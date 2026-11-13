@@ -445,6 +445,13 @@ pub struct CreateCaptureTask {
     pub edge_id: Option<String>,
     #[serde(default = "default_os_family")]
     pub os_family: String,
+    /// Clear pagefile/hiberfil/Temp before capture (PE). Default true.
+    #[serde(default = "default_true")]
+    pub exclude_temp: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

@@ -50,6 +50,7 @@ export function TasksPage() {
 
   const [captureMac, setCaptureMac] = useState("");
   const [captureName, setCaptureName] = useState("");
+  const [excludeTemp, setExcludeTemp] = useState(true);
   const [deployImage, setDeployImage] = useState("");
   const [selectedMacs, setSelectedMacs] = useState<Set<string>>(new Set());
   const [filterCampusId, setFilterCampusId] = useState("");
@@ -193,10 +194,15 @@ export function TasksPage() {
         mac: captureMac,
         name: captureName || undefined,
         edge_id: edgeId || undefined,
+        exclude_temp: excludeTemp,
       });
       setCaptureName("");
       setModal(null);
-      msg.success("已创建采集任务");
+      msg.success(
+        excludeTemp
+          ? "已创建采集任务（将清除 pagefile/Temp 等后再打包）"
+          : "已创建采集任务（未启用排除）",
+      );
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "创建失败");
@@ -454,6 +460,20 @@ export function TasksPage() {
               ))}
             </select>
           </div>
+          <label
+            className="muted"
+            style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start" }}
+          >
+            <input
+              type="checkbox"
+              checked={excludeTemp}
+              onChange={(e) => setExcludeTemp(e.target.checked)}
+            />
+            <span>
+              采集前清除临时/大文件（pagefile、hiberfil、Temp、回收站等）。PE
+              日志带 [exclude] 前缀，任务进度可见摘要。
+            </span>
+          </label>
           <div className="modal-actions">
             <button
               type="button"

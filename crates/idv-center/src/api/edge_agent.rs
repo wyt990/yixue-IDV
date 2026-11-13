@@ -40,6 +40,33 @@ pub struct ClaimedTask {
     pub mac: String,
     pub os_family: String,
     pub task_name: String,
+    #[serde(default = "default_exclude_true")]
+    pub exclude_temp: bool,
+}
+
+fn default_exclude_true() -> bool {
+    true
+}
+
+fn parse_capture_detail(detail: &str) -> (String, bool) {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return ("windows".into(), true);
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let os = v
+            .get("os_family")
+            .and_then(|x| x.as_str())
+            .unwrap_or("windows")
+            .to_string();
+        let excl = v
+            .get("exclude_temp")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        return (os, excl);
+    }
+    // Legacy: detail was plain os_family string.
+    (trimmed.to_string(), true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,11 +421,26 @@ pub async fn claim_task(
     .await
     .map_err(internal)?;
 
-    let os_family = if target.detail.trim().is_empty() {
-        "windows".into()
+    let (os_family, exclude_temp) = if task.kind == "capture" {
+        parse_capture_detail(&target.detail)
     } else {
-        target.detail.clone()
+        (
+            if target.detail.trim().is_empty() {
+                "windows".into()
+            } else {
+                target.detail.clone()
+            },
+            true,
+        )
     };
+
+    tracing::info!(
+        task_id = %task.id,
+        kind = %task.kind,
+        mac = %mac,
+        exclude_temp,
+        "[claim] task"
+    );
 
     Ok(Json(Some(ClaimedTask {
         target_id: target.id,
@@ -409,6 +451,7 @@ pub async fn claim_task(
         mac,
         os_family,
         task_name: task.name,
+        exclude_temp,
     })))
 }
 

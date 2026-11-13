@@ -143,6 +143,11 @@ pub async fn create_capture(
         updated_at: now,
     };
     insert_task(&state, &task).await?;
+    let detail = serde_json::json!({
+        "os_family": body.os_family,
+        "exclude_temp": body.exclude_temp,
+    })
+    .to_string();
     let target = MaintenanceTaskTarget {
         id: new_id(),
         task_id: task.id.clone(),
@@ -150,12 +155,17 @@ pub async fn create_capture(
         state: "pending".into(),
         progress: 0.0,
         error_message: String::new(),
-        detail: body.os_family,
+        detail,
         p2p_bytes: 0,
         edge_bytes: 0,
         updated_at: now,
     };
     insert_target(&state, &target).await?;
+    tracing::info!(
+        task_id = %task.id,
+        exclude_temp = body.exclude_temp,
+        "[capture] task created"
+    );
     Ok((
         StatusCode::CREATED,
         Json(TaskView {

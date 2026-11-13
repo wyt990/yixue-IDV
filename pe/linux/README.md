@@ -27,9 +27,9 @@ Edge 通过已有 `/pxe/` 静态目录提供这些文件（`tftp_root = pe`）�
 3. PE 内 `idv-pe-agent run` 流式读盘并上传  
 4. 管理端「镜像」列表出现新镜像  
 
-## 过滤（规划）
+## 排除大文件
 
-块级采集不会自动跳过 `pagefile.sys` 等。后续见 `docs/plans/2026-11-12-cold-capture-pe-design.md`：预处理清零 / v2 排除列表。
+`ntfs_used_v1` 打包时按 MFT 跳过 `pagefile.sys` / `hiberfil.sys` / Temp 等簇（不依赖 ntfs-3g）。任务 detail 可见 `[exclude] pack-skip …`。更新本目录 `idv-pe-agent` 后，下次 PXE 会从 Edge 拉新二进制。
 
 ## 注意
 

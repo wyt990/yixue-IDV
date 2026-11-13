@@ -24,6 +24,7 @@ use std::path::Path;
 use crate::image_format::{
     ImageHeader, PartitionRole, default_partitions, image_file_prefix, pending_payload_sha256,
 };
+use crate::ntfs_exclude::{self, ExcludePackReport};
 
 const GPT_EFI_SYSTEM: [u8; 16] = [
     0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
@@ -281,10 +282,15 @@ fn role_for_gpt(type_guid: &[u8; 16]) -> (&'static str, &'static str) {
     }
 }
 
-fn analyze_disk(f: &mut File, disk_size: u64) -> anyhow::Result<(Vec<PartitionRole>, Vec<PartPlan>)> {
+fn analyze_disk(
+    f: &mut File,
+    disk_size: u64,
+    exclude_paths: Option<&[&str]>,
+) -> anyhow::Result<(Vec<PartitionRole>, Vec<PartPlan>, ExcludePackReport)> {
     let gpt = parse_gpt(f, disk_size)?;
     let mut roles = Vec::new();
     let mut plans = Vec::new();
+    let mut exclude_report = ExcludePackReport::default();
     let mut seen_system_ntfs = false;
     for p in gpt {
         let off = p.first_lba * 512;
@@ -309,9 +315,23 @@ fn analyze_disk(f: &mut File, disk_size: u64) -> anyhow::Result<(Vec<PartitionRo
         });
         if ntfs && len > 64 * 1024 * 1024 {
             match read_ntfs_bitmap(f, off) {
-                Ok((cs, cc, bm)) => {
+                Ok((cs, cc, mut bm)) => {
                     let part_clusters = if cs > 0 { len / cs as u64 } else { 0 };
                     let cluster_count = cc.min((bm.len() as u64) * 8).min(part_clusters);
+                    if let Some(rules) = exclude_paths {
+                        let part_report = ntfs_exclude::clear_excluded_clusters(
+                            f,
+                            off,
+                            cs,
+                            cluster_count,
+                            &mut bm,
+                            rules,
+                        );
+                        exclude_report.files += part_report.files;
+                        exclude_report.clusters += part_report.clusters;
+                        exclude_report.bytes += part_report.bytes;
+                        exclude_report.lines.extend(part_report.lines);
+                    }
                     let mut used = 0u64;
                     for c in 0..cluster_count {
                         if bit_used(&bm, c) {
@@ -344,7 +364,7 @@ fn analyze_disk(f: &mut File, disk_size: u64) -> anyhow::Result<(Vec<PartitionRo
             length: len,
         });
     }
-    Ok((roles, plans))
+    Ok((roles, plans, exclude_report))
 }
 
 fn payload_size_for(plans: &[PartPlan], disk_size: u64) -> u64 {
@@ -374,27 +394,34 @@ pub fn pack_disk_ntfs_used_to_writer(
     os_family: &str,
     boot_mode: &str,
 ) -> anyhow::Result<ImageHeader> {
-    pack_disk_ntfs_used_to_writer_ex(disk, out, os_family, boot_mode, &mut |_| {})
+    pack_disk_ntfs_used_to_writer_ex(disk, out, os_family, boot_mode, &mut |_| {}, None)
+        .map(|(h, _)| h)
 }
 
 /// Like [`pack_disk_ntfs_used_to_writer`], but invokes `on_total(total_bytes)` once the
 /// packed size is known (after the image header is written).
+///
+/// When `exclude_paths` is `Some`, matching file clusters are omitted from the used-cluster
+/// bitmap (gold disk is not modified). Returns `(header, exclude_report)`.
 pub fn pack_disk_ntfs_used_to_writer_ex(
     disk: &Path,
     out: &mut dyn Write,
     os_family: &str,
     boot_mode: &str,
     on_total: &mut dyn FnMut(u64),
-) -> anyhow::Result<ImageHeader> {
+    exclude_paths: Option<&[&str]>,
+) -> anyhow::Result<(ImageHeader, ExcludePackReport)> {
     let mut f = File::open(disk)?;
     let disk_size = f.seek(SeekFrom::End(0))?;
     f.seek(SeekFrom::Start(0))?;
 
-    let (roles, plans) = match analyze_disk(&mut f, disk_size) {
+    let (roles, plans, exclude_report) = match analyze_disk(&mut f, disk_size, exclude_paths) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("ntfs_used: GPT/analyze failed ({err}); raw whole-disk fallback");
-            return pack_raw_disk_to_writer(disk, out, os_family, boot_mode, disk_size, on_total);
+            let header =
+                pack_raw_disk_to_writer(disk, out, os_family, boot_mode, disk_size, on_total)?;
+            return Ok((header, ExcludePackReport::default()));
         }
     };
 
@@ -469,7 +496,7 @@ pub fn pack_disk_ntfs_used_to_writer_ex(
         }
     }
     out.flush()?;
-    Ok(header)
+    Ok((header, exclude_report))
 }
 
 fn pack_raw_disk_to_writer(

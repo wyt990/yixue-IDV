@@ -98,6 +98,12 @@ pub struct ClaimedTask {
     pub mac: String,
     pub os_family: String,
     pub task_name: String,
+    #[serde(default = "default_exclude_temp")]
+    pub exclude_temp: bool,
+}
+
+fn default_exclude_temp() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

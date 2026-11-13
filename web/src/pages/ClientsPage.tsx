@@ -59,6 +59,7 @@ export function ClientsPage() {
 
   const [captureMac, setCaptureMac] = useState("");
   const [captureName, setCaptureName] = useState("");
+  const [excludeTemp, setExcludeTemp] = useState(true);
   const [deployImage, setDeployImage] = useState("");
   const [diskPlan, setDiskPlan] = useState("wipe_whole_disk");
   const [deployTargets, setDeployTargets] = useState<Client[]>([]);
@@ -140,6 +141,7 @@ export function ClientsPage() {
     }
     setCaptureMac(client.mac);
     setCaptureName(`${client.name}-金样`);
+    setExcludeTemp(true);
     setFormError("");
     setCaptureOpen(true);
   }
@@ -307,9 +309,14 @@ export function ClientsPage() {
       await api.tasks.capture({
         mac: captureMac,
         name: captureName || undefined,
+        exclude_temp: excludeTemp,
       });
       setCaptureOpen(false);
-      msg.success("已创建采集任务");
+      msg.success(
+        excludeTemp
+          ? "已创建采集任务（将清除临时文件后再打包）"
+          : "已创建采集任务",
+      );
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "创建失败");
     }
@@ -756,6 +763,17 @@ export function ClientsPage() {
               placeholder="机房A-金样"
             />
           </div>
+          <label
+            className="muted"
+            style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start" }}
+          >
+            <input
+              type="checkbox"
+              checked={excludeTemp}
+              onChange={(e) => setExcludeTemp(e.target.checked)}
+            />
+            <span>采集前清除 pagefile / Temp 等（推荐）</span>
+          </label>
           <div className="modal-actions">
             <button
               type="button"

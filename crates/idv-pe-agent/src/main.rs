@@ -4,11 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
+mod exclude_temp;
+
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use idv_common::image_format::{
     ImageHeader, deploy_reader_to_disk, format_bytes_progress, hex_sha256,
 };
+use idv_common::ntfs_exclude::DEFAULT_EXCLUDE_PATHS;
 use idv_common::ntfs_used::pack_disk_ntfs_used_to_writer_ex;
 use idv_common::{Error, Result, init_tracing, load_toml_file};
 use serde::{Deserialize, Serialize};
@@ -171,6 +174,13 @@ struct ClaimedTask {
     mac: String,
     os_family: String,
     task_name: String,
+    /// Clear pagefile/temp before capture (from Center).
+    #[serde(default = "default_exclude_temp")]
+    exclude_temp: bool,
+}
+
+fn default_exclude_temp() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -572,7 +582,69 @@ async fn capture_with_task(
         disk.display()
     );
     let _ = std::io::stderr().flush();
-    report_target(&cfg, &task.target_id, "running", 0.05, "", "capture-start", 0, 0).await?;
+    report_target(
+        &cfg,
+        &task.target_id,
+        "running",
+        0.05,
+        "",
+        "[capture] start",
+        0,
+        0,
+    )
+    .await?;
+
+    // Mount-based wipe is best-effort (needs ntfs-3g/fuse in PE). Pack-time skip is authoritative.
+    if task.exclude_temp {
+        report_target(
+            &cfg,
+            &task.target_id,
+            "running",
+            0.08,
+            "",
+            "[exclude] mount wipe (best-effort) + pack-time skip…",
+            0,
+            0,
+        )
+        .await?;
+        let report = exclude_temp::run_exclude_on_disk(&disk);
+        let joined = report
+            .lines
+            .iter()
+            .rev()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        report_target(
+            &cfg,
+            &task.target_id,
+            "running",
+            0.12,
+            "",
+            &joined,
+            0,
+            0,
+        )
+        .await?;
+    } else {
+        eprintln!("[exclude] disabled by task");
+        let _ = std::io::stderr().flush();
+        report_target(
+            &cfg,
+            &task.target_id,
+            "running",
+            0.12,
+            "",
+            "[exclude] disabled",
+            0,
+            0,
+        )
+        .await?;
+    }
 
     let os = if task.os_family.trim().is_empty() {
         os_family.to_string()
@@ -586,7 +658,7 @@ async fn capture_with_task(
         "running",
         0.15,
         "",
-        "packing+uploading (single pass, pending sha)",
+        "[capture] packing+uploading (single pass, pending sha)",
         0,
         0,
     )
@@ -609,8 +681,11 @@ async fn capture_with_task(
     let written = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
     let stop_progress = Arc::new(AtomicBool::new(false));
+    let exclude_note = Arc::new(std::sync::Mutex::new(String::new()));
     let written_w = Arc::clone(&written);
     let total_w = Arc::clone(&total);
+    let exclude_note_w = Arc::clone(&exclude_note);
+    let do_exclude = task.exclude_temp;
     let pack_handle = std::thread::spawn(move || -> anyhow::Result<ImageHeader> {
         let mut w = CaptureChunkWriter {
             tx: tx.clone(),
@@ -624,9 +699,25 @@ async fn capture_with_task(
             );
             let _ = std::io::stderr().flush();
         };
-        match pack_disk_ntfs_used_to_writer_ex(&disk_for_pack, &mut w, &os, &boot, &mut on_total)
-        {
-            Ok(header) => Ok(header),
+        let exclude_paths = if do_exclude {
+            Some(DEFAULT_EXCLUDE_PATHS)
+        } else {
+            None
+        };
+        match pack_disk_ntfs_used_to_writer_ex(
+            &disk_for_pack,
+            &mut w,
+            &os,
+            &boot,
+            &mut on_total,
+            exclude_paths,
+        ) {
+            Ok((header, rep)) => {
+                if let Ok(mut g) = exclude_note_w.lock() {
+                    *g = rep.summary();
+                }
+                Ok(header)
+            }
             Err(err) => {
                 let _ = tx.send(Err(err.to_string()));
                 Err(err)
@@ -746,7 +837,19 @@ async fn capture_with_task(
 
     let done_bytes = written.load(Ordering::Relaxed);
     let tot_bytes = total.load(Ordering::Relaxed).max(done_bytes);
-    let final_detail = format_bytes_progress(done_bytes, tot_bytes);
+    let exclude_summary = exclude_note
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let final_detail = if exclude_summary.is_empty() {
+        format_bytes_progress(done_bytes, tot_bytes)
+    } else {
+        format!(
+            "{exclude_summary} · {}",
+            format_bytes_progress(done_bytes, tot_bytes)
+        )
+    };
 
     let fail = |msg: String| async {
         let _ = report_target(

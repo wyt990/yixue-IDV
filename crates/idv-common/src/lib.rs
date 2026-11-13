@@ -7,6 +7,7 @@ pub mod error;
 pub mod fs_util;
 pub mod image_format;
 pub mod logging;
+pub mod ntfs_exclude;
 pub mod ntfs_used;
 pub mod restore;
 pub mod usb_policy;

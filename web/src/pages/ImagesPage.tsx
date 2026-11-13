@@ -17,6 +17,14 @@ export function ImagesPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<ImageItem | null>(null);
   const [deleteFile, setDeleteFile] = useState(false);
+  const [deltaOpen, setDeltaOpen] = useState(false);
+  const [deltaBaseId, setDeltaBaseId] = useState("");
+  const [deltaTargetId, setDeltaTargetId] = useState("");
+  const [deltaName, setDeltaName] = useState("");
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [applyBaseId, setApplyBaseId] = useState("");
+  const [applyDeltaId, setApplyDeltaId] = useState("");
+  const [applyName, setApplyName] = useState("");
   const [formError, setFormError] = useState("");
   const [busy, setBusy] = useState("");
 
@@ -157,6 +165,35 @@ export function ImagesPage() {
           </p>
         </div>
         <div className="page-actions">
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => {
+              const fulls = images.filter((i) => (i.content_type || "full") === "full");
+              setDeltaBaseId(fulls[0]?.id || "");
+              setDeltaTargetId(fulls[1]?.id || fulls[0]?.id || "");
+              setDeltaName("");
+              setFormError("");
+              setDeltaOpen(true);
+            }}
+          >
+            生成差量
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => {
+              const fulls = images.filter((i) => (i.content_type || "full") === "full");
+              const deltas = images.filter((i) => i.content_type === "delta");
+              setApplyBaseId(fulls[0]?.id || "");
+              setApplyDeltaId(deltas[0]?.id || "");
+              setApplyName("");
+              setFormError("");
+              setApplyOpen(true);
+            }}
+          >
+            应用差量
+          </button>
           <button type="button" className="btn" onClick={openModal}>
             登记镜像
           </button>
@@ -172,16 +209,17 @@ export function ImagesPage() {
           <thead>
             <tr>
               <th>名称</th>
+              <th>类型</th>
               <th>系统</th>
+              <th>大小</th>
               <th>校验和</th>
-              <th>路径</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
             {images.length === 0 ? (
               <tr>
-                <td colSpan={5} className="muted">
+                <td colSpan={6} className="muted">
                   暂无镜像，点击右上角「登记镜像」。
                 </td>
               </tr>
@@ -193,16 +231,26 @@ export function ImagesPage() {
                     {img.version_label ? (
                       <div className="muted">{img.version_label}</div>
                     ) : null}
+                    {img.notes ? (
+                      <div className="muted" title={img.notes}>
+                        {img.notes.length > 80
+                          ? `${img.notes.slice(0, 80)}…`
+                          : img.notes}
+                      </div>
+                    ) : null}
                   </td>
+                  <td>{img.content_type === "delta" ? "差量" : "全量"}</td>
                   <td>
                     <span className={`tag ${img.os_family}`}>
                       {img.os_family}
                     </span>
                   </td>
                   <td className="mono muted">
+                    {formatBytes(img.size_bytes || 0)}
+                  </td>
+                  <td className="mono muted">
                     {img.checksum_sha256.slice(0, 16)}…
                   </td>
-                  <td className="mono muted">{img.storage_uri || "—"}</td>
                   <td>
                     <button
                       type="button"
@@ -411,6 +459,189 @@ export function ImagesPage() {
             </button>
             <button className="btn danger" type="submit">
               确认删除
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={deltaOpen}
+        title="生成差量（旧全量 → 新全量）"
+        onClose={() => setDeltaOpen(false)}
+      >
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setFormError("");
+            setBusy("正在流式生成差量，请查看 Center 日志 [delta]…");
+            try {
+              const img = await api.images.buildDelta(
+                deltaBaseId,
+                deltaTargetId,
+                deltaName || undefined,
+              );
+              setDeltaOpen(false);
+              msg.success(
+                `已生成差量「${img.name}」（${formatBytes(img.size_bytes)}）`,
+              );
+              await refresh();
+            } catch (err) {
+              setFormError(err instanceof Error ? err.message : "生成失败");
+            } finally {
+              setBusy("");
+            }
+          }}
+        >
+          {formError ? <p className="error">{formError}</p> : null}
+          {busy ? <p className="muted">{busy}</p> : null}
+          <p className="muted">
+            基线 A（旧）+ 目标 B（新改装全量）→ 差量文件。部署学生机仍用全量
+            B；差量用于少传数据后 apply 出 B。
+          </p>
+          <div className="field">
+            <label>基线全量 A</label>
+            <select
+              value={deltaBaseId}
+              onChange={(e) => setDeltaBaseId(e.target.value)}
+              required
+            >
+              {images
+                .filter((i) => (i.content_type || "full") === "full")
+                .map((i) => (
+                  <option key={i.id} value={i.id}>
+                    {i.name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>目标全量 B</label>
+            <select
+              value={deltaTargetId}
+              onChange={(e) => setDeltaTargetId(e.target.value)}
+              required
+            >
+              {images
+                .filter((i) => (i.content_type || "full") === "full")
+                .map((i) => (
+                  <option key={i.id} value={i.id}>
+                    {i.name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>差量名称（可选）</label>
+            <input
+              value={deltaName}
+              onChange={(e) => setDeltaName(e.target.value)}
+              placeholder="自动命名"
+            />
+          </div>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setDeltaOpen(false)}
+              disabled={!!busy}
+            >
+              取消
+            </button>
+            <button
+              className="btn"
+              type="submit"
+              disabled={!!busy || !deltaBaseId || !deltaTargetId}
+            >
+              开始生成
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={applyOpen}
+        title="应用差量 → 新全量"
+        onClose={() => setApplyOpen(false)}
+      >
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setFormError("");
+            setBusy("正在应用差量，请查看 Center 日志 [delta]…");
+            try {
+              const img = await api.images.applyDelta(
+                applyBaseId,
+                applyDeltaId,
+                applyName || undefined,
+              );
+              setApplyOpen(false);
+              msg.success(
+                `已生成全量「${img.name}」（${formatBytes(img.size_bytes)}）`,
+              );
+              await refresh();
+            } catch (err) {
+              setFormError(err instanceof Error ? err.message : "应用失败");
+            } finally {
+              setBusy("");
+            }
+          }}
+        >
+          {formError ? <p className="error">{formError}</p> : null}
+          {busy ? <p className="muted">{busy}</p> : null}
+          <div className="field">
+            <label>基线全量 A</label>
+            <select
+              value={applyBaseId}
+              onChange={(e) => setApplyBaseId(e.target.value)}
+              required
+            >
+              {images
+                .filter((i) => (i.content_type || "full") === "full")
+                .map((i) => (
+                  <option key={i.id} value={i.id}>
+                    {i.name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>差量</label>
+            <select
+              value={applyDeltaId}
+              onChange={(e) => setApplyDeltaId(e.target.value)}
+              required
+            >
+              {images
+                .filter((i) => i.content_type === "delta")
+                .map((i) => (
+                  <option key={i.id} value={i.id}>
+                    {i.name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>输出全量名称（可选）</label>
+            <input
+              value={applyName}
+              onChange={(e) => setApplyName(e.target.value)}
+            />
+          </div>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setApplyOpen(false)}
+              disabled={!!busy}
+            >
+              取消
+            </button>
+            <button
+              className="btn"
+              type="submit"
+              disabled={!!busy || !applyBaseId || !applyDeltaId}
+            >
+              应用
             </button>
           </div>
         </form>

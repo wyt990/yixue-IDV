@@ -419,6 +419,16 @@ export const api = {
       }
       return data as ImageFileEntry;
     },
+    buildDelta: (base_image_id: string, target_image_id: string, name?: string) =>
+      request<ImageItem>("/api/v1/images/build-delta", {
+        method: "POST",
+        body: JSON.stringify({ base_image_id, target_image_id, name }),
+      }),
+    applyDelta: (base_image_id: string, delta_image_id: string, name?: string) =>
+      request<ImageItem>("/api/v1/images/apply-delta", {
+        method: "POST",
+        body: JSON.stringify({ base_image_id, delta_image_id, name }),
+      }),
   },
   admins: {
     list: () => request<Admin[]>("/api/v1/admins"),
@@ -484,6 +494,7 @@ export const api = {
       name?: string;
       edge_id?: string;
       os_family?: string;
+      exclude_temp?: boolean;
     }) =>
       request<TaskView>("/api/v1/tasks/capture", {
         method: "POST",

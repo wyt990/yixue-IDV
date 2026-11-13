@@ -4,8 +4,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use chrono::Utc;
-use idv_common::delta::{DEFAULT_BLOCK, apply_delta, build_delta, hex_sha256, unpack_delta};
-use idv_common::image_format::hex_sha256 as file_sha;
+use idv_common::delta::{FILE_BLOCK, apply_delta_files, build_delta_files};
+use tracing::info;
 
 use crate::auth::AuthUser;
 use crate::models::{ApplyDeltaRequest, BuildDeltaRequest, Image, new_id};
@@ -15,9 +15,10 @@ const IMAGE_COLS: &str = "id, name, os_family, version_label, checksum_sha256, s
 
 pub async fn build_delta_image(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Json(body): Json<BuildDeltaRequest>,
 ) -> Result<(StatusCode, Json<Image>), (StatusCode, String)> {
+    user.require_write()?;
     let base = load_image(&state, &body.base_image_id).await?;
     let target = load_image(&state, &body.target_image_id).await?;
     if base.content_type != "full" || target.content_type != "full" {
@@ -29,20 +30,46 @@ pub async fn build_delta_image(
     if base.os_family != target.os_family {
         return Err((StatusCode::BAD_REQUEST, "os_family mismatch".into()));
     }
-    let base_bytes = read_blob(&base)?;
-    let target_bytes = read_blob(&target)?;
-    let delta_bytes = build_delta(&base_bytes, &target_bytes, DEFAULT_BLOCK)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let packed = unpack_delta(&delta_bytes).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    let id = new_id();
+    let base_path = resolve_storage_path(&base.storage_uri)?;
+    let target_path = resolve_storage_path(&target.storage_uri)?;
     tokio::fs::create_dir_all(&state.images_dir)
         .await
         .map_err(internal)?;
+    let id = new_id();
     let dest = state.images_dir.join(format!("{id}.delta"));
-    tokio::fs::write(&dest, &delta_bytes)
+    let dest_clone = dest.clone();
+    let base_path_c = base_path.clone();
+    let target_path_c = target_path.clone();
+
+    info!(
+        base = %base.id,
+        target = %target.id,
+        out = %dest.display(),
+        "[delta] build queued"
+    );
+
+    let header = tokio::task::spawn_blocking(move || {
+        build_delta_files(
+            &base_path_c,
+            &target_path_c,
+            &dest_clone,
+            FILE_BLOCK,
+            |done, total, msg| {
+                if done == 0 || done == total || done % (256 * 1024 * 1024) < FILE_BLOCK as u64 {
+                    info!(done, total, "{msg}");
+                }
+            },
+        )
+    })
+    .await
+    .map_err(|e| internal(e))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let size_bytes = tokio::fs::metadata(&dest)
         .await
-        .map_err(internal)?;
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let checksum = idv_common::delta::hash_file(&dest).map_err(|e| internal(e))?;
     let now = Utc::now();
     let name = if body.name.trim().is_empty() {
         format!("delta-{}-to-{}", &base.id[..8], &target.id[..8])
@@ -54,17 +81,18 @@ pub async fn build_delta_image(
         name,
         os_family: target.os_family.clone(),
         version_label: format!("{}→{}", base.version_label, target.version_label),
-        checksum_sha256: file_sha(&delta_bytes),
-        size_bytes: delta_bytes.len() as i64,
+        checksum_sha256: checksum,
+        size_bytes,
         storage_uri: dest
             .canonicalize()
             .unwrap_or(dest)
             .to_string_lossy()
-            .to_string(),
+            .replace('\\', "/"),
         boot_mode: target.boot_mode.clone(),
         notes: format!(
-            "delta hunks={} base={} target={}",
-            packed.header.hunks.len(),
+            "[delta] hunks={} block={} base={} target={}",
+            header.hunks.len(),
+            header.block_size,
             base.id,
             target.id
         ),
@@ -74,14 +102,21 @@ pub async fn build_delta_image(
         created_at: now,
     };
     insert_image(&state, &image).await?;
+    info!(
+        image_id = %image.id,
+        hunks = header.hunks.len(),
+        size_bytes,
+        "[delta] build ok"
+    );
     Ok((StatusCode::CREATED, Json(image)))
 }
 
 pub async fn apply_delta_image(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Json(body): Json<ApplyDeltaRequest>,
 ) -> Result<(StatusCode, Json<Image>), (StatusCode, String)> {
+    user.require_write()?;
     let base = load_image(&state, &body.base_image_id).await?;
     let delta = load_image(&state, &body.delta_image_id).await?;
     if base.content_type != "full" {
@@ -104,15 +139,36 @@ pub async fn apply_delta_image(
         ));
     }
 
-    let base_bytes = read_blob(&base)?;
-    let delta_bytes = read_blob(&delta)?;
-    let out = apply_delta(&base_bytes, &delta_bytes)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let got = hex_sha256(&out);
-
+    let base_path = resolve_storage_path(&base.storage_uri)?;
+    let delta_path = resolve_storage_path(&delta.storage_uri)?;
     let id = new_id();
     let dest = state.images_dir.join(format!("{id}.bin"));
-    tokio::fs::write(&dest, &out).await.map_err(internal)?;
+    let dest_c = dest.clone();
+    let base_c = base_path.clone();
+    let delta_c = delta_path.clone();
+
+    info!(
+        base = %base.id,
+        delta = %delta.id,
+        out = %dest.display(),
+        "[delta] apply queued"
+    );
+
+    let got = tokio::task::spawn_blocking(move || {
+        apply_delta_files(&base_c, &delta_c, &dest_c, |done, total, msg| {
+            if done == 0 || done == total || done % 256 == 0 {
+                info!(done, total, "{msg}");
+            }
+        })
+    })
+    .await
+    .map_err(|e| internal(e))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let size_bytes = tokio::fs::metadata(&dest)
+        .await
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
     let now = Utc::now();
     let name = if body.name.trim().is_empty() {
         format!("applied-{}", &id[..8])
@@ -125,20 +181,21 @@ pub async fn apply_delta_image(
         os_family: base.os_family.clone(),
         version_label: "applied-delta".into(),
         checksum_sha256: got,
-        size_bytes: out.len() as i64,
+        size_bytes,
         storage_uri: dest
             .canonicalize()
             .unwrap_or(dest)
             .to_string_lossy()
-            .to_string(),
+            .replace('\\', "/"),
         boot_mode: base.boot_mode.clone(),
-        notes: format!("applied delta {} onto {}", delta.id, base.id),
+        notes: format!("[delta] applied {} onto {}", delta.id, base.id),
         partition_map: delta.partition_map.clone(),
         content_type: "full".into(),
         base_image_id: None,
         created_at: now,
     };
     insert_image(&state, &image).await?;
+    info!(image_id = %image.id, size_bytes, "[delta] apply ok");
     Ok((StatusCode::CREATED, Json(image)))
 }
 
@@ -150,16 +207,6 @@ async fn load_image(state: &AppState, id: &str) -> Result<Image, (StatusCode, St
         .await
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "image not found".into()))
-}
-
-fn read_blob(image: &Image) -> Result<Vec<u8>, (StatusCode, String)> {
-    let path = resolve_storage_path(&image.storage_uri)?;
-    std::fs::read(&path).map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("blob missing at {}: {e}", path.display()),
-        )
-    })
 }
 
 fn resolve_storage_path(storage_uri: &str) -> Result<PathBuf, (StatusCode, String)> {
