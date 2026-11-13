@@ -27,7 +27,7 @@
 3. 策略变更：本地 `pending` → **重启后生效**
 4. 保护点：封板部署后开启保护；换镜像重部署后再开保护
 5. 默认保护 `system` 卷；`persistent` 默认不保护（可配）
-6. 管控 UI 暂用现有「工作模式」绑定；机房勾选开/关还原后做（映射 teaching/office）
+6. 管控 UI：工作模式绑定 + 机房设置「开机还原」勾选（映射 teaching/office）
 7. 心跳扩展：`capabilities[]`、`desired_config_revision` / `applied_revision`、`pending_reboot`
 
 ### 不做
@@ -73,7 +73,7 @@ Agent 上报：`applied_revision`、`pending_reboot`、`capability_status`。
 ### 3.3 分期建议
 
 1. **本刀**：restore 驱动 + 心跳策略生效  
-2. **下一刀**：机房勾选还原；远程协助观看优先  
+2. **下一刀**：~~机房勾选还原~~（已做）；远程协助观看优先  
 3. **再后**：`deploy_files` / `collect_files` / `open_url` → `device` / `process` / `webfilter` → `network`；长连推送
 
 ## 4. 与现有代码的衔接

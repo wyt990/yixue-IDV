@@ -141,7 +141,7 @@ pub struct RestoreCapability {
 
 ## 后续计划（不在本 plan 实现）
 
-- 机房设置勾选还原（bind teaching/office）  
+- ~~机房设置勾选还原（bind teaching/office）~~（已做：LabsPage 勾选）  
 - WebSocket 推送  
 - `open_url` / `run_program` / `deploy_files` / `collect_files`  
 - `remote_assist` 真流、device/process/webfilter/network  

@@ -46,7 +46,8 @@ export function ModesPage() {
       <div>
         <h1>工作模式</h1>
         <p className="muted">
-          教学还原 / 办公 / 考试：分区角色策略下发给 idv-agent。
+          教学还原 / 办公 / 考试：分区角色策略经心跳下发给 idv-agent。机房快捷开关见「机房 →
+          设置」中的开机还原勾选（映射 teaching / office）。
         </p>
       </div>
       {error ? <p className="error">{error}</p> : null}

@@ -5,9 +5,26 @@ import {
   type EdgeNode,
   type ImageItem,
   type Lab,
+  type ModePolicy,
 } from "../api";
 import { Modal } from "../components/Modal";
 import { useMessage } from "../message";
+
+type ModeBinding = {
+  lab_id: string;
+  mode_policy_id: string;
+  effective: string;
+  updated_at: string;
+};
+
+function modeByName(modes: ModePolicy[], name: string) {
+  return modes.find((m) => m.name === name);
+}
+
+/** reboot = 卷过滤开机还原开；其它视为关（办公/手动）。 */
+function restoreEnabledForMode(mode?: ModePolicy | null) {
+  return (mode?.restore || "").toLowerCase() === "reboot";
+}
 
 function previewName(prefix: string, width: number, start: number) {
   const w = Math.min(8, Math.max(1, width || 3));
@@ -147,17 +164,25 @@ export function LabsPage() {
   const [editIpEnd, setEditIpEnd] = useState("");
   const [editImageId, setEditImageId] = useState("");
   const [editEdgeIds, setEditEdgeIds] = useState<string[]>([]);
+  const [modes, setModes] = useState<ModePolicy[]>([]);
+  const [bindings, setBindings] = useState<ModeBinding[]>([]);
+  const [editRestoreOn, setEditRestoreOn] = useState(true);
+  const [editModeHint, setEditModeHint] = useState("");
 
   async function refresh() {
-    const [c, l, imgs, eds] = await Promise.all([
+    const [c, l, imgs, eds, m, b] = await Promise.all([
       api.campuses.list(),
       api.labs.list(),
       api.images.list(),
       api.edges.list(),
+      api.modes.list(),
+      api.modes.bindings(),
     ]);
     setCampuses(c);
     setLabs(l);
     setImages(imgs);
+    setModes(m);
+    setBindings(b);
     setEdges(eds);
   }
 
@@ -202,6 +227,17 @@ export function LabsPage() {
     setEditIpEnd(lab.ip_end || "");
     setEditImageId(lab.default_image_id || "");
     setEditEdgeIds([...(lab.edge_ids || [])]);
+    const binding = bindings.find((x) => x.lab_id === lab.id);
+    const mode = binding
+      ? modes.find((m) => m.id === binding.mode_policy_id)
+      : undefined;
+    const on = mode ? restoreEnabledForMode(mode) : true;
+    setEditRestoreOn(on);
+    setEditModeHint(
+      mode
+        ? `${mode.name}（restore=${mode.restore}，${binding?.effective || "—"})`
+        : "未绑定（保存勾选将绑定 teaching/office）",
+    );
     setSettingsError("");
   }
 
@@ -290,8 +326,29 @@ export function LabsPage() {
         default_image_id: editImageId || null,
         edge_ids: editEdgeIds,
       });
+
+      const binding = bindings.find((x) => x.lab_id === settingsLab.id);
+      const current = binding
+        ? modes.find((m) => m.id === binding.mode_policy_id)
+        : undefined;
+      const wantOn = editRestoreOn;
+      const curOn = restoreEnabledForMode(current);
+      let modeMsg = "";
+      // Leave exam (also reboot) alone while restore stays on; ModesPage for exam re-bind.
+      if ((!current || curOn !== wantOn) && !(wantOn && current?.name === "exam")) {
+        const targetName = wantOn ? "teaching" : "office";
+        const target = modeByName(modes, targetName);
+        if (!target) {
+          throw new Error(`缺少默认模式 ${targetName}，请先在工作模式页确认`);
+        }
+        await api.modes.bindLab(settingsLab.id, target.id, "next_boot");
+        modeMsg = wantOn
+          ? " · 已开开机还原（teaching，下开机生效）"
+          : " · 已关开机还原（office，下开机生效）";
+      }
+
       setSettingsLab(null);
-      msg.success("已保存机房设置");
+      msg.success(`已保存机房设置${modeMsg}`);
       await refresh();
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : "保存失败");
@@ -776,6 +833,24 @@ export function LabsPage() {
               selected={editEdgeIds}
               onChange={setEditEdgeIds}
             />
+          </div>
+          <div className="field">
+            <label
+              className="muted"
+              style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}
+            >
+              <input
+                type="checkbox"
+                checked={editRestoreOn}
+                onChange={(e) => setEditRestoreOn(e.target.checked)}
+              />
+              开机还原（卷过滤保护系统区）
+            </label>
+            <p className="muted" style={{ fontSize: "0.85rem", marginTop: "0.35rem" }}>
+              勾选 → teaching（重启后保护开）；取消 → office（解冻）。Agent
+              心跳拉取后默认下开机生效。当前：{editModeHint || "—"}
+              。考试/细粒度请用「工作模式」页绑定。
+            </p>
           </div>
           <div className="modal-actions">
             <button
