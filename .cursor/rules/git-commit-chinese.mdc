@@ -1,0 +1,10 @@
+---
+description: Git 提交说明使用中文
+alwaysApply: true
+---
+
+# Git 提交说明
+
+- 本仓库 **commit message 使用中文**（标题 + 正文）。
+- 可用简短英文前缀（如 `feat:` / `fix:` / `docs:`），说明部分必须中文。
+- 例：`feat: 机房设置增加开机还原勾选`
