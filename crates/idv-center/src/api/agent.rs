@@ -71,13 +71,7 @@ pub async fn heartbeat(
     };
 
     let baseline_image_id = if let Some(ref lid) = lab_id {
-        let _ = lid;
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM images WHERE content_type = 'full' ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(internal)?
+        crate::site_defaults::resolve_baseline_image_id(&state.pool, lid).await?
     } else {
         None
     };

@@ -5,7 +5,8 @@ use axum::http::StatusCode;
 use crate::models::Lab;
 use crate::state::AppState;
 
-pub const LAB_COLS: &str = "id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, created_at";
+pub const LAB_COLS: &str = "id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, default_image_id, created_at";
+pub const CAMPUS_COLS: &str = "id, name, default_image_id, created_at";
 
 pub fn format_client_name(prefix: &str, width: i64, n: i64) -> String {
     let width = width.clamp(1, 8) as usize;

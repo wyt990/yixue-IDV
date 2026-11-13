@@ -141,21 +141,84 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(image)))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteImageQuery {
+    /// When true, also remove the file under `images_dir` if `storage_uri` points there.
+    #[serde(default)]
+    pub delete_file: bool,
+}
+
 pub async fn delete(
     State(state): State<AppState>,
     user: AuthUser,
     AxumPath(id): AxumPath<String>,
+    Query(q): Query<DeleteImageQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     user.require_write()?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT storage_uri FROM images WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+    let Some((storage_uri,)) = row else {
+        return Err((StatusCode::NOT_FOUND, "image not found".into()));
+    };
     let result = sqlx::query("DELETE FROM images WHERE id = ?")
-        .bind(id)
+        .bind(&id)
         .execute(&state.pool)
         .await
         .map_err(internal)?;
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "image not found".into()));
     }
+    if q.delete_file {
+        if let Some(path) = storage_uri_to_images_file(&state.images_dir, &storage_uri) {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => tracing::info!(path = %path.display(), "deleted image file"),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "failed to delete image file after DB delete"
+                    );
+                }
+            }
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn storage_uri_to_images_file(images_dir: &Path, storage_uri: &str) -> Option<PathBuf> {
+    let raw = storage_uri.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = if let Some(rest) = raw.strip_prefix("file:///") {
+        PathBuf::from(rest)
+    } else if let Some(rest) = raw.strip_prefix("file://") {
+        PathBuf::from(rest)
+    } else {
+        // path_uri stores with forward slashes; PathBuf accepts that on Windows too.
+        PathBuf::from(raw)
+    };
+    let canon_dir = images_dir
+        .canonicalize()
+        .unwrap_or_else(|_| images_dir.to_path_buf());
+    let candidate = path
+        .canonicalize()
+        .ok()
+        .or_else(|| {
+            let name = path.file_name()?.to_string_lossy();
+            let joined = images_dir.join(name.as_ref());
+            joined.canonicalize().ok()
+        })?;
+    if candidate.starts_with(&canon_dir) && candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// List files under center `images_dir` (no checksum; call meta to hash).

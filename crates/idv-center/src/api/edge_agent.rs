@@ -113,6 +113,11 @@ pub async fn register(
         cache_warn_pct: edge.cache_warn_pct,
         cache_level: edge.cache_level,
         capture_tmp_dir: edge.capture_tmp_dir,
+        cpu_pct: edge.cpu_pct,
+        mem_used_bytes: edge.mem_used_bytes,
+        mem_total_bytes: edge.mem_total_bytes,
+        net_rx_bps: edge.net_rx_bps,
+        net_tx_bps: edge.net_tx_bps,
         created_at: edge.created_at,
     }))
 }
@@ -124,14 +129,20 @@ pub async fn heartbeat(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let now = Utc::now();
     let level = cache_level(hb.cache_used_bytes, hb.cache_quota_bytes, hb.cache_warn_pct);
+    let cpu_pct = hb.cpu_pct.clamp(0.0, 100.0);
     sqlx::query(
-        "UPDATE edges SET last_seen = ?, cache_used_bytes = ?, cache_quota_bytes = ?, cache_warn_pct = ?, cache_level = ? WHERE id = ?",
+        "UPDATE edges SET last_seen = ?, cache_used_bytes = ?, cache_quota_bytes = ?, cache_warn_pct = ?, cache_level = ?, cpu_pct = ?, mem_used_bytes = ?, mem_total_bytes = ?, net_rx_bps = ?, net_tx_bps = ? WHERE id = ?",
     )
     .bind(now)
     .bind(hb.cache_used_bytes)
     .bind(hb.cache_quota_bytes)
     .bind(hb.cache_warn_pct)
     .bind(&level)
+    .bind(cpu_pct)
+    .bind(hb.mem_used_bytes.max(0))
+    .bind(hb.mem_total_bytes.max(0))
+    .bind(hb.net_rx_bps.max(0))
+    .bind(hb.net_tx_bps.max(0))
     .bind(&edge.id)
     .execute(&state.pool)
     .await

@@ -50,7 +50,13 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
-export type Campus = { id: string; name: string; created_at: string };
+export type Campus = {
+  id: string;
+  name: string;
+  default_image_id?: string | null;
+  edge_ids?: string[];
+  created_at: string;
+};
 export type Lab = {
   id: string;
   campus_id: string;
@@ -61,6 +67,8 @@ export type Lab = {
   next_suffix?: number;
   ip_start?: string;
   ip_end?: string;
+  default_image_id?: string | null;
+  edge_ids?: string[];
   created_at: string;
 };
 export type Client = {
@@ -154,7 +162,43 @@ export type DashboardStats = {
   clients: number;
   images: number;
   edges_online: number;
+  edges_total: number;
   tasks_running: number;
+};
+export type DashboardEdgeRow = {
+  id: string;
+  name: string;
+  online: boolean;
+  cpu_pct: number;
+  mem_used_bytes: number;
+  mem_total_bytes: number;
+  net_rx_bps: number;
+  net_tx_bps: number;
+  last_seen: string | null;
+};
+export type DashboardTaskRow = {
+  id: string;
+  name: string;
+  kind: string;
+  state: string;
+  progress_text: string;
+  error_message: string;
+  updated_at: string;
+};
+export type DashboardLabRow = {
+  id: string;
+  name: string;
+  campus_name: string;
+  client_count: number;
+  default_image_name: string;
+  image_from_campus: boolean;
+};
+export type DashboardOverview = {
+  stats: DashboardStats;
+  edges: DashboardEdgeRow[];
+  tasks_active: DashboardTaskRow[];
+  tasks_failed: DashboardTaskRow[];
+  labs: DashboardLabRow[];
 };
 export type EdgeNode = {
   id: string;
@@ -168,6 +212,11 @@ export type EdgeNode = {
   cache_level?: string;
   /** PE 采集暂存目录（Edge 本机路径）；空则用 Edge 本地默认 */
   capture_tmp_dir?: string;
+  cpu_pct?: number;
+  mem_used_bytes?: number;
+  mem_total_bytes?: number;
+  net_rx_bps?: number;
+  net_tx_bps?: number;
   created_at: string;
   online: boolean;
 };
@@ -190,7 +239,7 @@ export const api = {
       { method: "POST", body: JSON.stringify({ username, password }) },
     ),
   me: () => request<Admin>("/api/v1/auth/me"),
-  dashboard: () => request<DashboardStats>("/api/v1/dashboard"),
+  dashboard: () => request<DashboardOverview>("/api/v1/dashboard"),
   campuses: {
     list: () => request<Campus[]>("/api/v1/campuses"),
     create: (name: string) =>
@@ -198,10 +247,21 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ name }),
       }),
-    update: (id: string, name: string) =>
+    update: (
+      id: string,
+      payload:
+        | string
+        | {
+            name: string;
+            default_image_id?: string | null;
+            edge_ids?: string[];
+          },
+    ) =>
       request<Campus>(`/api/v1/campuses/${id}`, {
         method: "PUT",
-        body: JSON.stringify({ name }),
+        body: JSON.stringify(
+          typeof payload === "string" ? { name: payload } : payload,
+        ),
       }),
     delete: (id: string) =>
       request<void>(`/api/v1/campuses/${id}`, { method: "DELETE" }),
@@ -234,6 +294,8 @@ export const api = {
         next_suffix?: number;
         ip_start?: string;
         ip_end?: string;
+        default_image_id?: string | null;
+        edge_ids?: string[];
       },
     ) =>
       request<Lab>(`/api/v1/labs/${id}`, {
@@ -318,8 +380,11 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload),
       }),
-    delete: (id: string) =>
-      request<void>(`/api/v1/images/${id}`, { method: "DELETE" }),
+    delete: (id: string, delete_file = false) =>
+      request<void>(
+        `/api/v1/images/${id}?delete_file=${delete_file ? "true" : "false"}`,
+        { method: "DELETE" },
+      ),
     listFiles: () => request<ImageFileEntry[]>("/api/v1/images/files"),
     fileMeta: (name: string) =>
       request<ImageFileEntry>(

@@ -1,0 +1,6 @@
+-- Host metrics reported by Edge heartbeat (CPU / memory / NIC throughput).
+ALTER TABLE edges ADD COLUMN cpu_pct REAL NOT NULL DEFAULT 0;
+ALTER TABLE edges ADD COLUMN mem_used_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE edges ADD COLUMN mem_total_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE edges ADD COLUMN net_rx_bps INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE edges ADD COLUMN net_tx_bps INTEGER NOT NULL DEFAULT 0;

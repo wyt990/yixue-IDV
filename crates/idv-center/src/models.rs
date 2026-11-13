@@ -23,7 +23,13 @@ fn default_admin_role() -> String {
 pub struct Campus {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub default_image_id: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Bound Edge ids ordered by priority (not a DB column).
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub edge_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -43,7 +49,13 @@ pub struct Lab {
     pub ip_start: String,
     #[serde(default)]
     pub ip_end: String,
+    #[serde(default)]
+    pub default_image_id: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Bound Edge ids ordered by priority (not a DB column).
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub edge_ids: Vec<String>,
 }
 
 fn default_suffix_width() -> i64 {
@@ -104,6 +116,12 @@ pub struct CreateCampus {
 #[derive(Debug, Deserialize)]
 pub struct UpdateCampus {
     pub name: String,
+    /// When `edge_ids` is `Some`, also apply this (empty/None clears).
+    #[serde(default)]
+    pub default_image_id: Option<String>,
+    /// When `Some`, replace campus Edge bindings (order = priority).
+    #[serde(default)]
+    pub edge_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +158,12 @@ pub struct UpdateLab {
     pub ip_start: Option<String>,
     #[serde(default)]
     pub ip_end: Option<String>,
+    /// When `edge_ids` is `Some`, also apply this (empty/None clears).
+    #[serde(default)]
+    pub default_image_id: Option<String>,
+    /// When `Some`, replace lab Edge bindings (order = priority).
+    #[serde(default)]
+    pub edge_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -469,7 +493,51 @@ pub struct DashboardStats {
     pub clients: i64,
     pub images: i64,
     pub edges_online: i64,
+    pub edges_total: i64,
     pub tasks_running: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardEdgeRow {
+    pub id: String,
+    pub name: String,
+    pub online: bool,
+    pub cpu_pct: f64,
+    pub mem_used_bytes: i64,
+    pub mem_total_bytes: i64,
+    pub net_rx_bps: i64,
+    pub net_tx_bps: i64,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardTaskRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub state: String,
+    pub progress_text: String,
+    pub error_message: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardLabRow {
+    pub id: String,
+    pub name: String,
+    pub campus_name: String,
+    pub client_count: i64,
+    pub default_image_name: String,
+    pub image_from_campus: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardOverview {
+    pub stats: DashboardStats,
+    pub edges: Vec<DashboardEdgeRow>,
+    pub tasks_active: Vec<DashboardTaskRow>,
+    pub tasks_failed: Vec<DashboardTaskRow>,
+    pub labs: Vec<DashboardLabRow>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -486,6 +554,16 @@ pub struct Edge {
     /// Absolute/relative path on the Edge host for PE capture staging. Empty = Edge default.
     #[serde(default)]
     pub capture_tmp_dir: String,
+    #[serde(default)]
+    pub cpu_pct: f64,
+    #[serde(default)]
+    pub mem_used_bytes: i64,
+    #[serde(default)]
+    pub mem_total_bytes: i64,
+    #[serde(default)]
+    pub net_rx_bps: i64,
+    #[serde(default)]
+    pub net_tx_bps: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -552,6 +630,16 @@ pub struct EdgeHeartbeatRequest {
     pub cache_quota_bytes: i64,
     #[serde(default = "default_cache_warn")]
     pub cache_warn_pct: f64,
+    #[serde(default)]
+    pub cpu_pct: f64,
+    #[serde(default)]
+    pub mem_used_bytes: i64,
+    #[serde(default)]
+    pub mem_total_bytes: i64,
+    #[serde(default)]
+    pub net_rx_bps: i64,
+    #[serde(default)]
+    pub net_tx_bps: i64,
 }
 
 fn default_cache_warn() -> f64 {
@@ -591,6 +679,6 @@ pub fn new_id() -> String {
 
 pub fn edge_online(last_seen: Option<DateTime<Utc>>) -> bool {
     last_seen
-        .map(|ts| Utc::now().signed_duration_since(ts).num_seconds() <= 45)
+        .map(|ts| Utc::now().signed_duration_since(ts).num_seconds() <= 20)
         .unwrap_or(false)
 }

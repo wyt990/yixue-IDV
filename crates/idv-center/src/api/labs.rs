@@ -32,6 +32,8 @@ pub async fn list(
             .await
     }
     .map_err(internal)?;
+    let mut rows = rows;
+    crate::site_defaults::attach_lab_edges(&state.pool, &mut rows).await?;
     Ok(Json(rows))
 }
 
@@ -40,7 +42,9 @@ pub async fn get(
     _user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Lab>, (StatusCode, String)> {
-    crate::lab_naming::load_lab(&state, &id).await.map(Json)
+    let mut lab = crate::lab_naming::load_lab(&state, &id).await?;
+    lab.edge_ids = crate::site_defaults::load_lab_edge_ids(&state.pool, &id).await?;
+    Ok(Json(lab))
 }
 
 pub async fn create(
@@ -74,7 +78,9 @@ pub async fn create(
         next_suffix: start,
         ip_start: body.ip_start.trim().to_string(),
         ip_end: body.ip_end.trim().to_string(),
+        default_image_id: None,
         created_at: Utc::now(),
+        edge_ids: Vec::new(),
     };
     sqlx::query(
         "INSERT INTO labs (id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -175,7 +181,21 @@ pub async fn update(
             internal(err)
         }
     })?;
-    crate::lab_naming::load_lab(&state, &id).await.map(Json)
+
+    if let Some(edge_ids) = body.edge_ids {
+        let image_id =
+            crate::site_defaults::normalize_default_image_id(&state.pool, body.default_image_id)
+                .await?;
+        sqlx::query("UPDATE labs SET default_image_id = ? WHERE id = ?")
+            .bind(&image_id)
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal)?;
+        crate::site_defaults::replace_lab_edges(&state.pool, &id, &edge_ids).await?;
+    }
+
+    get(State(state), user, Path(id)).await
 }
 
 pub async fn delete(

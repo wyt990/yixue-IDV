@@ -94,7 +94,7 @@ pub fn edge_token(headers: &HeaderMap) -> Option<String> {
 
 pub async fn edge_from_token(pool: &SqlitePool, token: &str) -> Option<Edge> {
     sqlx::query_as::<_, Edge>(
-        "SELECT id, name, node_token, listen_url, last_seen, cache_used_bytes, cache_quota_bytes, cache_warn_pct, cache_level, capture_tmp_dir, created_at FROM edges WHERE node_token = ?",
+        "SELECT id, name, node_token, listen_url, last_seen, cache_used_bytes, cache_quota_bytes, cache_warn_pct, cache_level, capture_tmp_dir, cpu_pct, mem_used_bytes, mem_total_bytes, net_rx_bps, net_tx_bps, created_at FROM edges WHERE node_token = ?",
     )
     .bind(token)
     .fetch_optional(pool)

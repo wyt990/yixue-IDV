@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { api, type ImageFileEntry, type ImageItem } from "../api";
 import { Modal } from "../components/Modal";
+import { useMessage } from "../message";
 
 function formatBytes(n: number) {
   if (n < 1024) return `${n} B`;
@@ -10,10 +11,12 @@ function formatBytes(n: number) {
 }
 
 export function ImagesPage() {
+  const msg = useMessage();
   const [images, setImages] = useState<ImageItem[]>([]);
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
   const [open, setOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<ImageItem | null>(null);
+  const [deleteFile, setDeleteFile] = useState(false);
   const [formError, setFormError] = useState("");
   const [busy, setBusy] = useState("");
 
@@ -34,7 +37,7 @@ export function ImagesPage() {
   }
 
   useEffect(() => {
-    refresh().catch((err) => setError(err.message));
+    refresh().catch((err) => msg.error(err.message));
   }, []);
 
   async function openModal() {
@@ -85,7 +88,7 @@ export function ImagesPage() {
       if (!name.trim()) {
         setName(file.name.replace(/\.[^.]+$/, ""));
       }
-      setMessage(`已上传 ${entry.name}`);
+      msg.success(`已上传 ${entry.name}`);
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "上传失败");
     } finally {
@@ -111,21 +114,36 @@ export function ImagesPage() {
         storage_uri: fileMeta.storage_uri,
       });
       setOpen(false);
-      setMessage("已登记镜像");
+      msg.success("已登记镜像");
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "登记失败");
     }
   }
 
-  async function removeImage(img: ImageItem) {
-    if (!window.confirm(`删除镜像「${img.name}」的元数据登记？`)) return;
-    setError("");
+  function askDelete(img: ImageItem) {
+    setPendingDelete(img);
+    setDeleteFile(false);
+    setFormError("");
+    setDeleteOpen(true);
+  }
+
+  async function confirmDelete(e: FormEvent) {
+    e.preventDefault();
+    if (!pendingDelete) return;
+    setFormError("");
     try {
-      await api.images.delete(img.id);
+      await api.images.delete(pendingDelete.id, deleteFile);
+      setDeleteOpen(false);
+      setPendingDelete(null);
+      msg.success(
+        deleteFile
+          ? `已删除镜像「${pendingDelete.name}」及文件`
+          : `已删除镜像登记「${pendingDelete.name}」`,
+      );
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      setFormError(err instanceof Error ? err.message : "删除失败");
     }
   }
 
@@ -144,8 +162,6 @@ export function ImagesPage() {
           </button>
         </div>
       </div>
-      {error ? <p className="error">{error}</p> : null}
-      {message ? <p className="muted">{message}</p> : null}
 
       <div className="card">
         <div className="panel-head">
@@ -191,7 +207,7 @@ export function ImagesPage() {
                     <button
                       type="button"
                       className="btn danger"
-                      onClick={() => removeImage(img)}
+                      onClick={() => askDelete(img)}
                     >
                       删除
                     </button>
@@ -347,6 +363,54 @@ export function ImagesPage() {
               disabled={!!busy || !fileMeta?.checksum_sha256}
             >
               保存登记
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={deleteOpen}
+        title="删除镜像"
+        onClose={() => {
+          setDeleteOpen(false);
+          setPendingDelete(null);
+        }}
+      >
+        <form onSubmit={confirmDelete}>
+          {formError ? <p className="error">{formError}</p> : null}
+          <p>
+            确定删除镜像登记「{pendingDelete?.name}」？
+          </p>
+          <p className="muted mono" style={{ wordBreak: "break-all" }}>
+            {pendingDelete?.storage_uri || "—"}
+          </p>
+          <label
+            className="muted"
+            style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start" }}
+          >
+            <input
+              type="checkbox"
+              checked={deleteFile}
+              onChange={(e) => setDeleteFile(e.target.checked)}
+            />
+            <span>
+              同时删除镜像文件（默认仅删除登记记录；勾选后将删除 images_dir
+              下对应文件）
+            </span>
+          </label>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => {
+                setDeleteOpen(false);
+                setPendingDelete(null);
+              }}
+            >
+              取消
+            </button>
+            <button className="btn danger" type="submit">
+              确认删除
             </button>
           </div>
         </form>

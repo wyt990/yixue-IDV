@@ -25,6 +25,7 @@ pub struct EdgeRuntime {
     pub center_reachable: Arc<AtomicBool>,
     pub client: reqwest::Client,
     pub sync_slots: Arc<tokio::sync::Semaphore>,
+    pub host_metrics: Arc<crate::host_metrics::HostMetricsSampler>,
 }
 
 impl EdgeRuntime {
@@ -270,6 +271,7 @@ impl EdgeRuntime {
                 );
             }
         }
+        let metrics = self.host_metrics.sample();
         let url = format!("{}/api/v1/edge/heartbeat", self.center_url);
         let resp = self
             .client
@@ -279,6 +281,11 @@ impl EdgeRuntime {
                 "cache_used_bytes": used,
                 "cache_quota_bytes": self.cache_quota_bytes,
                 "cache_warn_pct": self.cache_warn_pct,
+                "cpu_pct": metrics.cpu_pct,
+                "mem_used_bytes": metrics.mem_used_bytes,
+                "mem_total_bytes": metrics.mem_total_bytes,
+                "net_rx_bps": metrics.net_rx_bps,
+                "net_tx_bps": metrics.net_tx_bps,
             }))
             .send()
             .await?;

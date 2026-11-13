@@ -9,6 +9,13 @@ import {
   type TaskLifecycleSettings,
   type TaskView,
 } from "../api";
+import { Modal } from "../components/Modal";
+import { useMessage } from "../message";
+import {
+  diskPlanLabel,
+  taskKindLabel,
+  taskStateLabel,
+} from "../taskLabels";
 
 const DISK_PLANS = [
   {
@@ -28,15 +35,18 @@ const DISK_PLANS = [
   },
 ] as const;
 
+type ModalKind = "capture" | "deploy" | "lifecycle" | null;
+
 export function TasksPage() {
+  const msg = useMessage();
   const [tasks, setTasks] = useState<TaskView[]>([]);
   const [images, setImages] = useState<ImageItem[]>([]);
   const [edges, setEdges] = useState<EdgeNode[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [campuses, setCampuses] = useState<Campus[]>([]);
   const [labs, setLabs] = useState<Lab[]>([]);
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
+  const [modal, setModal] = useState<ModalKind>(null);
+  const [formError, setFormError] = useState("");
 
   const [captureMac, setCaptureMac] = useState("");
   const [captureName, setCaptureName] = useState("");
@@ -46,13 +56,6 @@ export function TasksPage() {
   const [filterLabId, setFilterLabId] = useState("");
   const [diskPlan, setDiskPlan] = useState("wipe_whole_disk");
   const [edgeId, setEdgeId] = useState("");
-  const [preview, setPreview] = useState<{
-    warning: string;
-    overwrite_partitions: unknown[];
-    keep_partitions: unknown[];
-    image_name: string;
-  } | null>(null);
-  const [confirmText, setConfirmText] = useState("");
   const [lifecycle, setLifecycle] = useState<TaskLifecycleSettings>({
     stale_after_secs: 12 * 3600,
   });
@@ -86,6 +89,10 @@ export function TasksPage() {
     [selectedMacs],
   );
 
+  async function refreshTasks() {
+    setTasks(await api.tasks.list());
+  }
+
   async function refresh() {
     const [t, imgs, e, c, camps, ls] = await Promise.all([
       api.tasks.list(),
@@ -112,7 +119,6 @@ export function TasksPage() {
       else next.delete(mac);
       return next;
     });
-    setPreview(null);
   }
 
   function toggleFiltered(on: boolean) {
@@ -124,7 +130,6 @@ export function TasksPage() {
       }
       return next;
     });
-    setPreview(null);
   }
 
   function selectCurrentLab() {
@@ -136,11 +141,28 @@ export function TasksPage() {
       }
       return next;
     });
-    setPreview(null);
+  }
+
+  function openModal(kind: ModalKind) {
+    setFormError("");
+    if (kind === "deploy" && selectedMacList.length > 0) {
+      const resolved = selectedMacList.map((mac) => {
+        const client = clients.find((c) => c.mac === mac);
+        if (!client) return null;
+        const lab = labs.find((l) => l.id === client.lab_id);
+        if (!lab) return null;
+        if (lab.default_image_id) return lab.default_image_id;
+        const campus = campuses.find((c) => c.id === lab.campus_id);
+        return campus?.default_image_id || null;
+      });
+      const unique = [...new Set(resolved.filter(Boolean))] as string[];
+      if (unique.length === 1) setDeployImage(unique[0]);
+    }
+    setModal(kind);
   }
 
   useEffect(() => {
-    refresh().catch((err) => setError(err.message));
+    refresh().catch((err) => msg.error(err.message));
     api.taskLifecycle
       .get()
       .then((life) => {
@@ -151,20 +173,20 @@ export function TasksPage() {
             : String(Math.round(life.stale_after_secs / 3600)),
         );
       })
-      .catch((err) => setError(err.message));
+      .catch((err) => msg.error(err.message));
+    // Only poll task list (progress); avoid full refresh failing the poll.
     const timer = setInterval(() => {
-      refresh().catch(() => undefined);
-    }, 4000);
+      refreshTasks().catch(() => undefined);
+    }, 1500);
     return () => clearInterval(timer);
   }, []);
 
   async function onCapture(e: FormEvent) {
     e.preventDefault();
-    setError("");
-    setMessage("");
+    setFormError("");
     try {
       if (!captureMac) {
-        setError("请选择金样机");
+        setFormError("请选择金样机");
         return;
       }
       await api.tasks.capture({
@@ -173,82 +195,57 @@ export function TasksPage() {
         edge_id: edgeId || undefined,
       });
       setCaptureName("");
-      setMessage("已创建采集任务");
+      setModal(null);
+      msg.success("已创建采集任务");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "创建失败");
+      setFormError(err instanceof Error ? err.message : "创建失败");
     }
   }
 
   async function onCancelTask(id: string) {
-    setError("");
-    setMessage("");
     try {
       await api.tasks.cancel(id);
-      setMessage("已结束任务");
+      msg.success("已结束任务");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "结束失败");
+      msg.error(err instanceof Error ? err.message : "结束失败");
     }
   }
 
   async function onSaveLifecycle(e: FormEvent) {
     e.preventDefault();
-    setError("");
-    setMessage("");
+    setFormError("");
     try {
       const hours = Number(staleHours);
       if (!Number.isFinite(hours) || hours < 0) {
-        setError("超时小时数须为 ≥ 0 的数字（0=关闭自动收尸）");
+        setFormError("超时小时数须为 ≥ 0 的数字（0=关闭自动收尸）");
         return;
       }
       const next = await api.taskLifecycle.set({
         stale_after_secs: Math.round(hours * 3600),
       });
       setLifecycle(next);
-      setMessage(
+      setModal(null);
+      msg.success(
         next.stale_after_secs <= 0
           ? "已关闭任务自动收尸"
           : `已保存：${Math.round(next.stale_after_secs / 3600)} 小时无进度则自动结束`,
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "保存失败");
-    }
-  }
-
-  async function onPreview() {
-    setError("");
-    if (selectedMacList.length === 0) {
-      setError("请先勾选至少一台目标客户端");
-      return;
-    }
-    try {
-      const p = await api.tasks.previewDeploy({
-        image_id: deployImage,
-        macs: selectedMacList,
-        disk_plan: diskPlan,
-      });
-      setPreview(p);
-      setConfirmText("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "预览失败");
+      setFormError(err instanceof Error ? err.message : "保存失败");
     }
   }
 
   async function onDeploy(e: FormEvent) {
     e.preventDefault();
-    setError("");
-    setMessage("");
+    setFormError("");
     if (selectedMacList.length === 0) {
-      setError("请先勾选至少一台目标客户端");
+      setFormError("请先勾选至少一台目标客户端");
       return;
     }
-    if (!preview) {
-      setError("请先预览并确认覆盖范围");
-      return;
-    }
-    if (confirmText.trim() !== "确认覆盖") {
-      setError('请在确认框输入「确认覆盖」');
+    if (!deployImage) {
+      setFormError("请选择镜像");
       return;
     }
     try {
@@ -259,31 +256,159 @@ export function TasksPage() {
         edge_id: edgeId || undefined,
         confirm_destructive: true,
       });
-      setMessage(`已创建部署任务（${selectedMacList.length} 台）`);
-      setPreview(null);
-      setConfirmText("");
       setSelectedMacs(new Set());
+      setModal(null);
+      msg.success(`已创建部署任务（${selectedMacList.length} 台）`);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "创建失败");
+      setFormError(err instanceof Error ? err.message : "创建失败");
     }
   }
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div>
-        <h1>维护任务</h1>
-        <p className="muted">
-          采集入库与批量部署；部署前必须确认覆盖范围。区分「同步到边缘」与「部署到终端」。
-        </p>
+      <div className="panel-head">
+        <div>
+          <h1>维护任务</h1>
+          <p className="muted">
+            采集入库与批量部署；区分「同步到边缘」与「部署到终端」。
+          </p>
+        </div>
+        <div className="page-actions">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => openModal("capture")}
+          >
+            采集任务
+          </button>
+          <button
+            type="button"
+            className="btn accent"
+            onClick={() => openModal("deploy")}
+          >
+            部署任务
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => openModal("lifecycle")}
+          >
+            超时设置
+          </button>
+        </div>
       </div>
 
-      {error ? <p className="error">{error}</p> : null}
-      {message ? <p className="muted">{message}</p> : null}
+      <div className="card">
+        <div className="panel-head">
+          <div>
+            <h2>任务列表</h2>
+            <p className="muted" style={{ margin: 0 }}>
+              进度约 1.5 秒自动刷新，无需手动刷新页面
+            </p>
+          </div>
+          <button
+            className="btn ghost"
+            type="button"
+            onClick={() =>
+              api.tasks
+                .exportCsv()
+                .then(() => msg.success("已开始导出 CSV"))
+                .catch((err) => msg.error(err.message))
+            }
+          >
+            导出 CSV
+          </button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>进度</th>
+              <th>策略</th>
+              <th>目标</th>
+              <th>更新</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map((t) => {
+              const progressTarget =
+                t.targets.find(
+                  (tg) =>
+                    (tg.state === "running" || tg.state === "pending") &&
+                    tg.detail,
+                ) ||
+                t.targets.find((tg) => tg.detail) ||
+                t.targets[0];
+              const progressText =
+                progressTarget?.detail &&
+                /\d+(\.\d+)?\s*\/\s*(\d+(\.\d+)?|\?)\s*GB/i.test(
+                  progressTarget.detail,
+                )
+                  ? progressTarget.detail.split("·")[0].trim()
+                  : progressTarget && progressTarget.progress > 0
+                    ? `${Math.round(progressTarget.progress * 100)}%`
+                    : "—";
+              const macSummary = t.targets.length
+                ? `${t.targets.map((tg) => tg.mac).join(", ")} · ${
+                    t.targets.length === 1
+                      ? taskStateLabel(t.targets[0].state)
+                      : `${t.targets.length} 台`
+                  }`
+                : "—";
+              const err = t.targets
+                .map((tg) => tg.error_message)
+                .filter(Boolean)
+                .join("; ");
+              return (
+                <tr key={t.id}>
+                  <td>{t.name || t.id.slice(0, 8)}</td>
+                  <td>{taskKindLabel(t.kind)}</td>
+                  <td>{taskStateLabel(t.state)}</td>
+                  <td className="mono">{progressText}</td>
+                  <td className="muted">{diskPlanLabel(t.disk_plan)}</td>
+                  <td className="mono" title={err || undefined}>
+                    {macSummary}
+                    {err ? ` · ${err}` : ""}
+                  </td>
+                  <td className="muted">
+                    {new Date(t.updated_at).toLocaleString()}
+                  </td>
+                  <td>
+                    {t.state === "pending" || t.state === "running" ? (
+                      <button
+                        className="btn ghost"
+                        type="button"
+                        onClick={() => onCancelTask(t.id)}
+                      >
+                        结束
+                      </button>
+                    ) : null}
+                  </td>
+                </tr>
+              );
+            })}
+            {tasks.length === 0 ? (
+              <tr>
+                <td colSpan={8} className="muted">
+                  暂无任务
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
 
-      <div className="form-row">
-        <form className="card" onSubmit={onCapture}>
-          <h2>采集任务</h2>
+      <Modal
+        open={modal === "capture"}
+        title="采集任务"
+        onClose={() => setModal(null)}
+      >
+        <form onSubmit={onCapture}>
+          {formError ? <p className="error">{formError}</p> : null}
           <div className="field">
             <label>金样机</label>
             <select
@@ -299,7 +424,9 @@ export function TasksPage() {
               required
             >
               <option value="" disabled>
-                {clients.length === 0 ? "暂无终端，请先 PXE 报到登记" : "请选择终端"}
+                {clients.length === 0
+                  ? "暂无终端，请先 PXE 报到登记"
+                  : "请选择终端"}
               </option>
               {clients.map((c) => (
                 <option key={c.id} value={c.mac}>
@@ -327,22 +454,38 @@ export function TasksPage() {
               ))}
             </select>
           </div>
-          <button className="btn" type="submit">
-            下发采集
-          </button>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setModal(null)}
+            >
+              取消
+            </button>
+            <button className="btn" type="submit">
+              下发采集
+            </button>
+          </div>
         </form>
+      </Modal>
 
-        <form className="card" onSubmit={onDeploy}>
-          <h2>部署任务</h2>
+      <Modal
+        open={modal === "deploy"}
+        title="部署任务"
+        onClose={() => setModal(null)}
+        wide
+      >
+        <form onSubmit={onDeploy}>
+          {formError ? <p className="error">{formError}</p> : null}
           <div className="field">
             <label>镜像</label>
             <select
               value={deployImage}
-              onChange={(e) => {
-                setDeployImage(e.target.value);
-                setPreview(null);
-              }}
+              onChange={(e) => setDeployImage(e.target.value)}
             >
+              {images.length === 0 ? (
+                <option value="">暂无镜像</option>
+              ) : null}
               {images.map((img) => (
                 <option key={img.id} value={img.id}>
                   {img.name}
@@ -404,10 +547,7 @@ export function TasksPage() {
               <button
                 type="button"
                 className="btn ghost"
-                onClick={() => {
-                  setSelectedMacs(new Set());
-                  setPreview(null);
-                }}
+                onClick={() => setSelectedMacs(new Set())}
                 disabled={selectedMacs.size === 0}
               >
                 清除已选
@@ -475,10 +615,7 @@ export function TasksPage() {
             <label>磁盘策略</label>
             <select
               value={diskPlan}
-              onChange={(e) => {
-                setDiskPlan(e.target.value);
-                setPreview(null);
-              }}
+              onChange={(e) => setDiskPlan(e.target.value)}
             >
               {DISK_PLANS.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -490,164 +627,74 @@ export function TasksPage() {
           <p className="muted">
             {DISK_PLANS.find((p) => p.id === diskPlan)?.hint}
           </p>
-          <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+          <div className="field">
+            <label>指定 Edge（可选）</label>
+            <select value={edgeId} onChange={(e) => setEdgeId(e.target.value)}>
+              <option value="">任意</option>
+              {edges.map((ed) => (
+                <option key={ed.id} value={ed.id}>
+                  {ed.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="modal-actions">
             <button
-              className="btn ghost"
               type="button"
-              onClick={onPreview}
-              disabled={selectedMacs.size === 0}
+              className="btn ghost"
+              onClick={() => setModal(null)}
             >
-              预览覆盖范围（{selectedMacs.size} 台）
+              取消
             </button>
             <button
               className="btn"
               type="submit"
-              disabled={!preview || selectedMacs.size === 0}
+              disabled={selectedMacs.size === 0 || !deployImage}
             >
-              下发部署
+              下发部署（{selectedMacs.size} 台）
             </button>
           </div>
-          {preview ? (
-            <div className="card" style={{ marginTop: "0.85rem" }}>
-              <strong>{preview.image_name}</strong>
-              <p className="error">{preview.warning}</p>
-              <p className="muted mono">
-                将覆盖：{JSON.stringify(preview.overwrite_partitions)}
-              </p>
-              <p className="muted mono">
-                将保留：{JSON.stringify(preview.keep_partitions)}
-              </p>
-              <div className="field">
-                <label>输入「确认覆盖」继续</label>
-                <input
-                  value={confirmText}
-                  onChange={(e) => setConfirmText(e.target.value)}
-                  placeholder="确认覆盖"
-                />
-              </div>
-            </div>
-          ) : null}
         </form>
-      </div>
+      </Modal>
 
-      <form className="card" onSubmit={onSaveLifecycle}>
-        <h2>任务超时收尸</h2>
-        <p className="muted">
-          pending/running 超过设定时长无进度更新则自动标失败。当前：
-          {lifecycle.stale_after_secs <= 0
-            ? "已关闭"
-            : `${Math.round(lifecycle.stale_after_secs / 3600)} 小时`}
-          。设为 0 关闭自动。
-        </p>
-        <div className="field">
-          <label>无进度超时（小时）</label>
-          <input
-            type="number"
-            min={0}
-            step={1}
-            value={staleHours}
-            onChange={(e) => setStaleHours(e.target.value)}
-          />
-        </div>
-        <button className="btn" type="submit">
-          保存
-        </button>
-      </form>
-
-      <div className="card">
-        <div className="panel-head">
-          <h2>任务历史</h2>
-          <button
-            className="btn ghost"
-            type="button"
-            onClick={() =>
-              api.tasks.exportCsv().catch((err) => setError(err.message))
-            }
-          >
-            导出 CSV
-          </button>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>类型</th>
-              <th>状态</th>
-              <th>进度</th>
-              <th>策略</th>
-              <th>目标</th>
-              <th>更新</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {tasks.map((t) => {
-              const progressTarget =
-                t.targets.find(
-                  (tg) =>
-                    (tg.state === "running" || tg.state === "pending") &&
-                    tg.detail,
-                ) ||
-                t.targets.find((tg) => tg.detail) ||
-                t.targets[0];
-              const progressText =
-                progressTarget?.detail &&
-                /\d+(\.\d+)?\s*\/\s*(\d+(\.\d+)?|\?)\s*GB/i.test(
-                  progressTarget.detail,
-                )
-                  ? progressTarget.detail.split("·")[0].trim()
-                  : progressTarget && progressTarget.progress > 0
-                    ? `${Math.round(progressTarget.progress * 100)}%`
-                    : "—";
-              const macSummary = t.targets.length
-                ? `${t.targets.map((tg) => tg.mac).join(", ")} · ${
-                    t.targets.length === 1
-                      ? t.targets[0].state
-                      : `${t.targets.length} 台`
-                  }`
-                : "—";
-              const err = t.targets
-                .map((tg) => tg.error_message)
-                .filter(Boolean)
-                .join("; ");
-              return (
-                <tr key={t.id}>
-                  <td>{t.name || t.id.slice(0, 8)}</td>
-                  <td>{t.kind}</td>
-                  <td>{t.state}</td>
-                  <td className="mono">{progressText}</td>
-                  <td className="mono muted">{t.disk_plan}</td>
-                  <td className="mono" title={err || undefined}>
-                    {macSummary}
-                    {err ? ` · ${err}` : ""}
-                  </td>
-                  <td className="muted">
-                    {new Date(t.updated_at).toLocaleString()}
-                  </td>
-                  <td>
-                    {t.state === "pending" || t.state === "running" ? (
-                      <button
-                        className="btn ghost"
-                        type="button"
-                        onClick={() => onCancelTask(t.id)}
-                      >
-                        结束
-                      </button>
-                    ) : null}
-                  </td>
-                </tr>
-              );
-            })}
-            {tasks.length === 0 ? (
-              <tr>
-                <td colSpan={8} className="muted">
-                  暂无任务
-                </td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
+      <Modal
+        open={modal === "lifecycle"}
+        title="超时设置"
+        onClose={() => setModal(null)}
+      >
+        <form onSubmit={onSaveLifecycle}>
+          {formError ? <p className="error">{formError}</p> : null}
+          <p className="muted">
+            等待中/进行中任务超过设定时长无进度更新则自动标失败。当前：
+            {lifecycle.stale_after_secs <= 0
+              ? "已关闭"
+              : `${Math.round(lifecycle.stale_after_secs / 3600)} 小时`}
+            。设为 0 关闭自动。
+          </p>
+          <div className="field">
+            <label>无进度超时（小时）</label>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={staleHours}
+              onChange={(e) => setStaleHours(e.target.value)}
+            />
+          </div>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setModal(null)}
+            >
+              取消
+            </button>
+            <button className="btn" type="submit">
+              保存
+            </button>
+          </div>
+        </form>
+      </Modal>
     </div>
   );
 }

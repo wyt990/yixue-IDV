@@ -6,22 +6,61 @@ import {
   type ImageReplica,
 } from "../api";
 import { Modal } from "../components/Modal";
+import { useMessage } from "../message";
+
+function formatBytes(n: number) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatRate(bps: number) {
+  if (!Number.isFinite(bps) || bps <= 0) return "0 B/s";
+  if (bps < 1024) return `${Math.round(bps)} B/s`;
+  if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
+function formatHostLoad(edge: EdgeNode) {
+  if (!edge.online) return "—";
+  const cpu = Number(edge.cpu_pct ?? 0);
+  const memUsed = Number(edge.mem_used_bytes ?? 0);
+  const memTotal = Number(edge.mem_total_bytes ?? 0);
+  const rx = Number(edge.net_rx_bps ?? 0);
+  const tx = Number(edge.net_tx_bps ?? 0);
+  const mem =
+    memTotal > 0
+      ? `${formatBytes(memUsed)}/${formatBytes(memTotal)}`
+      : formatBytes(memUsed);
+  return `CPU ${cpu.toFixed(0)}% · 内存 ${mem} · ↓${formatRate(rx)} / ↑${formatRate(tx)}`;
+}
 
 export function EdgesPage() {
+  const msg = useMessage();
   const [edges, setEdges] = useState<EdgeNode[]>([]);
   const [images, setImages] = useState<ImageItem[]>([]);
   const [replicas, setReplicas] = useState<ImageReplica[]>([]);
   const [selectedEdge, setSelectedEdge] = useState("");
   const [selectedImage, setSelectedImage] = useState("");
   const [name, setName] = useState("");
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [detailEdge, setDetailEdge] = useState<EdgeNode | null>(null);
   const [editName, setEditName] = useState("");
   const [editCaptureTmp, setEditCaptureTmp] = useState("");
   const [formError, setFormError] = useState("");
   const [showToken, setShowToken] = useState(false);
+
+  async function refreshList() {
+    const e = await api.edges.list();
+    setEdges(e);
+    if (!selectedEdge && e[0]) setSelectedEdge(e[0].id);
+    setDetailEdge((prev) => {
+      if (!prev) return prev;
+      return e.find((x) => x.id === prev.id) ?? prev;
+    });
+  }
 
   async function refresh() {
     const [e, imgs] = await Promise.all([api.edges.list(), api.images.list()]);
@@ -31,13 +70,17 @@ export function EdgesPage() {
     if (!selectedImage && imgs[0]) setSelectedImage(imgs[0].id);
     const edgeId = selectedEdge || e[0]?.id;
     if (edgeId) setReplicas(await api.edges.replicas(edgeId));
+    setDetailEdge((prev) => {
+      if (!prev) return prev;
+      return e.find((x) => x.id === prev.id) ?? prev;
+    });
   }
 
   useEffect(() => {
-    refresh().catch((err) => setError(err.message));
+    refresh().catch((err) => msg.error(err.message));
     const timer = setInterval(() => {
-      refresh().catch(() => undefined);
-    }, 5000);
+      refreshList().catch(() => undefined);
+    }, 2500);
     return () => clearInterval(timer);
   }, []);
 
@@ -46,7 +89,7 @@ export function EdgesPage() {
     api.edges
       .replicas(selectedEdge)
       .then(setReplicas)
-      .catch((err) => setError(err.message));
+      .catch((err) => msg.error(err.message));
   }, [selectedEdge]);
 
   function openCreate() {
@@ -61,7 +104,7 @@ export function EdgesPage() {
     try {
       const edge = await api.edges.create(name);
       setCreateOpen(false);
-      setMessage("已创建边缘节点，请复制 token 写入 edge.toml");
+      msg.success("已创建边缘节点，请复制 token 写入 edge.toml");
       await refresh();
       setSelectedEdge(edge.id);
       openDetail(edge);
@@ -81,7 +124,7 @@ export function EdgesPage() {
   async function copyToken(token: string) {
     try {
       await navigator.clipboard.writeText(token);
-      setMessage("已复制完整 token 到剪贴板");
+      msg.success("已复制完整 token 到剪贴板");
     } catch {
       // fallback for older browsers / insecure context
       const ta = document.createElement("textarea");
@@ -90,7 +133,7 @@ export function EdgesPage() {
       ta.select();
       document.execCommand("copy");
       document.body.removeChild(ta);
-      setMessage("已复制完整 token 到剪贴板");
+      msg.success("已复制完整 token 到剪贴板");
     }
   }
 
@@ -106,7 +149,7 @@ export function EdgesPage() {
       );
       setDetailEdge(updated);
       setEditCaptureTmp(updated.capture_tmp_dir ?? "");
-      setMessage(
+      msg.success(
         "已保存；采集暂存目录将在 Edge 下次心跳（约数秒）后生效",
       );
       await refresh();
@@ -129,7 +172,7 @@ export function EdgesPage() {
       const edge = await api.edges.rotateToken(detailEdge.id);
       setDetailEdge(edge);
       setShowToken(true);
-      setMessage("令牌已轮换，请重新复制到 edge.toml");
+      msg.success("令牌已轮换，请重新复制到 edge.toml");
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "轮换失败");
@@ -137,47 +180,41 @@ export function EdgesPage() {
   }
 
   async function syncNow(purgeFirst: boolean) {
-    setError("");
-    setMessage("");
     try {
       await api.edges.sync(selectedEdge, selectedImage, purgeFirst);
-      setMessage(purgeFirst ? "已下发清空并同步" : "已下发同步任务");
+      msg.success(purgeFirst ? "已下发清空并同步" : "已下发同步任务");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "同步失败");
+      msg.error(err instanceof Error ? err.message : "同步失败");
     }
   }
 
   async function purgeSelected() {
-    setError("");
-    setMessage("");
     try {
       await api.edges.purgeReplica(selectedEdge, selectedImage);
-      setMessage("已下发清空缓存");
+      msg.success("已下发清空缓存");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "清空失败");
+      msg.error(err instanceof Error ? err.message : "清空失败");
     }
   }
 
   async function purgeAll() {
-    setError("");
-    setMessage("");
     const edge = edges.find((e) => e.id === selectedEdge);
     if (!edge) return;
     const typed = window.prompt(
       `危险操作：清空 Edge「${edge.name}」全部镜像缓存。请输入节点名称确认：`,
     );
     if (typed !== edge.name) {
-      setError("未确认节点名，已取消整库清空");
+      msg.warning("未确认节点名，已取消整库清空");
       return;
     }
     try {
       await api.edges.purgeAll(selectedEdge);
-      setMessage("已下发整库清空");
+      msg.success("已下发整库清空");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "整库清空失败");
+      msg.error(err instanceof Error ? err.message : "整库清空失败");
     }
   }
 
@@ -185,15 +222,13 @@ export function EdgesPage() {
     if (!window.confirm(`删除边缘节点「${edge.name}」？其副本记录也会删除。`)) {
       return;
     }
-    setError("");
-    setMessage("");
     try {
       await api.edges.delete(edge.id);
       if (selectedEdge === edge.id) setSelectedEdge("");
       await refresh();
-      setMessage("已删除边缘节点");
+      msg.success("已删除边缘节点");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      msg.error(err instanceof Error ? err.message : "删除失败");
     }
   }
 
@@ -212,20 +247,17 @@ export function EdgesPage() {
           </button>
         </div>
       </div>
-      {error ? <p className="error">{error}</p> : null}
-      {message ? <p className="muted">{message}</p> : null}
-
       <div className="card">
         <div className="panel-head">
           <h2>节点列表</h2>
-          <span className="muted">{edges.length} 个</span>
+          <span className="muted">{edges.length} 个 · 约 2.5 秒自动刷新</span>
         </div>
         <table>
           <thead>
             <tr>
               <th>名称</th>
               <th>状态</th>
-              <th>缓存水位</th>
+              <th>节点负载</th>
               <th>listen</th>
               <th>token</th>
               <th>操作</th>
@@ -255,11 +287,8 @@ export function EdgesPage() {
                       {edge.online ? "在线" : "离线"}
                     </span>
                   </td>
-                  <td className="mono muted">
-                    {edge.cache_level || "ok"}
-                    {edge.cache_quota_bytes
-                      ? ` · ${edge.cache_used_bytes ?? 0}/${edge.cache_quota_bytes}`
-                      : ""}
+                  <td className="mono muted" title={formatHostLoad(edge)}>
+                    {formatHostLoad(edge)}
                   </td>
                   <td className="mono muted">{edge.listen_url || "—"}</td>
                   <td>

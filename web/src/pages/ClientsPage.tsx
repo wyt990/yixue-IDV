@@ -1,24 +1,48 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   api,
+  type Campus,
   type Client,
   type EnrollmentSettings,
+  type ImageItem,
   type Lab,
 } from "../api";
 import { Modal } from "../components/Modal";
+import { useMessage } from "../message";
+
+function resolveDefaultImageId(
+  labId: string,
+  labs: Lab[],
+  campuses: Campus[],
+): string | null {
+  const lab = labs.find((l) => l.id === labId);
+  if (!lab) return null;
+  if (lab.default_image_id) return lab.default_image_id;
+  const campus = campuses.find((c) => c.id === lab.campus_id);
+  return campus?.default_image_id || null;
+}
+
+const DISK_PLANS = [
+  { id: "wipe_whole_disk", label: "整盘覆盖" },
+  { id: "wipe_target_partitions", label: "仅系统分区" },
+  { id: "write_system_only", label: "仅写系统区" },
+] as const;
 
 export function ClientsPage() {
+  const msg = useMessage();
   const [labs, setLabs] = useState<Lab[]>([]);
+  const [campuses, setCampuses] = useState<Campus[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
+  const [images, setImages] = useState<ImageItem[]>([]);
   const [filterLabId, setFilterLabId] = useState("");
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const [addOpen, setAddOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [enrollOpen, setEnrollOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [captureOpen, setCaptureOpen] = useState(false);
+  const [deployOpen, setDeployOpen] = useState(false);
 
   const [labId, setLabId] = useState("");
   const [mac, setMac] = useState("");
@@ -33,6 +57,12 @@ export function ClientsPage() {
   const [moveLabId, setMoveLabId] = useState("");
   const [moveRename, setMoveRename] = useState(true);
 
+  const [captureMac, setCaptureMac] = useState("");
+  const [captureName, setCaptureName] = useState("");
+  const [deployImage, setDeployImage] = useState("");
+  const [diskPlan, setDiskPlan] = useState("wipe_whole_disk");
+  const [deployTargets, setDeployTargets] = useState<Client[]>([]);
+
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [editLabId, setEditLabId] = useState("");
@@ -44,14 +74,19 @@ export function ClientsPage() {
   );
 
   async function refresh() {
-    const [l, c] = await Promise.all([
+    const [l, camps, c, imgs] = await Promise.all([
       api.labs.list(),
+      api.campuses.list(),
       api.clients.list(filterLabId || undefined),
+      api.images.list(),
     ]);
     setLabs(l);
+    setCampuses(camps);
     setClients(c);
+    setImages(imgs);
     if (!labId && l[0]) setLabId(l[0].id);
     if (!moveLabId && l[0]) setMoveLabId(l[0].id);
+    if (!deployImage && imgs[0]) setDeployImage(imgs[0].id);
     setSelected((prev) => {
       const ids = new Set(c.map((x) => x.id));
       return new Set([...prev].filter((id) => ids.has(id)));
@@ -59,7 +94,7 @@ export function ClientsPage() {
   }
 
   useEffect(() => {
-    refresh().catch((err) => setError(err.message));
+    refresh().catch((err) => msg.error(err.message));
   }, [filterLabId]);
 
   function openAdd() {
@@ -84,8 +119,54 @@ export function ClientsPage() {
       setEnroll(e);
       setEnrollOpen(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "读取登记设置失败");
+      msg.error(err instanceof Error ? err.message : "读取登记设置失败");
     }
+  }
+
+  function openCapture() {
+    if (selected.size === 0) {
+      msg.warning("请先选择一台终端");
+      return;
+    }
+    if (selected.size > 1) {
+      msg.warning("采集系统一次只能选择一台终端");
+      return;
+    }
+    const id = [...selected][0];
+    const client = clients.find((c) => c.id === id);
+    if (!client) {
+      msg.warning("未找到选中的终端");
+      return;
+    }
+    setCaptureMac(client.mac);
+    setCaptureName(`${client.name}-金样`);
+    setFormError("");
+    setCaptureOpen(true);
+  }
+
+  function openDeploy() {
+    if (selected.size === 0) {
+      msg.warning("请先选择要清除缓存的终端");
+      return;
+    }
+    const targets = clients.filter((c) => selected.has(c.id));
+    if (targets.length === 0) {
+      msg.warning("未找到选中的终端");
+      return;
+    }
+    const resolved = targets.map((t) =>
+      resolveDefaultImageId(t.lab_id, labs, campuses),
+    );
+    const unique = [...new Set(resolved.filter(Boolean))] as string[];
+    if (unique.length === 1) {
+      setDeployImage(unique[0]);
+    } else if (!deployImage && images[0]) {
+      setDeployImage(images[0].id);
+    }
+    setDeployTargets(targets);
+    setDiskPlan("wipe_whole_disk");
+    setFormError("");
+    setDeployOpen(true);
   }
 
   async function createOne(e: FormEvent) {
@@ -98,7 +179,7 @@ export function ClientsPage() {
         name: name.trim() || undefined,
       });
       setAddOpen(false);
-      setMessage("已添加终端");
+      msg.success("已添加终端");
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "添加失败");
@@ -115,10 +196,10 @@ export function ClientsPage() {
     try {
       const res = await api.clients.bulk(labId, macs);
       setBulkOpen(false);
-      setMessage(
+      msg.success(
         `批量完成：新增 ${res.created.length}，跳过 ${res.skipped.length}，错误 ${res.errors.length}`,
       );
-      if (res.errors.length) setError(res.errors.join("; "));
+      if (res.errors.length) msg.error(res.errors.join("; "));
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "批量失败");
@@ -135,7 +216,7 @@ export function ClientsPage() {
         default_campus_id: lab?.campus_id || "",
       });
       setEnrollOpen(false);
-      setMessage(
+      msg.success(
         enroll.default_lab_id
           ? "已保存自动登记默认机房"
           : "已清空默认机房（未知 MAC 不会自动入库）",
@@ -146,8 +227,6 @@ export function ClientsPage() {
   }
 
   async function saveClient(id: string) {
-    setError("");
-    setMessage("");
     try {
       await api.clients.update(id, {
         lab_id: editLabId,
@@ -156,23 +235,21 @@ export function ClientsPage() {
       });
       setEditingId(null);
       await refresh();
-      setMessage("已更新终端");
+      msg.success("已更新终端");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "更新失败");
+      msg.error(err instanceof Error ? err.message : "更新失败");
     }
   }
 
   async function removeClient(c: Client) {
     if (!window.confirm(`删除终端 ${c.mac}？`)) return;
-    setError("");
-    setMessage("");
     try {
       await api.clients.delete(c.id);
       if (editingId === c.id) setEditingId(null);
       await refresh();
-      setMessage("已删除终端");
+      msg.success("已删除终端");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      msg.error(err instanceof Error ? err.message : "删除失败");
     }
   }
 
@@ -193,15 +270,14 @@ export function ClientsPage() {
     const ids = [...selected];
     if (!ids.length) return;
     if (!window.confirm(`批量删除选中的 ${ids.length} 台终端？`)) return;
-    setError("");
     try {
       const res = await api.clients.bulkDelete(ids);
-      setMessage(`已删除 ${res.affected} 台`);
-      if (res.errors.length) setError(res.errors.join("; "));
+      msg.success(`已删除 ${res.affected} 台`);
+      if (res.errors.length) msg.error(res.errors.join("; "));
       setSelected(new Set());
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "批量删除失败");
+      msg.error(err instanceof Error ? err.message : "批量删除失败");
     }
   }
 
@@ -213,14 +289,55 @@ export function ClientsPage() {
     try {
       const res = await api.clients.bulkMove(ids, moveLabId, moveRename);
       setMoveOpen(false);
-      setMessage(
+      msg.success(
         `已移动 ${res.affected} 台${moveRename ? "（并按目标机房规则重命名）" : ""}`,
       );
-      if (res.errors.length) setError(res.errors.join("; "));
+      if (res.errors.length) msg.error(res.errors.join("; "));
       setSelected(new Set());
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "批量移动失败");
+    }
+  }
+
+  async function onCapture(e: FormEvent) {
+    e.preventDefault();
+    setFormError("");
+    try {
+      await api.tasks.capture({
+        mac: captureMac,
+        name: captureName || undefined,
+      });
+      setCaptureOpen(false);
+      msg.success("已创建采集任务");
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "创建失败");
+    }
+  }
+
+  async function onDeployConfirm(e: FormEvent) {
+    e.preventDefault();
+    setFormError("");
+    if (!deployImage) {
+      setFormError("请选择镜像");
+      return;
+    }
+    if (deployTargets.length === 0) {
+      setFormError("没有目标终端");
+      return;
+    }
+    try {
+      await api.tasks.deploy({
+        image_id: deployImage,
+        macs: deployTargets.map((c) => c.mac),
+        disk_plan: diskPlan,
+        confirm_destructive: true,
+      });
+      setDeployOpen(false);
+      setSelected(new Set());
+      msg.success(`已创建部署任务（${deployTargets.length} 台）`);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "创建失败");
     }
   }
 
@@ -261,8 +378,6 @@ export function ClientsPage() {
       {labs.length === 0 ? (
         <p className="muted">请先在「校区 / 机房」中创建机房，再登记终端。</p>
       ) : null}
-      {error ? <p className="error">{error}</p> : null}
-      {message ? <p className="muted">{message}</p> : null}
 
       <div className="card">
         <div className="panel-head">
@@ -282,6 +397,12 @@ export function ClientsPage() {
             <span className="muted">{clients.length} 台</span>
           </div>
           <div className="page-actions">
+            <button type="button" className="btn" onClick={openCapture}>
+              采集系统
+            </button>
+            <button type="button" className="btn accent" onClick={openDeploy}>
+              清除缓存
+            </button>
             <button
               type="button"
               className="btn ghost"
@@ -612,6 +733,106 @@ export function ClientsPage() {
             </button>
             <button className="btn" type="submit" disabled={!moveLabId}>
               移动
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={captureOpen}
+        title="采集系统"
+        onClose={() => setCaptureOpen(false)}
+      >
+        <form onSubmit={onCapture}>
+          {formError ? <p className="error">{formError}</p> : null}
+          <p className="muted">
+            将对终端 <span className="mono">{captureMac}</span> 下发采集任务。
+          </p>
+          <div className="field">
+            <label>任务/镜像名</label>
+            <input
+              value={captureName}
+              onChange={(e) => setCaptureName(e.target.value)}
+              placeholder="机房A-金样"
+            />
+          </div>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setCaptureOpen(false)}
+            >
+              取消
+            </button>
+            <button className="btn" type="submit">
+              下发采集
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={deployOpen}
+        title="清除缓存"
+        onClose={() => setDeployOpen(false)}
+      >
+        <form onSubmit={onDeployConfirm}>
+          {formError ? <p className="error">{formError}</p> : null}
+          <p className="error">
+            将对以下 {deployTargets.length}{" "}
+            台终端下发部署任务（覆盖磁盘），请确认后继续。
+          </p>
+          <ul className="muted" style={{ margin: "0 0 0.75rem", paddingLeft: "1.2rem" }}>
+            {deployTargets.map((c) => (
+              <li key={c.id}>
+                {c.name}（<span className="mono">{c.mac}</span>）
+              </li>
+            ))}
+          </ul>
+          <div className="field">
+            <label>镜像</label>
+            <select
+              value={deployImage}
+              onChange={(e) => setDeployImage(e.target.value)}
+              required
+            >
+              {images.length === 0 ? (
+                <option value="">暂无镜像，请先在镜像库登记</option>
+              ) : null}
+              {images.map((img) => (
+                <option key={img.id} value={img.id}>
+                  {img.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>磁盘策略</label>
+            <select
+              value={diskPlan}
+              onChange={(e) => setDiskPlan(e.target.value)}
+            >
+              {DISK_PLANS.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setDeployOpen(false)}
+            >
+              取消
+            </button>
+            <button
+              className="btn danger"
+              type="submit"
+              disabled={!deployImage || deployTargets.length === 0}
+            >
+              确认清除并部署
             </button>
           </div>
         </form>

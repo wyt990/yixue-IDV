@@ -10,7 +10,7 @@ use crate::models::{
 };
 use crate::state::AppState;
 
-const EDGE_COLS: &str = "id, name, node_token, listen_url, last_seen, cache_used_bytes, cache_quota_bytes, cache_warn_pct, cache_level, capture_tmp_dir, created_at";
+const EDGE_COLS: &str = "id, name, node_token, listen_url, last_seen, cache_used_bytes, cache_quota_bytes, cache_warn_pct, cache_level, capture_tmp_dir, cpu_pct, mem_used_bytes, mem_total_bytes, net_rx_bps, net_tx_bps, created_at";
 
 pub async fn list(
     State(state): State<AppState>,
@@ -55,6 +55,11 @@ pub async fn create(
         cache_warn_pct: 85.0,
         cache_level: "ok".into(),
         capture_tmp_dir: String::new(),
+        cpu_pct: 0.0,
+        mem_used_bytes: 0,
+        mem_total_bytes: 0,
+        net_rx_bps: 0,
+        net_tx_bps: 0,
         created_at: Utc::now(),
     };
     sqlx::query(

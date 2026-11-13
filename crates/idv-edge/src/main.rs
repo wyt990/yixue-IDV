@@ -1,4 +1,5 @@
 mod dhcp;
+mod host_metrics;
 mod p2p;
 mod pe_api;
 mod tftp;
@@ -150,7 +151,7 @@ fn default_log() -> String {
     "info,idv_edge=debug".into()
 }
 fn default_heartbeat_secs() -> u64 {
-    10
+    3
 }
 fn default_poll_secs() -> u64 {
     2
@@ -358,6 +359,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
         sync_slots: Arc::new(tokio::sync::Semaphore::new(
             cfg.max_concurrent_syncs.max(1),
         )),
+        host_metrics: Arc::new(host_metrics::HostMetricsSampler::new()),
     };
 
     if let Err(err) = runtime.register().await {
@@ -367,7 +369,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     }
 
     let worker_runtime = runtime.clone();
-    let heartbeat_secs = cfg.heartbeat_secs.max(3);
+    let heartbeat_secs = cfg.heartbeat_secs.max(2);
     let poll_secs = cfg.poll_secs.max(1);
     tokio::spawn(async move {
         worker_runtime.run_loops(heartbeat_secs, poll_secs).await;

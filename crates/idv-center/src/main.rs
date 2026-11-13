@@ -5,6 +5,7 @@ mod enroll;
 mod lab_naming;
 mod mac;
 mod models;
+mod site_defaults;
 mod state;
 
 use std::net::SocketAddr;

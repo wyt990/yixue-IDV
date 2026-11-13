@@ -113,12 +113,24 @@ pub async fn create_capture(
 ) -> Result<(StatusCode, Json<TaskView>), (StatusCode, String)> {
     let mac = normalize_mac(&body.mac).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let now = Utc::now();
+    let edge_id = match body.edge_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => Some(id),
+        None => {
+            if let Some(lab_id) =
+                crate::site_defaults::lab_id_for_mac(&state.pool, &mac).await?
+            {
+                crate::site_defaults::resolve_preferred_edge_id(&state.pool, &lab_id).await?
+            } else {
+                None
+            }
+        }
+    };
     let task = MaintenanceTask {
         id: new_id(),
         kind: "capture".into(),
         state: "pending".into(),
         image_id: None,
-        edge_id: body.edge_id,
+        edge_id,
         disk_plan: "wipe_whole_disk".into(),
         name: if body.name.trim().is_empty() {
             format!("capture-{mac}")
@@ -233,12 +245,32 @@ pub async fn create_deploy(
     }
 
     let now = Utc::now();
+    let mut normalized_macs = Vec::with_capacity(body.macs.len());
+    for raw in &body.macs {
+        normalized_macs.push(normalize_mac(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?);
+    }
+    let edge_id = match body.edge_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => Some(id),
+        None => {
+            if let Some(mac0) = normalized_macs.first() {
+                if let Some(lab_id) =
+                    crate::site_defaults::lab_id_for_mac(&state.pool, mac0).await?
+                {
+                    crate::site_defaults::resolve_preferred_edge_id(&state.pool, &lab_id).await?
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    };
     let task = MaintenanceTask {
         id: new_id(),
         kind: "deploy".into(),
         state: "pending".into(),
         image_id: Some(body.image_id),
-        edge_id: body.edge_id,
+        edge_id,
         disk_plan: body.disk_plan,
         name: if body.name.trim().is_empty() {
             format!("deploy-{}", now.timestamp())
@@ -252,8 +284,7 @@ pub async fn create_deploy(
     };
     insert_task(&state, &task).await?;
     let mut targets = Vec::new();
-    for raw in body.macs {
-        let mac = normalize_mac(&raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    for mac in normalized_macs {
         let target = MaintenanceTaskTarget {
             id: new_id(),
             task_id: task.id.clone(),

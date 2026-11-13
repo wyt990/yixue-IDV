@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use chrono::Utc;
 
 use crate::auth::AuthUser;
+use crate::lab_naming::CAMPUS_COLS;
 use crate::models::{Campus, CreateCampus, UpdateCampus, new_id};
 use crate::state::AppState;
 
@@ -11,11 +12,12 @@ pub async fn list(
     State(state): State<AppState>,
     _user: AuthUser,
 ) -> Result<Json<Vec<Campus>>, (StatusCode, String)> {
-    let rows =
-        sqlx::query_as::<_, Campus>("SELECT id, name, created_at FROM campuses ORDER BY name")
-            .fetch_all(&state.pool)
-            .await
-            .map_err(internal)?;
+    let sql = format!("SELECT {CAMPUS_COLS} FROM campuses ORDER BY name");
+    let mut rows = sqlx::query_as::<_, Campus>(&sql)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal)?;
+    crate::site_defaults::attach_campus_edges(&state.pool, &mut rows).await?;
     Ok(Json(rows))
 }
 
@@ -24,13 +26,15 @@ pub async fn get(
     _user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Campus>, (StatusCode, String)> {
-    sqlx::query_as::<_, Campus>("SELECT id, name, created_at FROM campuses WHERE id = ?")
-        .bind(id)
+    let sql = format!("SELECT {CAMPUS_COLS} FROM campuses WHERE id = ?");
+    let mut campus = sqlx::query_as::<_, Campus>(&sql)
+        .bind(&id)
         .fetch_optional(&state.pool)
         .await
         .map_err(internal)?
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, "campus not found".into()))
+        .ok_or((StatusCode::NOT_FOUND, "campus not found".into()))?;
+    campus.edge_ids = crate::site_defaults::load_campus_edge_ids(&state.pool, &id).await?;
+    Ok(Json(campus))
 }
 
 pub async fn create(
@@ -45,7 +49,9 @@ pub async fn create(
     let campus = Campus {
         id: new_id(),
         name: name.to_string(),
+        default_image_id: None,
         created_at: Utc::now(),
+        edge_ids: Vec::new(),
     };
     sqlx::query("INSERT INTO campuses (id, name, created_at) VALUES (?, ?, ?)")
         .bind(&campus.id)
@@ -89,13 +95,21 @@ pub async fn update(
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "campus not found".into()));
     }
-    sqlx::query_as::<_, Campus>("SELECT id, name, created_at FROM campuses WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(internal)?
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, "campus not found".into()))
+
+    if let Some(edge_ids) = body.edge_ids {
+        let image_id =
+            crate::site_defaults::normalize_default_image_id(&state.pool, body.default_image_id)
+                .await?;
+        sqlx::query("UPDATE campuses SET default_image_id = ? WHERE id = ?")
+            .bind(&image_id)
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal)?;
+        crate::site_defaults::replace_campus_edges(&state.pool, &id, &edge_ids).await?;
+    }
+
+    get(State(state), user, Path(id)).await
 }
 
 pub async fn delete(

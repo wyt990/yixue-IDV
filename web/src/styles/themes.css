@@ -216,6 +216,10 @@ textarea {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.grid.stats.stats-6 {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
 .stat-value {
   font-size: 1.75rem;
   font-weight: 700;
@@ -414,6 +418,59 @@ table td select {
   margin-top: 0.5rem;
 }
 
+.msg-host {
+  position: fixed;
+  top: 0.85rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  width: min(420px, calc(100vw - 1.5rem));
+  pointer-events: none;
+}
+
+.msg-toast {
+  pointer-events: auto;
+  padding: 0.65rem 0.9rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  font-size: 0.92rem;
+  line-height: 1.35;
+  animation: msg-slide-in 0.28s ease-out;
+}
+
+.msg-success {
+  background: #e8f6ee;
+  border-color: #8fcea8;
+  color: #1b5e35;
+}
+
+.msg-warning {
+  background: #fff7e6;
+  border-color: #e6c36a;
+  color: #7a5a00;
+}
+
+.msg-error {
+  background: #fdeceb;
+  border-color: #e39a96;
+  color: #8a1f1a;
+}
+
+@keyframes msg-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -484,7 +541,8 @@ table td select {
     flex-direction: row;
   }
 
-  .grid.stats {
+  .grid.stats,
+  .grid.stats.stats-6 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
