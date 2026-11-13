@@ -422,20 +422,40 @@ export function EdgesPage() {
             </tr>
           </thead>
           <tbody>
-            {replicas.map((r) => (
-              <tr key={r.id}>
-                <td className="mono">{r.image_id.slice(0, 8)}…</td>
-                <td>
-                  <span className="tag">{r.state}</span>
-                </td>
-                <td className="mono">{Math.round(r.progress * 100)}%</td>
-                <td className="mono muted">
-                  {r.checksum_sha256
-                    ? `${r.checksum_sha256.slice(0, 12)}…`
-                    : "—"}
-                </td>
-              </tr>
-            ))}
+            {replicas.map((r) => {
+              const imgName =
+                images.find((i) => i.id === r.image_id)?.name ||
+                `${r.image_id.slice(0, 8)}…`;
+              const stateLabel: Record<string, string> = {
+                pending: "排队",
+                syncing: "同步中",
+                ready: "就绪",
+                purging: "清空中",
+                absent: "已清空",
+                error: "失败",
+              };
+              return (
+                <tr key={r.id}>
+                  <td>
+                    {imgName}
+                    <div className="mono muted" style={{ fontSize: "0.85em" }}>
+                      {r.image_id.slice(0, 8)}…
+                    </div>
+                  </td>
+                  <td>
+                    <span className="tag">
+                      {stateLabel[r.state] || r.state}
+                    </span>
+                  </td>
+                  <td className="mono">{Math.round(r.progress * 100)}%</td>
+                  <td className="mono muted">
+                    {r.checksum_sha256
+                      ? `${r.checksum_sha256.slice(0, 12)}…`
+                      : "—"}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

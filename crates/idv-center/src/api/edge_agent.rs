@@ -225,6 +225,23 @@ pub async fn next_command(
             .execute(&state.pool)
             .await
             .map_err(internal)?;
+        // Flip replica out of "pending" as soon as Edge claims the command,
+        // so UI does not sit at 0% until the first byte-progress report.
+        if let Some(image_id) = &c.image_id {
+            if matches!(c.kind.as_str(), "sync" | "purge_and_sync") {
+                let _ = crate::api::edges::upsert_replica(
+                    &state,
+                    &edge.id,
+                    image_id,
+                    "syncing",
+                    0.01,
+                    "",
+                    "",
+                    "",
+                )
+                .await;
+            }
+        }
     }
 
     Ok(Json(cmd.map(|mut c| {

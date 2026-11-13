@@ -10,6 +10,21 @@ function formatBytes(n: number) {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+/** Full images newest-first (created_at DESC). */
+function fullImagesNewestFirst(images: ImageItem[]) {
+  return images
+    .filter((i) => (i.content_type || "full") === "full")
+    .slice()
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+}
+
+function fullOptionLabel(img: ImageItem, fulls: ImageItem[]) {
+  const idx = fulls.findIndex((f) => f.id === img.id);
+  const tag =
+    idx === 0 ? "最新" : idx === 1 ? "第二新" : idx >= 0 ? `第${idx + 1}新` : "";
+  return tag ? `${img.name}（${tag}）` : img.name;
+}
+
 export function ImagesPage() {
   const msg = useMessage();
   const [images, setImages] = useState<ImageItem[]>([]);
@@ -169,9 +184,10 @@ export function ImagesPage() {
             type="button"
             className="btn ghost"
             onClick={() => {
-              const fulls = images.filter((i) => (i.content_type || "full") === "full");
-              setDeltaBaseId(fulls[0]?.id || "");
-              setDeltaTargetId(fulls[1]?.id || fulls[0]?.id || "");
+              // A=旧基线 → 默认第二新；B=新改装 → 默认最新；均可手选。
+              const fulls = fullImagesNewestFirst(images);
+              setDeltaBaseId(fulls[1]?.id || fulls[0]?.id || "");
+              setDeltaTargetId(fulls[0]?.id || "");
               setDeltaName("");
               setFormError("");
               setDeltaOpen(true);
@@ -183,8 +199,13 @@ export function ImagesPage() {
             type="button"
             className="btn ghost"
             onClick={() => {
-              const fulls = images.filter((i) => (i.content_type || "full") === "full");
-              const deltas = images.filter((i) => i.content_type === "delta");
+              const fulls = fullImagesNewestFirst(images);
+              const deltas = images
+                .filter((i) => i.content_type === "delta")
+                .slice()
+                .sort((a, b) =>
+                  String(b.created_at).localeCompare(String(a.created_at)),
+                );
               setApplyBaseId(fulls[0]?.id || "");
               setApplyDeltaId(deltas[0]?.id || "");
               setApplyName("");
@@ -495,41 +516,44 @@ export function ImagesPage() {
           {formError ? <p className="error">{formError}</p> : null}
           {busy ? <p className="muted">{busy}</p> : null}
           <p className="muted">
-            基线 A（旧）+ 目标 B（新改装全量）→ 差量文件。部署学生机仍用全量
-            B；差量用于少传数据后 apply 出 B。
+            基线 A（旧）→ 目标 B（新改装全量）生成差量。默认 A=第二新、B=最新，可手选。部署学生机仍用全量
+            B。
           </p>
-          <div className="field">
-            <label>基线全量 A</label>
-            <select
-              value={deltaBaseId}
-              onChange={(e) => setDeltaBaseId(e.target.value)}
-              required
-            >
-              {images
-                .filter((i) => (i.content_type || "full") === "full")
-                .map((i) => (
-                  <option key={i.id} value={i.id}>
-                    {i.name}
-                  </option>
-                ))}
-            </select>
-          </div>
-          <div className="field">
-            <label>目标全量 B</label>
-            <select
-              value={deltaTargetId}
-              onChange={(e) => setDeltaTargetId(e.target.value)}
-              required
-            >
-              {images
-                .filter((i) => (i.content_type || "full") === "full")
-                .map((i) => (
-                  <option key={i.id} value={i.id}>
-                    {i.name}
-                  </option>
-                ))}
-            </select>
-          </div>
+          {(() => {
+            const fulls = fullImagesNewestFirst(images);
+            return (
+              <>
+                <div className="field">
+                  <label>基线全量 A（旧 · 默认第二新）</label>
+                  <select
+                    value={deltaBaseId}
+                    onChange={(e) => setDeltaBaseId(e.target.value)}
+                    required
+                  >
+                    {fulls.map((i) => (
+                      <option key={i.id} value={i.id}>
+                        {fullOptionLabel(i, fulls)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field">
+                  <label>目标全量 B（新 · 默认最新）</label>
+                  <select
+                    value={deltaTargetId}
+                    onChange={(e) => setDeltaTargetId(e.target.value)}
+                    required
+                  >
+                    {fulls.map((i) => (
+                      <option key={i.id} value={i.id}>
+                        {fullOptionLabel(i, fulls)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </>
+            );
+          })()}
           <div className="field">
             <label>差量名称（可选）</label>
             <input

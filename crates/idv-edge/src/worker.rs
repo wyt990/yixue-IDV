@@ -69,6 +69,9 @@ struct ImageMeta {
     id: String,
     checksum_sha256: String,
     size_bytes: i64,
+    /// Center storage path; when reachable on this host, prefer hardlink/copy over HTTP.
+    #[serde(default)]
+    storage_uri: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,6 +532,67 @@ impl EdgeRuntime {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
 
+        let _ = self
+            .report(command_id, "running", 0.02, "", tmp.display().to_string(), "")
+            .await;
+
+        // Same-machine / shared volume: hardlink or copy instead of HTTP-pulling tens of GB.
+        if let Some(src) = local_storage_path(&meta.storage_uri) {
+            if src.exists() {
+                info!(
+                    src = %src.display(),
+                    dest = %dest.display(),
+                    "sync via local hardlink/copy (skip HTTP blob)"
+                );
+                let _ = self
+                    .report(
+                        command_id,
+                        "running",
+                        0.5,
+                        "",
+                        dest.display().to_string(),
+                        "",
+                    )
+                    .await;
+                if dest.exists() {
+                    tokio::fs::remove_file(&dest).await?;
+                }
+                let placed = match tokio::fs::hard_link(&src, &dest).await {
+                    Ok(()) => {
+                        info!(path = %dest.display(), "local hardlink ok");
+                        true
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "hardlink failed; falling back to copy");
+                        match tokio::fs::copy(&src, &dest).await {
+                            Ok(_) => true,
+                            Err(err2) => {
+                                warn!(error = %err2, "local copy failed; falling back to HTTP");
+                                false
+                            }
+                        }
+                    }
+                };
+                if placed {
+                    let expected = meta.checksum_sha256.to_ascii_lowercase();
+                    let meta_len = meta.size_bytes.max(0) as u64;
+                    let actual = tokio::fs::metadata(&dest).await?.len();
+                    if meta_len > 0 && actual != meta_len {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        anyhow::bail!(
+                            "local sync size mismatch: file={actual} expected={meta_len}"
+                        );
+                    }
+                    info!(
+                        path = %dest.display(),
+                        checksum = %expected,
+                        "image synced to edge cache (local)"
+                    );
+                    return Ok((dest.display().to_string(), expected));
+                }
+            }
+        }
+
         let blob_url = format!("{}/api/v1/edge/images/{image_id}/blob", self.center_url);
         let resp = self
             .client
@@ -548,7 +612,8 @@ impl EdgeRuntime {
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut hasher = Sha256::new();
         let mut written: u64 = 0;
-        let mut last_report = 0.0_f64;
+        let mut last_report = 0.02_f64;
+        let mut last_bytes_report = 0u64;
 
         let mut window_start = std::time::Instant::now();
         let mut window_bytes = 0u64;
@@ -575,7 +640,9 @@ impl EdgeRuntime {
             } else {
                 0.5
             };
-            if progress - last_report >= 0.1 {
+            let due_pct = progress - last_report >= 0.02;
+            let due_bytes = written.saturating_sub(last_bytes_report) >= 256 * 1024 * 1024;
+            if due_pct || due_bytes {
                 let _ = self
                     .report(
                         command_id,
@@ -587,6 +654,7 @@ impl EdgeRuntime {
                     )
                     .await;
                 last_report = progress;
+                last_bytes_report = written;
             }
         }
         file.flush().await?;
@@ -624,6 +692,21 @@ impl EdgeRuntime {
         );
         Ok((dest.display().to_string(), checksum))
     }
+}
+
+fn local_storage_path(storage_uri: &str) -> Option<PathBuf> {
+    let raw = storage_uri.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else if let Some(rest) = raw.strip_prefix("file://") {
+        PathBuf::from(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    Some(path)
 }
 
 #[allow(dead_code)]
