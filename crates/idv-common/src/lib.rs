@@ -3,6 +3,7 @@
 pub mod chunking;
 pub mod config;
 pub mod delta;
+pub mod endpoint_policy;
 pub mod error;
 pub mod fs_util;
 pub mod image_format;

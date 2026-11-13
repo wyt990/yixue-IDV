@@ -309,6 +309,15 @@ pub struct AgentHeartbeat {
     pub agent_version: String,
     #[serde(default = "default_trigger")]
     pub trigger: String,
+    /// Last DesiredState revision applied on the endpoint.
+    #[serde(default)]
+    pub applied_revision: u64,
+    /// Agent has a DesiredState waiting for reboot.
+    #[serde(default)]
+    pub pending_reboot: bool,
+    /// Free-form restore-driver status (e.g. protected / thawed / missing).
+    #[serde(default)]
+    pub driver_status: String,
 }
 
 fn default_trigger() -> String {
@@ -330,6 +339,9 @@ pub struct AgentPolicyResponse {
     pub pending_software: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_assist: Option<serde_json::Value>,
+    /// Volume-filter / freeze DesiredState (preferred over should_restore for new agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_state: Option<idv_common::endpoint_policy::DesiredEndpointState>,
     pub message: String,
 }
 

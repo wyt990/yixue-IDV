@@ -2,6 +2,9 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use chrono::Utc;
+use idv_common::endpoint_policy::{
+    DesiredEndpointState, restore_from_mode_policy, revision_from_timestamp,
+};
 use idv_common::restore::should_restore_now;
 
 use crate::mac::normalize_mac;
@@ -49,14 +52,17 @@ pub async fn heartbeat(
         },
     };
 
+    let mut binding_updated_at: Option<String> = None;
     let mut mode = if let Some(ref lid) = lab_id {
-        let binding: Option<(String,)> =
-            sqlx::query_as("SELECT mode_policy_id FROM lab_mode_bindings WHERE lab_id = ?")
-                .bind(lid)
-                .fetch_optional(&state.pool)
-                .await
-                .map_err(internal)?;
-        if let Some((mid,)) = binding {
+        let binding: Option<(String, String)> = sqlx::query_as(
+            "SELECT mode_policy_id, updated_at FROM lab_mode_bindings WHERE lab_id = ?",
+        )
+        .bind(lid)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?;
+        if let Some((mid, updated)) = binding {
+            binding_updated_at = Some(updated);
             let sql = format!("SELECT {MODE_COLS} FROM mode_policies WHERE id = ?");
             sqlx::query_as::<_, ModePolicy>(&sql)
                 .bind(mid)
@@ -115,6 +121,7 @@ pub async fn heartbeat(
                     .fetch_optional(&state.pool)
                     .await
                     .map_err(internal)?;
+                binding_updated_at = Some(now.to_rfc3339());
                 schedule_active = true;
                 fallback_note = Some("考试时间窗已结束，已自动回落教学模式".into());
             }
@@ -182,12 +189,44 @@ pub async fn heartbeat(
         .map_err(internal)?;
     }
 
+    let desired_state = mode.as_ref().map(|m| {
+        let restore = restore_from_mode_policy(&m.restore, &m.name);
+        let revision = binding_updated_at
+            .as_deref()
+            .map(revision_from_timestamp)
+            .unwrap_or_else(|| revision_from_timestamp(&m.updated_at.to_rfc3339()));
+        DesiredEndpointState::with_restore(revision, restore)
+    });
+
+    // Persist agent-reported freeze status into session detail (lightweight).
+    if !body.driver_status.is_empty() || body.applied_revision > 0 || body.pending_reboot {
+        let detail = format!(
+            "applied_revision={} pending_reboot={} driver_status={}",
+            body.applied_revision, body.pending_reboot, body.driver_status
+        );
+        let _ = sqlx::query("UPDATE agent_sessions SET detail = ? WHERE mac = ?")
+            .bind(&detail)
+            .bind(&mac)
+            .execute(&state.pool)
+            .await;
+    }
+
     let message = if let Some(note) = fallback_note {
         note
     } else if client_id.is_none() {
         "未登记终端且未配置默认机房；仅记录会话，请在管理端设置自动登记默认机房".into()
     } else if mode.is_none() {
         "未绑定工作模式；默认不还原".into()
+    } else if desired_state
+        .as_ref()
+        .map(|d| d.restore.enabled && d.restore.frozen)
+        .unwrap_or(false)
+    {
+        format!(
+            "冻结策略生效中（模式「{}」，revision={}）；变更将于重启后应用",
+            mode.as_ref().unwrap().name,
+            desired_state.as_ref().map(|d| d.revision).unwrap_or(0)
+        )
     } else if should {
         format!(
             "应按策略还原（restore={}, trigger={}）",
@@ -196,7 +235,7 @@ pub async fn heartbeat(
         )
     } else {
         format!(
-            "当前模式「{}」本次不还原",
+            "当前模式「{}」：解冻/不自动冻结",
             mode.as_ref().unwrap().name
         )
     };
@@ -213,6 +252,7 @@ pub async fn heartbeat(
         pending_power,
         pending_software: pending_software,
         pending_assist: pending_assist,
+        desired_state,
         message,
     }))
 }

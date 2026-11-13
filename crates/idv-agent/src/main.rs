@@ -1,6 +1,10 @@
+mod policy_store;
+mod restore_driver;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use idv_common::endpoint_policy::DesiredEndpointState;
 use idv_common::image_format::{
     ImageHeader, default_partitions, pack_image, unpack_image,
 };
@@ -11,6 +15,8 @@ use idv_common::volume::{
     write_lab_baseline, LabVolumeSnapshot,
 };
 use idv_common::{Error, Result, init_tracing, load_toml_file};
+use policy_store::{LocalPolicyStore, default_state_dir};
+use restore_driver::{apply_frozen_state, default_driver};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -123,6 +129,33 @@ enum Commands {
         #[arg(long, default_value = "")]
         agent_bin: String,
     },
+    /// Volume-filter restore driver status / protect on|off (mock if no .sys)
+    RestoreDriver {
+        #[command(subcommand)]
+        action: RestoreDriverCmd,
+    },
+    /// Heartbeat: queue DesiredState if newer; with --apply apply pending after "reboot"
+    SyncPolicy {
+        #[arg(short, long, default_value = "deploy/config/agent.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Apply pending DesiredState now (boot hook should pass this)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(long, default_value = "heartbeat")]
+        trigger: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RestoreDriverCmd {
+    Status,
+    ProtectOn {
+        #[arg(long, default_value = "system")]
+        volumes: String,
+    },
+    ProtectOff,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +198,8 @@ struct PolicyResponse {
     pending_software: Option<serde_json::Value>,
     #[serde(default)]
     pending_assist: Option<serde_json::Value>,
+    #[serde(default)]
+    desired_state: Option<DesiredEndpointState>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +217,9 @@ struct HeartbeatBody<'a> {
     hostname: &'a str,
     agent_version: &'a str,
     trigger: &'a str,
+    applied_revision: u64,
+    pending_reboot: bool,
+    driver_status: &'a str,
 }
 
 #[tokio::main]
@@ -199,7 +237,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Heartbeat { config, trigger } => {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
-            let policy = heartbeat(&cfg, &trigger).await?;
+            let store = LocalPolicyStore::load(&default_state_dir());
+            let status = store.applied_status();
+            let policy = heartbeat(&cfg, &trigger, &status).await?;
             println!(
                 "mac={} should_restore={} schedule_active={} usb_restricted={} mode={} msg={}",
                 policy.mac,
@@ -213,6 +253,12 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or("-"),
                 policy.message
             );
+            if let Some(ref d) = policy.desired_state {
+                println!(
+                    "desired_state revision={} frozen={} apply={:?}",
+                    d.revision, d.restore.frozen, d.restore.apply
+                );
+            }
             if let Some(ref p) = policy.pending_power {
                 println!("pending_power={}", p);
             }
@@ -235,7 +281,8 @@ async fn main() -> anyhow::Result<()> {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
             let trigger = if manual { "manual" } else { "boot" };
-            let policy = heartbeat(&cfg, trigger).await?;
+            let st = LocalPolicyStore::load(&default_state_dir()).applied_status();
+            let policy = heartbeat(&cfg, trigger, &st).await?;
             run_restore(
                 &cfg,
                 &policy,
@@ -258,8 +305,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
-            let policy = heartbeat(&cfg, "boot").await?;
-            if policy.should_restore {
+            // Prefer freeze DesiredState apply on boot; keep legacy image restore as fallback.
+            let state_dir = default_state_dir();
+            let _ = sync_and_maybe_apply(&cfg, &state_dir, true, "boot").await?;
+            let st = LocalPolicyStore::load(&state_dir).applied_status();
+            let policy = heartbeat(&cfg, "boot", &st).await?;
+            if policy.should_restore && policy.desired_state.is_none() {
                 run_restore(
                     &cfg,
                     &policy,
@@ -315,7 +366,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::EnforceUsb { config, state_file } => {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
-            let policy = heartbeat(&cfg, "heartbeat").await?;
+            let st = LocalPolicyStore::load(&default_state_dir()).applied_status();
+            let policy = heartbeat(&cfg, "heartbeat", &st).await?;
             let applied = apply_usb_policy(&state_file, policy.usb_restricted)
                 .map_err(|e| anyhow::anyhow!(e))?;
             report_usb(&cfg, applied.restricted, &applied.detail).await?;
@@ -328,7 +380,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::SoftApply { config, out_dir } => {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
-            let policy = heartbeat(&cfg, "heartbeat").await?;
+            let st = LocalPolicyStore::load(&default_state_dir()).applied_status();
+            let policy = heartbeat(&cfg, "heartbeat", &st).await?;
             let Some(job) = policy.pending_software else {
                 println!("soft_apply_skip reason=no_pending_job");
                 return Ok(());
@@ -413,7 +466,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::AssistAck { config, state } => {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
-            let policy = heartbeat(&cfg, "heartbeat").await?;
+            let st = LocalPolicyStore::load(&default_state_dir()).applied_status();
+            let policy = heartbeat(&cfg, "heartbeat", &st).await?;
             let Some(sess) = policy.pending_assist else {
                 println!("assist_ack_skip reason=no_pending");
                 return Ok(());
@@ -473,8 +527,108 @@ async fn main() -> anyhow::Result<()> {
                 marker.display()
             );
         }
+        Commands::RestoreDriver { action } => {
+            init_tracing("info,idv_agent=debug");
+            let drv = default_driver();
+            match action {
+                RestoreDriverCmd::Status => {
+                    let st = drv.status()?;
+                    println!(
+                        "restore_driver backend={:?} available={} frozen={} detail={}",
+                        st.backend, st.available, st.frozen, st.detail
+                    );
+                }
+                RestoreDriverCmd::ProtectOn { volumes } => {
+                    let vols: Vec<String> = volumes
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let st = drv.protect_on(&vols)?;
+                    println!(
+                        "protect_on_ok frozen={} detail={}",
+                        st.frozen, st.detail
+                    );
+                }
+                RestoreDriverCmd::ProtectOff => {
+                    let st = drv.protect_off()?;
+                    println!(
+                        "protect_off_ok frozen={} detail={}",
+                        st.frozen, st.detail
+                    );
+                }
+            }
+        }
+        Commands::SyncPolicy {
+            config,
+            state_dir,
+            apply,
+            trigger,
+        } => {
+            let cfg = load_cfg(&config).await?;
+            init_tracing(&cfg.log);
+            let dir = state_dir.unwrap_or_else(default_state_dir);
+            let summary = sync_and_maybe_apply(&cfg, &dir, apply, &trigger).await?;
+            println!("{summary}");
+        }
     }
     Ok(())
+}
+
+async fn sync_and_maybe_apply(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    apply: bool,
+    trigger: &str,
+) -> Result<String> {
+    let mut store = LocalPolicyStore::load(state_dir);
+    let status = store.applied_status();
+    let policy = heartbeat(cfg, trigger, &status).await?;
+    let mut lines = Vec::new();
+    lines.push(format!("msg={}", policy.message));
+    if let Some(desired) = policy.desired_state {
+        if store.queue_if_newer(desired.clone()) {
+            store.save(state_dir).map_err(|e| Error::Other(e))?;
+            lines.push(format!(
+                "queued_revision={} frozen={} pending_reboot=true",
+                desired.revision, desired.restore.frozen
+            ));
+        } else {
+            lines.push(format!(
+                "no_queue revision={} applied={}",
+                desired.revision, store.applied_revision
+            ));
+        }
+    } else {
+        lines.push("desired_state=none".into());
+    }
+
+    if apply {
+        if let Some(pending) = store.pending.clone() {
+            if pending.restore.enabled {
+                let drv = default_driver();
+                let st = apply_frozen_state(
+                    drv.as_ref(),
+                    pending.restore.frozen,
+                    &pending.restore.protect_volumes,
+                )
+                .map_err(|e| Error::Other(e))?;
+                store.clear_pending_applied(pending.revision, st.detail.clone());
+                store.save(state_dir).map_err(|e| Error::Other(e))?;
+                lines.push(format!(
+                    "applied_revision={} frozen={} driver={}",
+                    pending.revision, st.frozen, st.detail
+                ));
+            } else {
+                store.clear_pending_applied(pending.revision, "restore_disabled".into());
+                store.save(state_dir).map_err(|e| Error::Other(e))?;
+                lines.push("applied restore_disabled".into());
+            }
+        } else {
+            lines.push("apply_skip reason=no_pending".into());
+        }
+    }
+    Ok(lines.join(" · "))
 }
 
 async fn load_cfg(path: &PathBuf) -> Result<AgentConfig> {
@@ -490,7 +644,11 @@ async fn load_cfg(path: &PathBuf) -> Result<AgentConfig> {
     }
 }
 
-async fn heartbeat(cfg: &AgentConfig, trigger: &str) -> Result<PolicyResponse> {
+async fn heartbeat(
+    cfg: &AgentConfig,
+    trigger: &str,
+    status: &idv_common::endpoint_policy::EndpointAppliedStatus,
+) -> Result<PolicyResponse> {
     let url = format!(
         "{}/api/v1/agent/heartbeat",
         cfg.center_url.trim_end_matches('/')
@@ -503,6 +661,9 @@ async fn heartbeat(cfg: &AgentConfig, trigger: &str) -> Result<PolicyResponse> {
             hostname: &cfg.hostname,
             agent_version: env!("CARGO_PKG_VERSION"),
             trigger,
+            applied_revision: status.applied_revision,
+            pending_reboot: status.pending_reboot,
+            driver_status: &status.driver_status,
         })
         .send()
         .await

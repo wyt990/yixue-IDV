@@ -43,6 +43,14 @@ deploy/config/*.local.toml
 /pe/snponly.efi
 /pe/undionly.kpxe
 
+# --- 驱动构建产物 ---
+/drivers/sys-restore/**/x64/
+/drivers/sys-restore/**/Debug/
+/drivers/sys-restore/**/Release/
+/drivers/sys-restore/**/.vs/
+*.sys
+*.cer
+
 # --- 日志与杂项 ---
 *.log
 =rwc
