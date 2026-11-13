@@ -9,7 +9,7 @@ use idv_common::restore::should_restore_now;
 
 use crate::mac::normalize_mac;
 use crate::models::{
-    AgentHeartbeat, AgentPolicyResponse, AgentRestoreReport, AgentUsbReport,
+    AgentHeartbeat, AgentPolicyResponse, AgentRestoreReport, AgentUsbReport, DesiredIdentity,
     DeltaRecommendRequest, DeltaRecommendResponse, Image, ModePolicy, PowerCommand, new_id,
 };
 use crate::state::AppState;
@@ -139,7 +139,7 @@ pub async fn heartbeat(
         .unwrap_or(false);
 
     let pending_power = sqlx::query_as::<_, PowerCommand>(
-        "SELECT id, client_id, mac, kind, state, detail, created_at, updated_at FROM power_commands WHERE mac = ? AND state = 'pending' AND kind = 'shutdown' ORDER BY created_at ASC LIMIT 1",
+        "SELECT id, client_id, mac, kind, state, detail, created_at, updated_at FROM power_commands WHERE mac = ? AND state = 'pending' AND kind IN ('shutdown','reboot') ORDER BY created_at ASC LIMIT 1",
     )
     .bind(&mac)
     .fetch_optional(&state.pool)
@@ -160,6 +160,23 @@ pub async fn heartbeat(
             .fetch_optional(&state.pool)
             .await
             .map_err(internal)?;
+    if !body.local_ip.trim().is_empty() {
+        if let Some(ref cid) = client_id {
+            let _ = sqlx::query("UPDATE clients SET last_ip = ?, last_seen = ? WHERE id = ?")
+                .bind(body.local_ip.trim())
+                .bind(now)
+                .bind(cid)
+                .execute(&state.pool)
+                .await;
+        }
+    } else if let Some(ref cid) = client_id {
+        let _ = sqlx::query("UPDATE clients SET last_seen = ? WHERE id = ?")
+            .bind(now)
+            .bind(cid)
+            .execute(&state.pool)
+            .await;
+    }
+
     if let Some((id,)) = existing {
         sqlx::query(
             "UPDATE agent_sessions SET client_id = ?, hostname = ?, agent_version = ?, mode_policy_id = ?, last_seen = ?, status = 'online' WHERE id = ?",
@@ -197,6 +214,47 @@ pub async fn heartbeat(
             .unwrap_or_else(|| revision_from_timestamp(&m.updated_at.to_rfc3339()));
         DesiredEndpointState::with_restore(revision, restore)
     });
+
+    let desired_identity = if let (Some(cid), Some(lid)) = (&client_id, &lab_id) {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT name, assigned_ip FROM clients WHERE id = ?")
+                .bind(cid)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(internal)?;
+        if let Some((hostname, mut assigned_ip)) = row {
+            if assigned_ip.trim().is_empty() {
+                if let Ok(ip) = crate::lab_naming::allocate_next_ip(&state, lid).await {
+                    if !ip.is_empty() {
+                        let _ = sqlx::query("UPDATE clients SET assigned_ip = ? WHERE id = ?")
+                            .bind(&ip)
+                            .bind(cid)
+                            .execute(&state.pool)
+                            .await;
+                        assigned_ip = ip;
+                    }
+                }
+            }
+            let lab = crate::lab_naming::load_lab(&state, lid).await.ok();
+            Some(DesiredIdentity {
+                hostname,
+                ip: assigned_ip,
+                netmask: lab
+                    .as_ref()
+                    .map(|l| l.netmask.clone())
+                    .unwrap_or_default(),
+                gateway: lab
+                    .as_ref()
+                    .map(|l| l.gateway.clone())
+                    .unwrap_or_default(),
+                dns: lab.as_ref().map(|l| l.dns.clone()).unwrap_or_default(),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Persist agent-reported freeze status into session detail (lightweight).
     if !body.driver_status.is_empty() || body.applied_revision > 0 || body.pending_reboot {
@@ -253,6 +311,7 @@ pub async fn heartbeat(
         pending_software: pending_software,
         pending_assist: pending_assist,
         desired_state,
+        desired_identity,
         message,
     }))
 }

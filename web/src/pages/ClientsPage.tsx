@@ -68,6 +68,7 @@ export function ClientsPage() {
   const [editName, setEditName] = useState("");
   const [editLabId, setEditLabId] = useState("");
   const [editNotes, setEditNotes] = useState("");
+  const [editAssignedIp, setEditAssignedIp] = useState("");
 
   const labMap = useMemo(
     () => new Map(labs.map((l) => [l.id, l])),
@@ -234,6 +235,7 @@ export function ClientsPage() {
         lab_id: editLabId,
         name: editName,
         notes: editNotes,
+        assigned_ip: editAssignedIp,
       });
       setEditingId(null);
       await refresh();
@@ -280,6 +282,33 @@ export function ClientsPage() {
       await refresh();
     } catch (err) {
       msg.error(err instanceof Error ? err.message : "批量删除失败");
+    }
+  }
+
+  async function bulkPower(kind: "reboot" | "shutdown" | "wol") {
+    const targets = clients.filter((c) => selected.has(c.id));
+    if (!targets.length) {
+      msg.warning("请先选择终端");
+      return;
+    }
+    const labels = { reboot: "重启", shutdown: "关机", wol: "开机(WOL)" };
+    if (
+      !window.confirm(
+        `对选中的 ${targets.length} 台终端下发「${labels[kind]}」？`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await api.power.createBulk(
+        targets.map((c) => c.mac),
+        kind,
+        `ui bulk ${kind}`,
+      );
+      msg.success(`已下发 ${res.created} 台${labels[kind]}`);
+      if (res.errors.length) msg.error(res.errors.join("; "));
+    } catch (err) {
+      msg.error(err instanceof Error ? err.message : "电源指令失败");
     }
   }
 
@@ -412,6 +441,30 @@ export function ClientsPage() {
             </button>
             <button
               type="button"
+              className="btn"
+              disabled={selected.size === 0}
+              onClick={() => bulkPower("reboot")}
+            >
+              重启
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={selected.size === 0}
+              onClick={() => bulkPower("shutdown")}
+            >
+              关机
+            </button>
+            <button
+              type="button"
+              className="btn accent"
+              disabled={selected.size === 0}
+              onClick={() => bulkPower("wol")}
+            >
+              开机
+            </button>
+            <button
+              type="button"
               className="btn ghost"
               disabled={selected.size === 0}
               onClick={() => {
@@ -446,6 +499,8 @@ export function ClientsPage() {
               <th>MAC</th>
               <th>名称</th>
               <th>机房</th>
+              <th>分配 IP</th>
+              <th>上报 IP</th>
               <th>最近上报</th>
               <th>备注</th>
               <th>操作</th>
@@ -454,7 +509,7 @@ export function ClientsPage() {
           <tbody>
             {clients.length === 0 ? (
               <tr>
-                <td colSpan={7} className="muted">
+                <td colSpan={9} className="muted">
                   暂无终端。可手动添加，或配置默认机房后由 Agent 自动上报入库。
                 </td>
               </tr>
@@ -496,6 +551,19 @@ export function ClientsPage() {
                       labMap.get(c.lab_id)?.name || c.lab_id
                     )}
                   </td>
+                  <td>
+                    {editingId === c.id ? (
+                      <input
+                        className="mono"
+                        value={editAssignedIp}
+                        onChange={(e) => setEditAssignedIp(e.target.value)}
+                        placeholder="静态 IP"
+                      />
+                    ) : (
+                      <span className="mono muted">{c.assigned_ip || "—"}</span>
+                    )}
+                  </td>
+                  <td className="mono muted">{c.last_ip || "—"}</td>
                   <td className="muted">
                     {c.last_seen
                       ? new Date(c.last_seen).toLocaleString()
@@ -540,6 +608,7 @@ export function ClientsPage() {
                               setEditName(c.name || "");
                               setEditLabId(c.lab_id);
                               setEditNotes(c.notes || "");
+                              setEditAssignedIp(c.assigned_ip || "");
                             }}
                           >
                             编辑

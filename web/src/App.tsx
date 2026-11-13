@@ -10,7 +10,6 @@ import { ImagesPage } from "./pages/ImagesPage";
 import { LabsPage } from "./pages/LabsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { PeSessionsPage } from "./pages/PeSessionsPage";
-import { ModesPage } from "./pages/ModesPage";
 import { Phase3Page } from "./pages/Phase3Page";
 import { TasksPage } from "./pages/TasksPage";
 
@@ -40,7 +39,7 @@ export default function App() {
         <Route path="edges" element={<EdgesPage />} />
         <Route path="pe-sessions" element={<PeSessionsPage />} />
         <Route path="tasks" element={<TasksPage />} />
-        <Route path="modes" element={<ModesPage />} />
+        <Route path="modes" element={<Navigate to="/labs" replace />} />
         <Route path="phase3" element={<Phase3Page />} />
         <Route path="admins" element={<AdminsPage />} />
         <Route path="appearance" element={<AppearancePage />} />

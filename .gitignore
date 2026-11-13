@@ -50,6 +50,8 @@ deploy/config/*.local.toml
 /drivers/sys-restore/**/.vs/
 *.sys
 *.cer
+*.pfx
+/drivers/sys-restore/testcert/
 
 # --- 日志与杂项 ---
 *.log

@@ -151,6 +151,7 @@ pub fn router() -> Router<AppState> {
             post(delta_images::apply_delta_image),
         )
         .route("/api/v1/power/commands", get(power::list).post(power::create))
+        .route("/api/v1/power/commands/bulk", post(power::create_bulk))
         .route("/api/v1/power/commands/{id}/ack", post(power::ack))
         .route("/api/v1/tasks", get(tasks::list))
         .route("/api/v1/tasks/export.csv", get(tasks::export_csv))

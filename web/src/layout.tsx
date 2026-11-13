@@ -10,7 +10,6 @@ const links = [
   { to: "/edges", label: "边缘节点" },
   { to: "/pe-sessions", label: "PE 会话" },
   { to: "/tasks", label: "维护任务" },
-  { to: "/modes", label: "工作模式" },
   { to: "/phase3", label: "三期运维" },
   { to: "/admins", label: "管理员" },
   { to: "/appearance", label: "外观主题" },

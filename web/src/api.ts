@@ -67,6 +67,9 @@ export type Lab = {
   next_suffix?: number;
   ip_start?: string;
   ip_end?: string;
+  netmask?: string;
+  gateway?: string;
+  dns?: string;
   default_image_id?: string | null;
   edge_ids?: string[];
   created_at: string;
@@ -77,6 +80,8 @@ export type Client = {
   mac: string;
   name: string;
   notes: string;
+  last_ip?: string;
+  assigned_ip?: string;
   last_seen?: string | null;
   created_at: string;
 };
@@ -277,6 +282,9 @@ export const api = {
         suffix_start: number;
         ip_start: string;
         ip_end: string;
+        netmask: string;
+        gateway: string;
+        dns: string;
       }>,
     ) =>
       request<Lab>("/api/v1/labs", {
@@ -294,6 +302,9 @@ export const api = {
         next_suffix?: number;
         ip_start?: string;
         ip_end?: string;
+        netmask?: string;
+        gateway?: string;
+        dns?: string;
         default_image_id?: string | null;
         edge_ids?: string[];
       },
@@ -324,7 +335,12 @@ export const api = {
       }),
     update: (
       id: string,
-      payload: { lab_id?: string; name?: string; notes?: string },
+      payload: {
+        lab_id?: string;
+        name?: string;
+        notes?: string;
+        assigned_ip?: string;
+      },
     ) =>
       request<Client>(`/api/v1/clients/${id}`, {
         method: "PUT",
@@ -605,11 +621,27 @@ export const api = {
           detail: string;
         }[]
       >("/api/v1/power/commands"),
-    create: (mac: string, kind: "wol" | "shutdown", detail?: string) =>
+    create: (
+      mac: string,
+      kind: "wol" | "shutdown" | "reboot",
+      detail?: string,
+    ) =>
       request("/api/v1/power/commands", {
         method: "POST",
         body: JSON.stringify({ mac, kind, detail }),
       }),
+    createBulk: (
+      macs: string[],
+      kind: "wol" | "shutdown" | "reboot",
+      detail?: string,
+    ) =>
+      request<{ created: number; errors: string[] }>(
+        "/api/v1/power/commands/bulk",
+        {
+          method: "POST",
+          body: JSON.stringify({ macs, kind, detail }),
+        },
+      ),
   },
   phase3: {
     getClassLock: () =>

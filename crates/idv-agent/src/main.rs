@@ -200,6 +200,22 @@ struct PolicyResponse {
     pending_assist: Option<serde_json::Value>,
     #[serde(default)]
     desired_state: Option<DesiredEndpointState>,
+    #[serde(default)]
+    desired_identity: Option<DesiredIdentity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DesiredIdentity {
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    netmask: String,
+    #[serde(default)]
+    gateway: String,
+    #[serde(default)]
+    dns: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +236,7 @@ struct HeartbeatBody<'a> {
     applied_revision: u64,
     pending_reboot: bool,
     driver_status: &'a str,
+    local_ip: &'a str,
 }
 
 #[tokio::main]
@@ -603,32 +620,299 @@ async fn sync_and_maybe_apply(
         lines.push("desired_state=none".into());
     }
 
-    if apply {
-        if let Some(pending) = store.pending.clone() {
-            if pending.restore.enabled {
-                let drv = default_driver();
-                let st = apply_frozen_state(
-                    drv.as_ref(),
-                    pending.restore.frozen,
-                    &pending.restore.protect_volumes,
-                )
-                .map_err(|e| Error::Other(e))?;
-                store.clear_pending_applied(pending.revision, st.detail.clone());
-                store.save(state_dir).map_err(|e| Error::Other(e))?;
-                lines.push(format!(
-                    "applied_revision={} frozen={} driver={}",
-                    pending.revision, st.frozen, st.detail
-                ));
-            } else {
-                store.clear_pending_applied(pending.revision, "restore_disabled".into());
-                store.save(state_dir).map_err(|e| Error::Other(e))?;
-                lines.push("applied restore_disabled".into());
+    let power_kind = policy
+        .pending_power
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let power_id = policy
+        .pending_power
+        .as_ref()
+        .and_then(|p| p.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut need_rename_reboot = false;
+    if let Some(ref ident) = policy.desired_identity {
+        match apply_desired_identity(ident) {
+            Ok((msg, reboot)) => {
+                lines.push(msg);
+                need_rename_reboot = reboot;
             }
-        } else {
-            lines.push("apply_skip reason=no_pending".into());
+            Err(e) => lines.push(format!("identity_err={e}")),
         }
     }
+
+    // Reboot from Center: apply pending freeze first, then reboot.
+    let should_apply = apply || power_kind == "reboot" || need_rename_reboot;
+    if should_apply {
+        lines.push(apply_pending_store(&mut store, state_dir)?);
+    }
+
+    if !power_id.is_empty() && (power_kind == "reboot" || power_kind == "shutdown") {
+        let _ = ack_power(cfg, &power_id, true, &format!("agent_{power_kind}_issued")).await;
+        lines.push(format!("power_{power_kind}_id={power_id}"));
+        // Give ack a moment to flush before process dies with the OS.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        issue_windows_power(&power_kind)?;
+    } else if need_rename_reboot {
+        lines.push("identity_rename_reboot=1".into());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        issue_windows_power("reboot")?;
+    }
+
     Ok(lines.join(" · "))
+}
+
+/// Returns (detail, needs_reboot_for_rename).
+fn apply_desired_identity(ident: &DesiredIdentity) -> Result<(String, bool)> {
+    let want_host = ident.hostname.trim();
+    let want_ip = ident.ip.trim();
+    if want_host.is_empty() && want_ip.is_empty() {
+        return Ok(("identity_skip=empty".into(), false));
+    }
+
+    let mut parts = Vec::new();
+    let mut need_reboot = false;
+
+    if !want_ip.is_empty() {
+        let cur = detect_local_ip("8.8.8.8:80");
+        if cur != want_ip {
+            set_windows_static_ip(
+                want_ip,
+                ident.netmask.trim(),
+                ident.gateway.trim(),
+                ident.dns.trim(),
+            )?;
+            parts.push(format!("ip_set={want_ip}"));
+        } else {
+            parts.push(format!("ip_ok={want_ip}"));
+        }
+    }
+
+    if !want_host.is_empty() {
+        let cur = current_computer_name();
+        if !cur.eq_ignore_ascii_case(want_host) {
+            rename_windows_computer(want_host)?;
+            parts.push(format!("hostname_set={want_host}"));
+            need_reboot = true;
+        } else {
+            parts.push(format!("hostname_ok={want_host}"));
+        }
+    }
+
+    Ok((parts.join(","), need_reboot))
+}
+
+fn current_computer_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default()
+}
+
+fn set_windows_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mask = if netmask.is_empty() {
+            "255.255.255.0"
+        } else {
+            netmask
+        };
+        let dns_arg = if dns.is_empty() { gateway } else { dns };
+        let alias_cmd = r#"$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1; if (-not $a) { throw 'no adapter' }; $a.Name"#;
+        let alias_out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", alias_cmd])
+            .output()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        if !alias_out.status.success() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "adapter lookup failed: {}",
+                String::from_utf8_lossy(&alias_out.stderr)
+            )));
+        }
+        let alias = String::from_utf8_lossy(&alias_out.stdout).trim().to_string();
+        if alias.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!("empty adapter alias")));
+        }
+        let mut args = vec![
+            "interface".into(),
+            "ip".into(),
+            "set".into(),
+            "address".into(),
+            format!("name={alias}"),
+            "static".into(),
+            ip.to_string(),
+            mask.to_string(),
+        ];
+        if !gateway.is_empty() {
+            args.push(gateway.to_string());
+        }
+        let st = std::process::Command::new("netsh")
+            .args(&args)
+            .status()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        if !st.success() {
+            return Err(Error::Other(anyhow::anyhow!("netsh set address failed")));
+        }
+        if !dns_arg.is_empty() {
+            let st = std::process::Command::new("netsh")
+                .args([
+                    "interface",
+                    "ip",
+                    "set",
+                    "dns",
+                    &format!("name={alias}"),
+                    "static",
+                    dns_arg,
+                ])
+                .status()
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            if !st.success() {
+                return Err(Error::Other(anyhow::anyhow!("netsh set dns failed")));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (ip, netmask, gateway, dns);
+        Err(Error::Other(anyhow::anyhow!(
+            "static IP only supported on Windows"
+        )))
+    }
+}
+
+fn rename_windows_computer(name: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let safe: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(15)
+            .collect();
+        if safe.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!("invalid hostname")));
+        }
+        let st = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Rename-Computer -NewName '{safe}' -Force"),
+            ])
+            .status()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        if !st.success() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "Rename-Computer failed: {st}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        Err(Error::Other(anyhow::anyhow!(
+            "rename only supported on Windows"
+        )))
+    }
+}
+
+fn apply_pending_store(
+    store: &mut LocalPolicyStore,
+    state_dir: &std::path::Path,
+) -> Result<String> {
+    if let Some(pending) = store.pending.clone() {
+        if pending.restore.enabled {
+            let drv = default_driver();
+            let st = apply_frozen_state(
+                drv.as_ref(),
+                pending.restore.frozen,
+                &pending.restore.protect_volumes,
+            )
+            .map_err(|e| Error::Other(e))?;
+            store.clear_pending_applied(pending.revision, st.detail.clone());
+            store.save(state_dir).map_err(|e| Error::Other(e))?;
+            Ok(format!(
+                "applied_revision={} frozen={} driver={}",
+                pending.revision, st.frozen, st.detail
+            ))
+        } else {
+            store.clear_pending_applied(pending.revision, "restore_disabled".into());
+            store.save(state_dir).map_err(|e| Error::Other(e))?;
+            Ok("applied restore_disabled".into())
+        }
+    } else {
+        Ok("apply_skip reason=no_pending".into())
+    }
+}
+
+fn issue_windows_power(kind: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let arg = if kind == "reboot" { "/r" } else { "/s" };
+        let status = std::process::Command::new("shutdown.exe")
+            .args([arg, "/t", "5", "/f", "/c", "YixueIDV power command"])
+            .status()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        if !status.success() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "shutdown.exe failed: {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = kind;
+        Err(Error::Other(anyhow::anyhow!(
+            "power command only supported on Windows"
+        )))
+    }
+}
+
+async fn ack_power(cfg: &AgentConfig, id: &str, ok: bool, detail: &str) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/power/commands/{id}/ack",
+        cfg.center_url.trim_end_matches('/')
+    );
+    let client = http_client();
+    let resp = client
+        .post(url)
+        .json(&serde_json::json!({ "ok": ok, "detail": detail }))
+        .send()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Other(anyhow::anyhow!(
+            "power ack failed: {status} {body}"
+        )));
+    }
+    Ok(())
+}
+
+fn detect_local_ip(center_url: &str) -> String {
+    let host = center_url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("8.8.8.8");
+    let addr = format!("{host}:80");
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect(&addr)?;
+            s.local_addr()
+        })
+        .ok()
+        .map(|a| a.ip().to_string())
+        .filter(|ip| ip != "0.0.0.0")
+        .unwrap_or_default()
 }
 
 async fn load_cfg(path: &PathBuf) -> Result<AgentConfig> {
@@ -653,6 +937,7 @@ async fn heartbeat(
         "{}/api/v1/agent/heartbeat",
         cfg.center_url.trim_end_matches('/')
     );
+    let local_ip = detect_local_ip(&cfg.center_url);
     let client = http_client();
     let resp = client
         .post(url)
@@ -664,6 +949,7 @@ async fn heartbeat(
             applied_revision: status.applied_revision,
             pending_reboot: status.pending_reboot,
             driver_status: &status.driver_status,
+            local_ip: &local_ip,
         })
         .send()
         .await

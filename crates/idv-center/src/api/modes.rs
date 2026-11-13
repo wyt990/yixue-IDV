@@ -188,6 +188,17 @@ pub async fn bind_lab(
     .execute(&state.pool)
     .await
     .map_err(internal)?;
+    let mode_changed = prev.as_deref() != Some(body.mode_policy_id.as_str());
+    let mut reboot_n = 0usize;
+    if mode_changed {
+        reboot_n = super::power::enqueue_reboots_for_lab(
+            &state.pool,
+            &lab_id,
+            &format!("mode_bind→{} auto-reboot", mode.name),
+        )
+        .await
+        .unwrap_or(0);
+    }
     let _ = super::audit::record(
         &state.pool,
         &user.0.username,
@@ -195,8 +206,8 @@ pub async fn bind_lab(
         "lab",
         &lab_id,
         &format!(
-            "mode={} ({}) effective={} prev={:?}",
-            mode.name, body.mode_policy_id, body.effective, prev
+            "mode={} ({}) effective={} prev={:?} reboot_queued={}",
+            mode.name, body.mode_policy_id, body.effective, prev, reboot_n
         ),
     )
     .await;

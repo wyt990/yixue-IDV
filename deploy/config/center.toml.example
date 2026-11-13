@@ -1,6 +1,7 @@
 # 易学 IDV — 中心服务配置示例
 # 可直接复制为 center.toml，或按环境修改 listen / database_url
-listen = "127.0.0.1:8080"
+# 机房部署用 0.0.0.0:8080；仅本机调试可用 127.0.0.1:8080
+listen = "0.0.0.0:8080"
 log = "info,idv_center=debug"
 database_url = "sqlite://data/idv-center.db?mode=rwc"
 web_dir = "web/dist"

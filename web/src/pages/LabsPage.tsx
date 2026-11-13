@@ -17,13 +17,21 @@ type ModeBinding = {
   updated_at: string;
 };
 
-function modeByName(modes: ModePolicy[], name: string) {
-  return modes.find((m) => m.name === name);
+function modeLabel(m: ModePolicy) {
+  const r = (m.restore || "").toLowerCase();
+  if (r === "reboot") return `${m.name}（开机还原）`;
+  if (r === "off" || r === "manual") return `${m.name}（不还原）`;
+  return m.name;
 }
 
-/** reboot = 卷过滤开机还原开；其它视为关（办公/手动）。 */
-function restoreEnabledForMode(mode?: ModePolicy | null) {
-  return (mode?.restore || "").toLowerCase() === "reboot";
+function boundModeId(
+  labId: string,
+  bindings: ModeBinding[],
+  modes: ModePolicy[],
+): string {
+  const b = bindings.find((x) => x.lab_id === labId);
+  if (b?.mode_policy_id) return b.mode_policy_id;
+  return modes.find((m) => m.name === "office")?.id || modes[0]?.id || "";
 }
 
 function previewName(prefix: string, width: number, start: number) {
@@ -150,6 +158,9 @@ export function LabsPage() {
   const [labStart, setLabStart] = useState(1);
   const [labIpStart, setLabIpStart] = useState("");
   const [labIpEnd, setLabIpEnd] = useState("");
+  const [labNetmask, setLabNetmask] = useState("255.255.255.0");
+  const [labGateway, setLabGateway] = useState("");
+  const [labDns, setLabDns] = useState("");
   const [labFormError, setLabFormError] = useState("");
 
   const [settingsLab, setSettingsLab] = useState<Lab | null>(null);
@@ -162,12 +173,13 @@ export function LabsPage() {
   const [editNext, setEditNext] = useState(1);
   const [editIpStart, setEditIpStart] = useState("");
   const [editIpEnd, setEditIpEnd] = useState("");
+  const [editNetmask, setEditNetmask] = useState("");
+  const [editGateway, setEditGateway] = useState("");
+  const [editDns, setEditDns] = useState("");
   const [editImageId, setEditImageId] = useState("");
   const [editEdgeIds, setEditEdgeIds] = useState<string[]>([]);
   const [modes, setModes] = useState<ModePolicy[]>([]);
   const [bindings, setBindings] = useState<ModeBinding[]>([]);
-  const [editRestoreOn, setEditRestoreOn] = useState(true);
-  const [editModeHint, setEditModeHint] = useState("");
 
   async function refresh() {
     const [c, l, imgs, eds, m, b] = await Promise.all([
@@ -212,6 +224,9 @@ export function LabsPage() {
     setLabStart(1);
     setLabIpStart("");
     setLabIpEnd("");
+    setLabNetmask("255.255.255.0");
+    setLabGateway("");
+    setLabDns("");
     setLabFormError("");
   }
 
@@ -225,20 +240,26 @@ export function LabsPage() {
     setEditNext(lab.next_suffix ?? lab.suffix_start ?? 1);
     setEditIpStart(lab.ip_start || "");
     setEditIpEnd(lab.ip_end || "");
+    setEditNetmask(lab.netmask || "255.255.255.0");
+    setEditGateway(lab.gateway || "");
+    setEditDns(lab.dns || "");
     setEditImageId(lab.default_image_id || "");
     setEditEdgeIds([...(lab.edge_ids || [])]);
-    const binding = bindings.find((x) => x.lab_id === lab.id);
-    const mode = binding
-      ? modes.find((m) => m.id === binding.mode_policy_id)
-      : undefined;
-    const on = mode ? restoreEnabledForMode(mode) : true;
-    setEditRestoreOn(on);
-    setEditModeHint(
-      mode
-        ? `${mode.name}（restore=${mode.restore}，${binding?.effective || "—"})`
-        : "未绑定（保存勾选将绑定 teaching/office）",
-    );
     setSettingsError("");
+  }
+
+  async function changeLabMode(labId: string, modeId: string) {
+    if (!modeId) return;
+    const cur = boundModeId(labId, bindings, modes);
+    if (cur === modeId && bindings.some((b) => b.lab_id === labId)) return;
+    try {
+      await api.modes.bindLab(labId, modeId, "next_boot");
+      msg.success("已切换工作模式（该机房终端将排队重启）");
+      await refresh();
+    } catch (err) {
+      msg.error(err instanceof Error ? err.message : "切换模式失败");
+      await refresh();
+    }
   }
 
   async function createCampus(e: FormEvent) {
@@ -283,6 +304,9 @@ export function LabsPage() {
         suffix_start: labStart,
         ip_start: labIpStart,
         ip_end: labIpEnd,
+        netmask: labNetmask,
+        gateway: labGateway,
+        dns: labDns,
       });
       setLabModalCampus(null);
       msg.success(`已在「${labModalCampus.name}」下创建机房`);
@@ -323,32 +347,15 @@ export function LabsPage() {
         next_suffix: editNext,
         ip_start: editIpStart,
         ip_end: editIpEnd,
+        netmask: editNetmask,
+        gateway: editGateway,
+        dns: editDns,
         default_image_id: editImageId || null,
         edge_ids: editEdgeIds,
       });
 
-      const binding = bindings.find((x) => x.lab_id === settingsLab.id);
-      const current = binding
-        ? modes.find((m) => m.id === binding.mode_policy_id)
-        : undefined;
-      const wantOn = editRestoreOn;
-      const curOn = restoreEnabledForMode(current);
-      let modeMsg = "";
-      // Leave exam (also reboot) alone while restore stays on; ModesPage for exam re-bind.
-      if ((!current || curOn !== wantOn) && !(wantOn && current?.name === "exam")) {
-        const targetName = wantOn ? "teaching" : "office";
-        const target = modeByName(modes, targetName);
-        if (!target) {
-          throw new Error(`缺少默认模式 ${targetName}，请先在工作模式页确认`);
-        }
-        await api.modes.bindLab(settingsLab.id, target.id, "next_boot");
-        modeMsg = wantOn
-          ? " · 已开开机还原（teaching，下开机生效）"
-          : " · 已关开机还原（office，下开机生效）";
-      }
-
       setSettingsLab(null);
-      msg.success(`已保存机房设置${modeMsg}`);
+      msg.success("已保存机房设置");
       await refresh();
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : "保存失败");
@@ -379,7 +386,7 @@ export function LabsPage() {
         <div>
           <h1>校区 / 机房</h1>
           <p className="muted">
-            可配置命名规则、默认基线镜像与边缘绑定；机房未配时回落校区。
+            可配置命名/IP 网段、工作模式、默认镜像与边缘绑定；机房未配时回落校区。
           </p>
         </div>
         <div className="page-actions">
@@ -468,6 +475,7 @@ export function LabsPage() {
             <tr>
               <th>机房</th>
               <th>校区</th>
+              <th>工作模式</th>
               <th>命名预览</th>
               <th>默认镜像</th>
               <th>边缘</th>
@@ -477,7 +485,7 @@ export function LabsPage() {
           <tbody>
             {labs.length === 0 ? (
               <tr>
-                <td colSpan={6} className="muted">
+                <td colSpan={7} className="muted">
                   暂无机房。在上方校区行点击「增加机房」。
                 </td>
               </tr>
@@ -486,10 +494,28 @@ export function LabsPage() {
                 const campus = campuses.find((c) => c.id === lab.campus_id);
                 const effectiveImg =
                   lab.default_image_id || campus?.default_image_id || null;
+                const modeId = boundModeId(lab.id, bindings, modes);
                 return (
                   <tr key={lab.id}>
                     <td>{lab.name}</td>
                     <td>{campus?.name || lab.campus_id}</td>
+                    <td>
+                      <select
+                        value={modeId}
+                        onChange={(e) => changeLabMode(lab.id, e.target.value)}
+                        disabled={modes.length === 0}
+                        aria-label={`${lab.name} 工作模式`}
+                      >
+                        {modes.length === 0 ? (
+                          <option value="">无模式</option>
+                        ) : null}
+                        {modes.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {modeLabel(m)}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
                     <td className="mono muted">
                       {previewName(
                         lab.name_prefix || "",
@@ -702,6 +728,35 @@ export function LabsPage() {
               />
             </div>
           </div>
+          <div className="form-row">
+            <div className="field">
+              <label>子网掩码</label>
+              <input
+                className="mono"
+                value={labNetmask}
+                onChange={(e) => setLabNetmask(e.target.value)}
+                placeholder="255.255.255.0"
+              />
+            </div>
+            <div className="field">
+              <label>网关</label>
+              <input
+                className="mono"
+                value={labGateway}
+                onChange={(e) => setLabGateway(e.target.value)}
+                placeholder="192.168.1.254"
+              />
+            </div>
+            <div className="field">
+              <label>DNS</label>
+              <input
+                className="mono"
+                value={labDns}
+                onChange={(e) => setLabDns(e.target.value)}
+                placeholder="192.168.1.254"
+              />
+            </div>
+          </div>
           <div className="modal-actions">
             <button
               type="button"
@@ -812,6 +867,36 @@ export function LabsPage() {
               />
             </div>
           </div>
+          <div className="form-row">
+            <div className="field">
+              <label>子网掩码</label>
+              <input
+                className="mono"
+                value={editNetmask}
+                onChange={(e) => setEditNetmask(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>网关</label>
+              <input
+                className="mono"
+                value={editGateway}
+                onChange={(e) => setEditGateway(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>DNS</label>
+              <input
+                className="mono"
+                value={editDns}
+                onChange={(e) => setEditDns(e.target.value)}
+              />
+            </div>
+          </div>
+          <p className="muted" style={{ fontSize: "0.85rem" }}>
+            登记终端时按 IP 区间顺延分配；Agent 按 MAC 将计算机名与静态 IP
+            落到学生机。工作模式请在列表下拉中切换。
+          </p>
           <div className="field">
             <label>默认基线镜像</label>
             <select
@@ -833,24 +918,6 @@ export function LabsPage() {
               selected={editEdgeIds}
               onChange={setEditEdgeIds}
             />
-          </div>
-          <div className="field">
-            <label
-              className="muted"
-              style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}
-            >
-              <input
-                type="checkbox"
-                checked={editRestoreOn}
-                onChange={(e) => setEditRestoreOn(e.target.checked)}
-              />
-              开机还原（卷过滤保护系统区）
-            </label>
-            <p className="muted" style={{ fontSize: "0.85rem", marginTop: "0.35rem" }}>
-              勾选 → teaching（重启后保护开）；取消 → office（解冻）。Agent
-              心跳拉取后默认下开机生效。当前：{editModeHint || "—"}
-              。考试/细粒度请用「工作模式」页绑定。
-            </p>
           </div>
           <div className="modal-actions">
             <button

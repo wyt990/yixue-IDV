@@ -398,42 +398,57 @@ fn query_protect_status_ioctl() -> Option<bool> {
         ) -> i32;
     }
     const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
     const OPEN_EXISTING: u32 = 3;
     const INVALID: isize = -1;
-    let path: Vec<u16> = std::ffi::OsStr::new(r"\\.\QHEngineControlDevice")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    // Prefer Global\ DOS device namespace; fall back to short name.
+    let candidates = [r"\\.\Global\QHEngineControlDevice", r"\\.\QHEngineControlDevice"];
     unsafe {
-        let h = CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ,
-            0,
-            ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            ptr::null_mut(),
-        );
-        if h as isize == INVALID {
-            return None;
+        unsafe extern "system" {
+            fn GetLastError() -> u32;
         }
-        let mut result: u8 = 0;
-        let mut returned = 0u32;
-        let ok = DeviceIoControl(
-            h,
-            IOCTL_QH_QUERY_PROTECT_STATUS,
-            ptr::null_mut(),
-            0,
-            &mut result as *mut u8 as *mut _,
-            1,
-            &mut returned,
-            ptr::null_mut(),
-        );
-        CloseHandle(h);
-        if ok == 0 {
-            return None;
+        for name in candidates {
+            let path: Vec<u16> = std::ffi::OsStr::new(name)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let h = CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            );
+            if h as isize == INVALID {
+                let err = GetLastError();
+                tracing::debug!(device = name, err, "open restore control device failed");
+                continue;
+            }
+            let mut result: u8 = 0;
+            let mut returned = 0u32;
+            let ok = DeviceIoControl(
+                h,
+                IOCTL_QH_QUERY_PROTECT_STATUS,
+                ptr::null_mut(),
+                0,
+                &mut result as *mut u8 as *mut _,
+                1,
+                &mut returned,
+                ptr::null_mut(),
+            );
+            let ioctl_err = if ok == 0 { GetLastError() } else { 0 };
+            CloseHandle(h);
+            if ok == 0 {
+                tracing::debug!(device = name, ioctl_err, "IOCTL_QH_QUERY_PROTECT_STATUS failed");
+                continue;
+            }
+            return Some(result != 0);
         }
-        Some(result != 0)
+        None
     }
 }
 

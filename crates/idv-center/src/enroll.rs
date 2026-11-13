@@ -56,20 +56,22 @@ pub async fn ensure_client_enrolled(
     let lab_id = settings.default_lab_id.trim().to_string();
     let _ = crate::lab_naming::load_lab(state, &lab_id).await?;
     let name = crate::lab_naming::allocate_next_name(state, &lab_id).await?;
-    let notes = if hostname_note.trim().is_empty() {
-        String::new()
-    } else {
-        format!("auto-enroll hostname={}", hostname_note.trim())
-    };
+    let assigned_ip = crate::lab_naming::allocate_next_ip(state, &lab_id)
+        .await
+        .unwrap_or_default();
+    // 备注留给管理员手填，自动登记不写入内容
+    let notes = String::new();
+    let _ = hostname_note;
     let id = new_id();
     match sqlx::query(
-        "INSERT INTO clients (id, lab_id, mac, name, notes, last_seen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO clients (id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
     )
     .bind(&id)
     .bind(&lab_id)
     .bind(mac)
     .bind(&name)
     .bind(&notes)
+    .bind(&assigned_ip)
     .bind(now)
     .bind(now)
     .execute(&state.pool)
@@ -82,7 +84,7 @@ pub async fn ensure_client_enrolled(
                 "client.auto_enroll",
                 "client",
                 &id,
-                &format!("mac={mac} lab={lab_id} name={name}"),
+                &format!("mac={mac} lab={lab_id} name={name} ip={assigned_ip}"),
             )
             .await;
             Ok(Some(EnrollOutcome {

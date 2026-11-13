@@ -50,6 +50,12 @@ pub struct Lab {
     #[serde(default)]
     pub ip_end: String,
     #[serde(default)]
+    pub netmask: String,
+    #[serde(default)]
+    pub gateway: String,
+    #[serde(default)]
+    pub dns: String,
+    #[serde(default)]
     pub default_image_id: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Bound Edge ids ordered by priority (not a DB column).
@@ -73,6 +79,11 @@ pub struct Client {
     pub mac: String,
     pub name: String,
     pub notes: String,
+    #[serde(default)]
+    pub last_ip: String,
+    /// Center-assigned static IPv4 for this MAC (may be empty).
+    #[serde(default)]
+    pub assigned_ip: String,
     pub last_seen: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -138,6 +149,12 @@ pub struct CreateLab {
     pub ip_start: String,
     #[serde(default)]
     pub ip_end: String,
+    #[serde(default)]
+    pub netmask: String,
+    #[serde(default)]
+    pub gateway: String,
+    #[serde(default)]
+    pub dns: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +175,12 @@ pub struct UpdateLab {
     pub ip_start: Option<String>,
     #[serde(default)]
     pub ip_end: Option<String>,
+    #[serde(default)]
+    pub netmask: Option<String>,
+    #[serde(default)]
+    pub gateway: Option<String>,
+    #[serde(default)]
+    pub dns: Option<String>,
     /// When `edge_ids` is `Some`, also apply this (empty/None clears).
     #[serde(default)]
     pub default_image_id: Option<String>,
@@ -192,6 +215,18 @@ pub struct UpdateClient {
     pub name: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default)]
+    pub assigned_ip: Option<String>,
+}
+
+/// Hostname + static IPv4 the agent should enforce for this MAC.
+#[derive(Debug, Clone, Serialize)]
+pub struct DesiredIdentity {
+    pub hostname: String,
+    pub ip: String,
+    pub netmask: String,
+    pub gateway: String,
+    pub dns: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,6 +353,9 @@ pub struct AgentHeartbeat {
     /// Free-form restore-driver status (e.g. protected / thawed / missing).
     #[serde(default)]
     pub driver_status: String,
+    /// Best-effort local IPv4 reported by agent.
+    #[serde(default)]
+    pub local_ip: String,
 }
 
 fn default_trigger() -> String {
@@ -342,6 +380,9 @@ pub struct AgentPolicyResponse {
     /// Volume-filter / freeze DesiredState (preferred over should_restore for new agents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_state: Option<idv_common::endpoint_policy::DesiredEndpointState>,
+    /// Center-assigned computer name + static IP for this client (if registered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_identity: Option<DesiredIdentity>,
     pub message: String,
 }
 

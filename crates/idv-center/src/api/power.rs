@@ -2,13 +2,14 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
+use sqlx::SqlitePool;
 
 use crate::auth::AuthUser;
 use crate::mac::normalize_mac;
 use crate::models::{CreatePowerCommand, PowerCommand, new_id};
 use crate::state::AppState;
 
-/// Queue WOL or shutdown for a MAC. WOL is best-effort magic packet from Center host.
+/// Queue WOL / shutdown / reboot for a MAC. WOL is best-effort from Center host.
 pub async fn create(
     State(state): State<AppState>,
     user: AuthUser,
@@ -17,19 +18,96 @@ pub async fn create(
     user.require_write()?;
     let mac = normalize_mac(&body.mac).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let kind = body.kind.trim().to_ascii_lowercase();
-    if !matches!(kind.as_str(), "wol" | "shutdown") {
-        return Err((StatusCode::BAD_REQUEST, "kind must be wol|shutdown".into()));
+    if !matches!(kind.as_str(), "wol" | "shutdown" | "reboot") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "kind must be wol|shutdown|reboot".into(),
+        ));
     }
+    let cmd = enqueue_power(&state.pool, &mac, &kind, &body.detail).await?;
+    Ok((StatusCode::CREATED, Json(cmd)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BulkPowerCommand {
+    pub macs: Vec<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BulkPowerResult {
+    pub created: usize,
+    pub errors: Vec<String>,
+}
+
+pub async fn create_bulk(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<BulkPowerCommand>,
+) -> Result<Json<BulkPowerResult>, (StatusCode, String)> {
+    user.require_write()?;
+    let kind = body.kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "wol" | "shutdown" | "reboot") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "kind must be wol|shutdown|reboot".into(),
+        ));
+    }
+    let mut created = 0usize;
+    let mut errors = Vec::new();
+    for raw in body.macs {
+        let mac = match normalize_mac(&raw) {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        match enqueue_power(&state.pool, &mac, &kind, &body.detail).await {
+            Ok(_) => created += 1,
+            Err((_, msg)) => errors.push(format!("{mac}: {msg}")),
+        }
+    }
+    Ok(Json(BulkPowerResult { created, errors }))
+}
+
+/// Enqueue reboot for every client in a lab (mode-change path A).
+pub async fn enqueue_reboots_for_lab(
+    pool: &SqlitePool,
+    lab_id: &str,
+    detail: &str,
+) -> Result<usize, (StatusCode, String)> {
+    let macs: Vec<(String,)> = sqlx::query_as("SELECT mac FROM clients WHERE lab_id = ?")
+        .bind(lab_id)
+        .fetch_all(pool)
+        .await
+        .map_err(internal)?;
+    let mut n = 0usize;
+    for (mac,) in macs {
+        enqueue_power(pool, &mac, "reboot", detail).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+pub async fn enqueue_power(
+    pool: &SqlitePool,
+    mac: &str,
+    kind: &str,
+    detail_in: &str,
+) -> Result<PowerCommand, (StatusCode, String)> {
     let client_id: Option<String> = sqlx::query_scalar("SELECT id FROM clients WHERE mac = ?")
-        .bind(&mac)
-        .fetch_optional(&state.pool)
+        .bind(mac)
+        .fetch_optional(pool)
         .await
         .map_err(internal)?;
 
     let now = Utc::now();
-    let mut detail = body.detail;
+    let mut detail = detail_in.to_string();
     if kind == "wol" {
-        match send_wol(&mac) {
+        match send_wol(mac) {
             Ok(msg) => {
                 if detail.is_empty() {
                     detail = msg;
@@ -44,8 +122,8 @@ pub async fn create(
     let cmd = PowerCommand {
         id: new_id(),
         client_id,
-        mac: mac.clone(),
-        kind: kind.clone(),
+        mac: mac.to_string(),
+        kind: kind.to_string(),
         state: if kind == "wol" {
             "done".into()
         } else {
@@ -66,10 +144,10 @@ pub async fn create(
     .bind(&cmd.detail)
     .bind(cmd.created_at)
     .bind(cmd.updated_at)
-    .execute(&state.pool)
+    .execute(pool)
     .await
     .map_err(internal)?;
-    Ok((StatusCode::CREATED, Json(cmd)))
+    Ok(cmd)
 }
 
 pub async fn ack(
@@ -120,8 +198,10 @@ pub async fn list(
     Ok(Json(rows))
 }
 
-fn send_wol(mac: &str) -> anyhow::Result<String> {
-    idv_common::wol::send_magic_packet(mac).map_err(|e| anyhow::anyhow!(e))
+fn send_wol(mac: &str) -> Result<String, String> {
+    idv_common::wol::send_magic_packet(mac)
+        .map(|_| format!("wol_sent mac={mac}"))
+        .map_err(|e| e.to_string())
 }
 
 fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {

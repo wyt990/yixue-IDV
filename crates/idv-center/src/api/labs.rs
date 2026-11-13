@@ -78,12 +78,15 @@ pub async fn create(
         next_suffix: start,
         ip_start: body.ip_start.trim().to_string(),
         ip_end: body.ip_end.trim().to_string(),
+        netmask: body.netmask.trim().to_string(),
+        gateway: body.gateway.trim().to_string(),
+        dns: body.dns.trim().to_string(),
         default_image_id: None,
         created_at: Utc::now(),
         edge_ids: Vec::new(),
     };
     sqlx::query(
-        "INSERT INTO labs (id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO labs (id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, netmask, gateway, dns, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&lab.id)
     .bind(&lab.campus_id)
@@ -94,6 +97,9 @@ pub async fn create(
     .bind(lab.next_suffix)
     .bind(&lab.ip_start)
     .bind(&lab.ip_end)
+    .bind(&lab.netmask)
+    .bind(&lab.gateway)
+    .bind(&lab.dns)
     .bind(lab.created_at)
     .execute(&state.pool)
     .await
@@ -148,6 +154,18 @@ pub async fn update(
         .ip_end
         .map(|s| s.trim().to_string())
         .unwrap_or(existing.ip_end);
+    let netmask = body
+        .netmask
+        .map(|s| s.trim().to_string())
+        .unwrap_or(existing.netmask);
+    let gateway = body
+        .gateway
+        .map(|s| s.trim().to_string())
+        .unwrap_or(existing.gateway);
+    let dns = body
+        .dns
+        .map(|s| s.trim().to_string())
+        .unwrap_or(existing.dns);
 
     let campus_ok: Option<(String,)> = sqlx::query_as("SELECT id FROM campuses WHERE id = ?")
         .bind(&campus_id)
@@ -158,7 +176,7 @@ pub async fn update(
         return Err((StatusCode::BAD_REQUEST, "campus not found".into()));
     }
     sqlx::query(
-        "UPDATE labs SET campus_id = ?, name = ?, name_prefix = ?, suffix_width = ?, suffix_start = ?, next_suffix = ?, ip_start = ?, ip_end = ? WHERE id = ?",
+        "UPDATE labs SET campus_id = ?, name = ?, name_prefix = ?, suffix_width = ?, suffix_start = ?, next_suffix = ?, ip_start = ?, ip_end = ?, netmask = ?, gateway = ?, dns = ? WHERE id = ?",
     )
     .bind(&campus_id)
     .bind(&name)
@@ -168,6 +186,9 @@ pub async fn update(
     .bind(next_suffix)
     .bind(&ip_start)
     .bind(&ip_end)
+    .bind(&netmask)
+    .bind(&gateway)
+    .bind(&dns)
     .bind(&id)
     .execute(&state.pool)
     .await

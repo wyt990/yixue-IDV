@@ -61,7 +61,7 @@ pub async fn list(
         (Some(lab_id), Some(tag)) => {
             sqlx::query_as::<_, Client>(
                 r#"
-                SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_seen, c.created_at
+                SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_ip, c.assigned_ip, c.last_seen, c.created_at
                 FROM clients c
                 JOIN client_tags t ON t.client_id = c.id
                 WHERE c.lab_id = ? AND t.tag = ?
@@ -76,7 +76,7 @@ pub async fn list(
         (None, Some(tag)) => {
             sqlx::query_as::<_, Client>(
                 r#"
-                SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_seen, c.created_at
+                SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_ip, c.assigned_ip, c.last_seen, c.created_at
                 FROM clients c
                 JOIN client_tags t ON t.client_id = c.id
                 WHERE t.tag = ?
@@ -89,7 +89,7 @@ pub async fn list(
         }
         (Some(lab_id), None) => {
             sqlx::query_as::<_, Client>(
-                "SELECT id, lab_id, mac, name, notes, last_seen, created_at FROM clients WHERE lab_id = ? ORDER BY mac",
+                "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients WHERE lab_id = ? ORDER BY mac",
             )
             .bind(lab_id)
             .fetch_all(&state.pool)
@@ -97,7 +97,7 @@ pub async fn list(
         }
         (None, None) => {
             sqlx::query_as::<_, Client>(
-                "SELECT id, lab_id, mac, name, notes, last_seen, created_at FROM clients ORDER BY mac",
+                "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients ORDER BY mac",
             )
             .fetch_all(&state.pool)
             .await
@@ -164,7 +164,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<Client>, (StatusCode, String)> {
     sqlx::query_as::<_, Client>(
-        "SELECT id, lab_id, mac, name, notes, last_seen, created_at FROM clients WHERE id = ?",
+        "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -187,12 +187,17 @@ pub async fn create(
     } else {
         body.name.trim().to_string()
     };
+    let assigned_ip = crate::lab_naming::allocate_next_ip(&state, &body.lab_id)
+        .await
+        .unwrap_or_default();
     let client = Client {
         id: new_id(),
         lab_id: body.lab_id,
         mac,
         name,
         notes: body.notes,
+        last_ip: String::new(),
+        assigned_ip,
         last_seen: None,
         created_at: Utc::now(),
     };
@@ -230,12 +235,17 @@ pub async fn bulk_create(
                 continue;
             }
         };
+        let assigned_ip = crate::lab_naming::allocate_next_ip(&state, &body.lab_id)
+            .await
+            .unwrap_or_default();
         let client = Client {
             id: new_id(),
             lab_id: body.lab_id.clone(),
             mac: mac.clone(),
             name,
             notes: String::new(),
+            last_ip: String::new(),
+            assigned_ip,
             last_seen: None,
             created_at: Utc::now(),
         };
@@ -337,7 +347,7 @@ pub async fn update(
 ) -> Result<Json<Client>, (StatusCode, String)> {
     user.require_write()?;
     let existing = sqlx::query_as::<_, Client>(
-        "SELECT id, lab_id, mac, name, notes, last_seen, created_at FROM clients WHERE id = ?",
+        "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -352,18 +362,23 @@ pub async fn update(
     ensure_lab(&state, &lab_id).await?;
     let name = body.name.unwrap_or(existing.name);
     let notes = body.notes.unwrap_or(existing.notes);
+    let assigned_ip = body
+        .assigned_ip
+        .map(|s| s.trim().to_string())
+        .unwrap_or(existing.assigned_ip);
 
-    sqlx::query("UPDATE clients SET lab_id = ?, name = ?, notes = ? WHERE id = ?")
+    sqlx::query("UPDATE clients SET lab_id = ?, name = ?, notes = ?, assigned_ip = ? WHERE id = ?")
         .bind(&lab_id)
         .bind(&name)
         .bind(&notes)
+        .bind(&assigned_ip)
         .bind(&id)
         .execute(&state.pool)
         .await
         .map_err(internal)?;
 
     sqlx::query_as::<_, Client>(
-        "SELECT id, lab_id, mac, name, notes, last_seen, created_at FROM clients WHERE id = ?",
+        "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -404,13 +419,15 @@ async fn ensure_lab(state: &AppState, lab_id: &str) -> Result<(), (StatusCode, S
 
 async fn insert_client(state: &AppState, client: &Client) -> Result<(), (StatusCode, String)> {
     sqlx::query(
-        "INSERT INTO clients (id, lab_id, mac, name, notes, last_seen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO clients (id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&client.id)
     .bind(&client.lab_id)
     .bind(&client.mac)
     .bind(&client.name)
     .bind(&client.notes)
+    .bind(&client.last_ip)
+    .bind(&client.assigned_ip)
     .bind(client.last_seen)
     .bind(client.created_at)
     .execute(&state.pool)
