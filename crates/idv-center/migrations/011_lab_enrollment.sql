@@ -1,0 +1,7 @@
+-- Lab naming / IP range + enrollment defaults via ops_settings
+ALTER TABLE labs ADD COLUMN name_prefix TEXT NOT NULL DEFAULT '';
+ALTER TABLE labs ADD COLUMN suffix_width INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE labs ADD COLUMN suffix_start INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE labs ADD COLUMN next_suffix INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE labs ADD COLUMN ip_start TEXT NOT NULL DEFAULT '';
+ALTER TABLE labs ADD COLUMN ip_end TEXT NOT NULL DEFAULT '';

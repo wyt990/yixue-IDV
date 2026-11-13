@@ -1,0 +1,1 @@
+ALTER TABLE agent_sessions ADD COLUMN usb_enforced INTEGER NOT NULL DEFAULT 0;

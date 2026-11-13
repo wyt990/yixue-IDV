@@ -1,0 +1,14 @@
+#!ipxe
+# PE entry: check-in (enroll + name) then local disk or wait for task.
+# ASCII only — iPXE console has no CJK glyphs.
+echo
+echo === Yixue IDV Maintenance ===
+isset ${mac} || set mac ${net0/mac}
+isset ${edge-http} || set edge-http http://${next-server}:8081
+echo Chaining check-in: ${edge-http}
+chain ${edge-http}/api/v1/pe/checkin.ipxe?mac=${mac}&source=ipxe || goto failed
+exit 0
+
+:failed
+echo ERROR: check-in script failed
+shell

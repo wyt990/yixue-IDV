@@ -1,0 +1,3 @@
+# PE / 本机调试用 pe-agent 配置示例
+edge_url = "http://127.0.0.1:8081"
+log = "info,idv_pe_agent=debug"

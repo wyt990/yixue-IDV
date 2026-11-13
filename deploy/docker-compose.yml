@@ -1,0 +1,23 @@
+# 易学 IDV — 开发依赖（阶段 0）
+# PostgreSQL 钉小版本标签，见 docs/modules/09-外部依赖与版本策略.md
+services:
+  postgres:
+    # 钉在 PostgreSQL 18 大版本；升级小版本时同步改标签并更新模块 09
+    image: postgres:18
+    container_name: idv-postgres
+    environment:
+      POSTGRES_USER: idv
+      POSTGRES_PASSWORD: idv
+      POSTGRES_DB: idv
+    ports:
+      - "5432:5432"
+    volumes:
+      - idv_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U idv -d idv"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  idv_pg_data:

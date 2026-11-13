@@ -1,0 +1,53 @@
+# --- Rust ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- Node / 前端 ---
+/web/node_modules/
+/web/dist/
+
+# --- 运行时数据与镜像（勿入库） ---
+/data/
+*.db
+*.db-*
+*.bin
+temp/
+/tmp/
+
+# --- 本地机密与现场配置（提交 *.toml.example） ---
+.env
+.env.*
+!.env.example
+deploy/config/edge.toml
+deploy/config/center.toml
+deploy/config/pe-agent.toml
+deploy/config/agent.toml
+deploy/config/*.local.toml
+
+# --- PE 大文件与构建产物（脚本可重新拉取/编译） ---
+/pe/linux/vmlinuz-lts
+/pe/linux/initramfs-lts
+/pe/linux/initramfs-lts.orig
+/pe/linux/modloop-lts
+/pe/linux/idv-pe-agent
+/pe/linux/idv.apkovl.tar.gz
+/pe/linux/_mod_ko/
+/pe/linux/_initrd_work/
+/pe/linux/initramfs-extract/
+/pe/linux/ovl-work/
+/pe/linux/ovl-refresh/
+/pe/build/
+/pe/ipxe.efi
+/pe/ipxe.pxe
+/pe/snponly.efi
+/pe/undionly.kpxe
+
+# --- 日志与杂项 ---
+*.log
+=rwc
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json

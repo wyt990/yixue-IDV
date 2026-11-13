@@ -1,0 +1,10 @@
+# 易学 IDV — 中心服务配置示例
+# 可直接复制为 center.toml，或按环境修改 listen / database_url
+listen = "127.0.0.1:8080"
+log = "info,idv_center=debug"
+database_url = "sqlite://data/idv-center.db?mode=rwc"
+web_dir = "web/dist"
+images_dir = "data/images"
+max_concurrent_deploy_targets = 80
+max_pending_sync_per_edge = 16
+recommended_deploy_batch = 40

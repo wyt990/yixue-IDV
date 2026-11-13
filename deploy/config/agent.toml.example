@@ -1,0 +1,4 @@
+# 学生机 idv-agent 配置示例（按实际 Edge/Center 填写）
+edge_url = "http://10.101.0.36:8081"
+center_url = "http://10.101.0.36:8080"
+log = "info,idv_agent=info"

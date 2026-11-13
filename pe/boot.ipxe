@@ -1,0 +1,16 @@
+#!ipxe
+# First-hop iPXE script (Edge TFTP/HTTP). ASCII only: iPXE console has no CJK glyphs.
+echo
+echo === Yixue IDV Network Boot ===
+isset ${mac} || set mac ${net0/mac}
+echo MAC: ${mac}
+isset ${edge-http} || set edge-http http://${next-server}:8081
+chain ${edge-http}/pxe/pe.ipxe && goto done || goto failed
+
+:done
+exit 0
+
+:failed
+echo ERROR: failed to load pe.ipxe
+echo Dropping to iPXE shell. Type 'exit' to leave.
+shell

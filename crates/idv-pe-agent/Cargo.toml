@@ -1,0 +1,24 @@
+[package]
+name = "idv-pe-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Yixue IDV agent running inside the PE maintenance environment"
+
+[[bin]]
+name = "idv-pe-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes = "1"
+clap.workspace = true
+futures-util.workspace = true
+idv-common.workspace = true
+# PE LAN uses plain HTTP to Edge; avoid rustls/ring so linux-musl can link without a C toolchain.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

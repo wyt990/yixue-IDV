@@ -1,0 +1,31 @@
+{
+  "format_version": 1,
+  "description": "PE WiFi driver pack slots for stage 6d (placeholder hardware IDs)",
+  "note": "Replace inf_path with signed drivers before production PE build. PXE firmware WiFi is not supported.",
+  "drivers": [
+    {
+      "id": "intel-ax201-lab",
+      "vendor": "Intel",
+      "product": "Wi-Fi 6 AX201 (lab placeholder)",
+      "hardware_ids": ["PCI\\VEN_8086&DEV_06F0"],
+      "inf_path": "intel/ax201/netwtw08.inf",
+      "status": "placeholder"
+    },
+    {
+      "id": "realtek-8822ce-lab",
+      "vendor": "Realtek",
+      "product": "RTL8822CE (lab placeholder)",
+      "hardware_ids": ["PCI\\VEN_10EC&DEV_C822"],
+      "inf_path": "realtek/8822ce/netrtwlane.inf",
+      "status": "placeholder"
+    },
+    {
+      "id": "mediatek-mt7921-lab",
+      "vendor": "MediaTek",
+      "product": "MT7921 (lab placeholder)",
+      "hardware_ids": ["PCI\\VEN_14C3&DEV_7961"],
+      "inf_path": "mediatek/mt7921/netwlan.inf",
+      "status": "placeholder"
+    }
+  ]
+}

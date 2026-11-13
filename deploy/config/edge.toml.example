@@ -1,0 +1,32 @@
+# 易学 IDV — 边缘节点配置示例
+# 复制为 edge.toml 后填写 node_token 与机房网段参数：
+#   copy deploy\config\edge.toml.example deploy\config\edge.toml
+listen = "0.0.0.0:8081"
+center_url = "http://127.0.0.1:8080"
+name = "楼栋A-缓存"
+# 在管理端「边缘节点」创建后粘贴令牌（勿提交含真实令牌的 edge.toml）
+node_token = "REPLACE_WITH_EDGE_NODE_TOKEN"
+cache_dir = "data/edge-cache"
+capture_tmp_dir = "data/edge-cache/capture-tmp"
+cache_quota_bytes = 107374182400
+cache_warn_pct = 85
+sync_bandwidth_bps = 0
+max_concurrent_syncs = 2
+p2p_chunk_size = 16384
+log = "info,idv_edge=debug"
+heartbeat_secs = 10
+poll_secs = 2
+
+[pxe]
+enabled = true
+mode = "full"
+dhcp_bind = "0.0.0.0:67"
+tftp_bind = "0.0.0.0:69"
+tftp_root = "pe"
+boot_file = "ipxe.efi"
+next_server = "10.101.0.36"
+subnet_mask = "255.255.255.0"
+router = "10.101.0.254"
+offer_start = "10.101.0.230"
+offer_end = "10.101.0.250"
+lease_secs = 3600

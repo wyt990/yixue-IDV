@@ -1,0 +1,31 @@
+[package]
+name = "idv-center"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Yixue IDV central management service"
+
+[[bin]]
+name = "idv-center"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+idv-common.workspace = true
+password-hash.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
