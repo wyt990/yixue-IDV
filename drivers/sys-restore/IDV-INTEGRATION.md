@@ -27,9 +27,28 @@ bcdedit /set testsigning on
 
 桌面出现「测试模式」水印属正常。量产需 EV 代码签名，本刀不覆盖。
 
-## Agent 无驱动时
+## Agent 控制面
 
-`idv-agent restore-driver` 自动回落 **MockFile**（`%ProgramData%\YixueIDV\restore-driver-state.json`），用于联调策略队列，**不提供真还原**。
+```text
+idv-agent restore-driver status
+idv-agent restore-driver protect-on --volumes system
+idv-agent restore-driver protect-off
+idv-agent sync-policy --apply
+```
+
+开/关保护与 QHEngineUI 相同：在系统盘根目录写 `_qh_protect_state.data`（1MB，首字节 1/0）。**需重启后驱动才按文件激活**。  
+`status` 中 `armed`=状态文件意图，`frozen`=IOCTL 查询到的运行时保护（驱动未加载时回落为 armed）。
+
+强制 Mock（不写真实卷）：
+
+```powershell
+$env:IDV_RESTORE_MOCK=1
+idv-agent restore-driver protect-on --volumes system
+```
+
+## 无驱动 / Mock
+
+未设置 Mock 时 Windows 默认走 **StateFile**。设置 `IDV_RESTORE_MOCK=1` 时用 `%ProgramData%\YixueIDV\restore-driver-state.json`，仅联调策略，**不提供真还原**。
 
 ## 参考
 

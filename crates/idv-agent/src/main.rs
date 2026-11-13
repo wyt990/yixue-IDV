@@ -534,8 +534,8 @@ async fn main() -> anyhow::Result<()> {
                 RestoreDriverCmd::Status => {
                     let st = drv.status()?;
                     println!(
-                        "restore_driver backend={:?} available={} frozen={} detail={}",
-                        st.backend, st.available, st.frozen, st.detail
+                        "restore_driver backend={:?} available={} frozen={} armed={} detail={}",
+                        st.backend, st.available, st.frozen, st.armed, st.detail
                     );
                 }
                 RestoreDriverCmd::ProtectOn { volumes } => {
