@@ -116,6 +116,8 @@ pub struct ClientView {
     pub mode_name: String,
     pub current_hostname: String,
     pub identity_state: String,
+    /// Agent build version reported by heartbeat ("" if never reported).
+    pub agent_version: String,
 }
 
 /// Raw row for [`ClientView`] (sqlx mapping + computed fields).
@@ -136,6 +138,7 @@ pub struct ClientViewRow {
     pub mode_name: String,
     pub current_hostname: String,
     pub identity_state: String,
+    pub agent_version: String,
 }
 
 impl From<ClientViewRow> for ClientView {
@@ -161,6 +164,7 @@ impl From<ClientViewRow> for ClientView {
             mode_name: r.mode_name,
             current_hostname: r.current_hostname,
             identity_state: r.identity_state,
+            agent_version: r.agent_version,
         }
     }
 }
@@ -352,8 +356,15 @@ pub struct ModePolicy {
     pub schedule_start: Option<String>,
     pub schedule_end: Option<String>,
     pub usb_restricted: i64,
+    /// system = protect only the system volume; all_fixed = all fixed NTFS volumes.
+    #[serde(default = "default_protect_scope")]
+    pub protect_scope: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_protect_scope() -> String {
+    "system".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,6 +386,17 @@ pub struct CreateModePolicy {
     pub schedule_end: Option<String>,
     #[serde(default)]
     pub usb_restricted: bool,
+    /// system | all_fixed (default system for backward compatibility).
+    #[serde(default = "default_protect_scope")]
+    pub protect_scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAgentUpdateTask {
+    pub version: String,
+    pub macs: Vec<String>,
+    #[serde(default)]
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +407,9 @@ pub struct UpdateModeSchedule {
     pub schedule_end: Option<String>,
     #[serde(default)]
     pub usb_restricted: Option<bool>,
+    /// system | all_fixed
+    #[serde(default)]
+    pub protect_scope: Option<String>,
 }
 
 fn default_restore() -> String {

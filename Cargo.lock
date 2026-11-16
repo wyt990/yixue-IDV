@@ -956,16 +956,18 @@ dependencies = [
 
 [[package]]
 name = "idv-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "futures-util",
+ "hex",
  "idv-common",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",

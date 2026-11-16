@@ -93,6 +93,7 @@ export type Client = {
   mode_name?: string;
   current_hostname?: string;
   identity_state?: string;
+  agent_version?: string;
   created_at: string;
 };
 export type EnrollmentSettings = {
@@ -163,6 +164,12 @@ export type TaskView = {
   created_at: string;
   updated_at: string;
   targets: TaskTarget[];
+};
+
+export type AgentPackage = {
+  version: string;
+  size_bytes: number;
+  sha256: string;
 };
 export type Admin = {
   id: string;
@@ -556,6 +563,11 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload),
       }),
+    agentUpdate: (payload: { version: string; macs: string[]; name?: string }) =>
+      request<TaskView>("/api/v1/tasks/agent-update", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
     exportCsv: async () => {
       const token = getToken();
       const res = await fetch("/api/v1/tasks/export.csv", {
@@ -571,9 +583,21 @@ export const api = {
       URL.revokeObjectURL(url);
     },
   },
+  agentPackages: {
+    list: () => request<AgentPackage[]>("/api/v1/agent/packages"),
+    upload: async (file: File) => {
+      const token = getToken();
+      const res = await fetch("/api/v1/agent/packages", {
+        method: "PUT",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: file,
+      });
+      if (!res.ok) throw new ApiError(res.status, await res.text());
+      return (await res.json()) as AgentPackage;
+    },
+  },
   modes: {
-    list: () => request<ModePolicy[]>("/api/v1/modes"),
-    bindings: () =>
+    list: () => request<ModePolicy[]>("/api/v1/modes"),    bindings: () =>
       request<
         {
           lab_id: string;

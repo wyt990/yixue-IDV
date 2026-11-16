@@ -61,7 +61,7 @@ pub async fn list(
         "SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_ip, c.assigned_ip, c.last_seen, c.created_at, \
          s.last_seen AS agent_last_seen, COALESCE(s.frozen, 0) AS frozen, COALESCE(s.armed, 0) AS armed, \
          COALESCE(s.mode_name, '') AS mode_name, COALESCE(s.current_hostname, '') AS current_hostname, \
-         COALESCE(s.identity_state, '') AS identity_state \
+         COALESCE(s.identity_state, '') AS identity_state, COALESCE(s.agent_version, '') AS agent_version \
          FROM clients c LEFT JOIN agent_sessions s ON s.mac = c.mac WHERE 1 = 1",
     );
     if filter.lab_id.is_some() {

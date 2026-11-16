@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   api,
+  type AgentPackage,
   type Campus,
   type Client,
   type EdgeNode,
@@ -35,7 +36,7 @@ const DISK_PLANS = [
   },
 ] as const;
 
-type ModalKind = "capture" | "deploy" | "lifecycle" | null;
+type ModalKind = "capture" | "deploy" | "agent" | "lifecycle" | null;
 
 export function TasksPage() {
   const msg = useMessage();
@@ -52,6 +53,9 @@ export function TasksPage() {
   const [captureName, setCaptureName] = useState("");
   const [excludeTemp, setExcludeTemp] = useState(true);
   const [deployImage, setDeployImage] = useState("");
+  const [agentPackages, setAgentPackages] = useState<AgentPackage[]>([]);
+  const [agentVersion, setAgentVersion] = useState("");
+  const [agentFile, setAgentFile] = useState<File | null>(null);
   const [selectedMacs, setSelectedMacs] = useState<Set<string>>(new Set());
   const [filterCampusId, setFilterCampusId] = useState("");
   const [filterLabId, setFilterLabId] = useState("");
@@ -158,6 +162,15 @@ export function TasksPage() {
       });
       const unique = [...new Set(resolved.filter(Boolean))] as string[];
       if (unique.length === 1) setDeployImage(unique[0]);
+    }
+    if (kind === "agent") {
+      api.agentPackages
+        .list()
+        .then((pkgs) => {
+          setAgentPackages(pkgs);
+          if (!agentVersion && pkgs[0]) setAgentVersion(pkgs[0].version);
+        })
+        .catch((err) => setFormError(err instanceof Error ? err.message : String(err)));
     }
     setModal(kind);
   }
@@ -271,6 +284,36 @@ export function TasksPage() {
     }
   }
 
+  async function onAgentUpdate(e: FormEvent) {
+    e.preventDefault();
+    setFormError("");
+    if (selectedMacList.length === 0) {
+      setFormError("请先勾选至少一台目标客户端");
+      return;
+    }
+    let version = agentVersion.trim();
+    try {
+      if (agentFile) {
+        const uploaded = await api.agentPackages.upload(agentFile);
+        version = uploaded.version;
+        setAgentVersion(uploaded.version);
+        setAgentFile(null);
+        setAgentPackages(await api.agentPackages.list());
+      }
+      if (!version) {
+        setFormError("请选择已上传的 Agent 包，或选择文件上传");
+        return;
+      }
+      await api.tasks.agentUpdate({ version, macs: selectedMacList });
+      setSelectedMacs(new Set());
+      setModal(null);
+      msg.success(`已下发 Agent ${version} 更新任务（${selectedMacList.length} 台）`);
+      await refresh();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "创建失败");
+    }
+  }
+
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
       <div className="panel-head">
@@ -294,6 +337,13 @@ export function TasksPage() {
             onClick={() => openModal("deploy")}
           >
             部署任务
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => openModal("agent")}
+          >
+            更新 Agent
           </button>
           <button
             type="button"
@@ -672,6 +722,126 @@ export function TasksPage() {
               disabled={selectedMacs.size === 0 || !deployImage}
             >
               下发部署（{selectedMacs.size} 台）
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={modal === "agent"}
+        title="更新客户端 Agent"
+        onClose={() => setModal(null)}
+        wide
+      >
+        <form onSubmit={onAgentUpdate}>
+          {formError ? <p className="error">{formError}</p> : null}
+          <p className="muted">
+            更新流程：客户端如处于还原状态，会先解除还原并重启；重启后自动下载新
+            Agent、替换并重启服务；新版本上线后自动重新开启还原（再重启一次）。
+          </p>
+          <div className="field">
+            <label>目标客户端</label>
+            <div className="page-actions" style={{ marginBottom: "0.5rem" }}>
+              <select
+                value={filterCampusId}
+                onChange={(e) => {
+                  setFilterCampusId(e.target.value);
+                  setFilterLabId("");
+                }}
+                aria-label="校区筛选"
+              >
+                <option value="">全部校区</option>
+                {campuses.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={filterLabId}
+                onChange={(e) => setFilterLabId(e.target.value)}
+                aria-label="机房筛选"
+              >
+                <option value="">全部机房</option>
+                {labsForFilter.map((lab) => (
+                  <option key={lab.id} value={lab.id}>
+                    {lab.name}
+                  </option>
+                ))}
+              </select>
+              <span className="muted">
+                可见 {filteredClients.length} / 已选 {selectedMacs.size}
+              </span>
+            </div>
+            <div className="page-actions" style={{ marginBottom: "0.5rem" }}>
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => toggleFiltered(true)}
+                disabled={filteredClients.length === 0}
+              >
+                全选当前筛选
+              </button>
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={selectCurrentLab}
+                disabled={!filterLabId}
+              >
+                选中本机房全部
+              </button>
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => setSelectedMacs(new Set())}
+                disabled={selectedMacs.size === 0}
+              >
+                清除已选
+              </button>
+            </div>
+          </div>
+          <div className="field">
+            <label>已上传的 Agent 包</label>
+            <select
+              value={agentVersion}
+              onChange={(e) => setAgentVersion(e.target.value)}
+            >
+              <option value="">选择版本…</option>
+              {agentPackages.map((pkg) => (
+                <option key={pkg.version} value={pkg.version}>
+                  {pkg.version}（{(pkg.size_bytes / 1024 / 1024).toFixed(1)} MB）
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>上传新的 idv-agent.exe（可选）</label>
+            <input
+              type="file"
+              accept=".exe"
+              onChange={(e) => setAgentFile(e.target.files?.[0] ?? null)}
+            />
+            <span className="muted">
+              直接选择新版 exe 即可，版本号会自动从程序内嵌版本标记读取并上传。
+            </span>
+          </div>
+          <p className="muted">
+            已选客户端：{selectedMacs.size} 台。管理员可在任务列表查看每台的更新状态。
+          </p>
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => setModal(null)}
+            >
+              取消
+            </button>
+            <button
+              className="btn"
+              type="submit"
+              disabled={selectedMacs.size === 0 || (!agentVersion && !agentFile)}
+            >
+              下发更新（{selectedMacs.size} 台）
             </button>
           </div>
         </form>

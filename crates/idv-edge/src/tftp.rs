@@ -122,19 +122,42 @@ async fn serve_file(root: &Path, rrq: &Rrq, peer: std::net::SocketAddr) -> anyho
             oack.extend_from_slice(data.len().to_string().as_bytes());
             oack.push(0);
         }
-        xfer.send_to(&oack, peer).await?;
-        let (n, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), xfer.recv_from(&mut rx))
-                .await??;
-        if n >= 4 && u16::from_be_bytes([rx[0], rx[1]]) == 4 {
-            let ack_block = u16::from_be_bytes([rx[2], rx[3]]);
-            if ack_block != 0 {
-                anyhow::bail!("expected ACK#0 after OACK, got {ack_block}");
+
+        // Do not silently fall back to 512-byte blocks after sending OACK: the
+        // client is already in option-negotiation state and will reject/ignore
+        // mismatched DATA, causing "no ACK for block 1". Retransmit OACK instead;
+        // a fresh client RRQ always starts a clean transfer.
+        let mut oack_tries = 0u32;
+        loop {
+            if oack_tries >= 5 {
+                anyhow::bail!("OACK not acknowledged after 5 attempts");
             }
-        } else {
-            // Client rejected options; continue on this TID with classic 512-byte blocks.
-            warn!(%peer, bytes = n, "OACK not ACKed; falling back to blksize 512");
-            return serve_data(&xfer, &rrq.filename, &data, peer, 512, &mut rx).await;
+            oack_tries += 1;
+            xfer.send_to(&oack, peer).await?;
+            match tokio::time::timeout(std::time::Duration::from_secs(2), xfer.recv_from(&mut rx))
+                .await
+            {
+                Ok(Ok((n, _))) if n >= 4 => {
+                    let op = u16::from_be_bytes([rx[0], rx[1]]);
+                    if op == 4 {
+                        let ack_block = u16::from_be_bytes([rx[2], rx[3]]);
+                        if ack_block == 0 {
+                            break;
+                        }
+                        warn!(%peer, ack_block, "unexpected ACK while waiting for ACK#0");
+                    } else if op == 5 {
+                        let msg = String::from_utf8_lossy(&rx[4..n]);
+                        anyhow::bail!("client ERROR during OACK: {msg}");
+                    } else if op == 1 {
+                        warn!(%peer, "duplicate RRQ while waiting for ACK#0; resending OACK");
+                    } else {
+                        warn!(%peer, op, "unexpected TFTP packet while waiting for ACK#0");
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => warn!(%peer, attempt = oack_tries, "OACK ACK timeout; retransmitting"),
+            }
         }
     }
 
@@ -194,6 +217,9 @@ async fn serve_data(
             break;
         }
         block = block.wrapping_add(1);
+        if block == 0 {
+            anyhow::bail!("TFTP block number rollover (file too large for 16-bit block)");
+        }
     }
     Ok(())
 }

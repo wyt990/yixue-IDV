@@ -119,10 +119,18 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     tokio::fs::create_dir_all(&software_dir)
         .await
         .map_err(Error::Io)?;
+    let agent_dir = images_dir
+        .parent()
+        .map(|p| p.join("agent-packages"))
+        .unwrap_or_else(|| PathBuf::from("data/agent-packages"));
+    tokio::fs::create_dir_all(&agent_dir)
+        .await
+        .map_err(Error::Io)?;
     let state = AppState {
         pool: pool.clone(),
         images_dir,
         software_dir,
+        agent_dir,
         max_concurrent_deploy_targets: cfg.max_concurrent_deploy_targets.max(1),
         max_pending_sync_per_edge: cfg.max_pending_sync_per_edge.max(1),
         recommended_deploy_batch: cfg.recommended_deploy_batch.max(1),

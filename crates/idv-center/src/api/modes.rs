@@ -9,7 +9,7 @@ use crate::models::{
 };
 use crate::state::AppState;
 
-const MODE_COLS: &str = "id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, created_at, updated_at";
+const MODE_COLS: &str = "id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, protect_scope, created_at, updated_at";
 
 pub async fn list(
     State(state): State<AppState>,
@@ -38,6 +38,16 @@ pub async fn create(
         &body.persistent_action,
         &body.volatile_action,
     )?;
+    let protect_scope = match body.protect_scope.trim().to_ascii_lowercase().as_str() {
+        "all_fixed" | "all" => "all_fixed".to_string(),
+        "" | "system" => "system".to_string(),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("protect_scope must be system|all_fixed, got '{other}'"),
+            ));
+        }
+    };
     let now = Utc::now();
     let policy = ModePolicy {
         id: new_id(),
@@ -50,11 +60,12 @@ pub async fn create(
         schedule_start: body.schedule_start.filter(|s| !s.trim().is_empty()),
         schedule_end: body.schedule_end.filter(|s| !s.trim().is_empty()),
         usb_restricted: if body.usb_restricted { 1 } else { 0 },
+        protect_scope,
         created_at: now,
         updated_at: now,
     };
     sqlx::query(
-        "INSERT INTO mode_policies (id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO mode_policies (id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, protect_scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&policy.id)
     .bind(&policy.name)
@@ -66,6 +77,7 @@ pub async fn create(
     .bind(&policy.schedule_start)
     .bind(&policy.schedule_end)
     .bind(policy.usb_restricted)
+    .bind(&policy.protect_scope)
     .bind(policy.created_at)
     .bind(policy.updated_at)
     .execute(&state.pool)
@@ -99,18 +111,60 @@ pub async fn update_schedule(
         .usb_restricted
         .map(|b| if b { 1 } else { 0 })
         .unwrap_or(existing.usb_restricted);
+    let protect_scope = match body
+        .protect_scope
+        .as_deref()
+        .unwrap_or(&existing.protect_scope)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "all_fixed" | "all" => "all_fixed",
+        "" | "system" => "system",
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("protect_scope must be system|all_fixed, got '{other}'"),
+            ));
+        }
+    };
     let now = Utc::now();
     sqlx::query(
-        "UPDATE mode_policies SET schedule_start = ?, schedule_end = ?, usb_restricted = ?, updated_at = ? WHERE id = ?",
+        "UPDATE mode_policies SET schedule_start = ?, schedule_end = ?, usb_restricted = ?, protect_scope = ?, updated_at = ? WHERE id = ?",
     )
     .bind(&start)
     .bind(&end)
     .bind(usb)
+    .bind(protect_scope)
     .bind(now)
     .bind(&id)
     .execute(&state.pool)
     .await
     .map_err(internal)?;
+
+    // Scope change must produce a new DesiredState revision on bound labs, and
+    // long-poll clients get an immediate apply_policy (they auto-reboot once).
+    if existing.protect_scope.as_str() != protect_scope {
+        sqlx::query("UPDATE lab_mode_bindings SET updated_at = ? WHERE mode_policy_id = ?")
+            .bind(now)
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal)?;
+        let macs: Vec<(String,)> = sqlx::query_as(
+            "SELECT c.mac FROM clients c JOIN lab_mode_bindings b ON b.lab_id = c.lab_id WHERE b.mode_policy_id = ?",
+        )
+        .bind(&id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal)?;
+        for (mac,) in &macs {
+            let _ =
+                super::agent_commands::enqueue(&state, mac, "apply_policy", "", &user.0.username)
+                    .await;
+        }
+    }
+
     let _ = super::audit::record(
         &state.pool,
         &user.0.username,

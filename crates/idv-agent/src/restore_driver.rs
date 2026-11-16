@@ -144,6 +144,10 @@ impl StateFileDriver {
         let mut roots = Vec::new();
         for v in volumes {
             let t = v.trim();
+            if t.eq_ignore_ascii_case("all_fixed") {
+                roots.extend(fixed_volume_roots());
+                continue;
+            }
             if t.eq_ignore_ascii_case("system") || t.is_empty() {
                 if let Some(r) = system_drive_root() {
                     roots.push(r);
@@ -251,7 +255,7 @@ impl StateFileDriver {
 
 impl RestoreDriver for StateFileDriver {
     fn status(&self) -> anyhow::Result<DriverStatus> {
-        let roots = Self::volume_roots(&["system".into()]);
+        let roots = Self::volume_roots(&["system".into(), "all_fixed".into()]);
         let armed = roots.iter().filter_map(|r| Self::read_armed(r)).any(|a| a);
         let live = Self::ioctl_live_protecting();
         let frozen = live.unwrap_or(armed);
@@ -278,6 +282,21 @@ impl RestoreDriver for StateFileDriver {
         let roots = Self::volume_roots(volumes);
         if roots.is_empty() {
             anyhow::bail!("no volume roots resolved for {volumes:?}");
+        }
+        // Disarm fixed volumes outside the requested scope. Example:
+        // teaching (all_fixed) -> exam (system) must leave D/E thawed instead of
+        // keeping their previously armed state files.
+        let mut others = fixed_volume_roots();
+        if let Some(system) = system_drive_root() {
+            others.push(system);
+        }
+        others.sort();
+        others.dedup();
+        for root in &others {
+            if !roots.contains(root) && Self::state_path(root).exists() {
+                let _ = Self::disarm_volume(root)?;
+                info!(root = %root.display(), "disarmed volume outside requested scope");
+            }
         }
         for root in &roots {
             Self::arm_volume(root)?;
@@ -322,6 +341,86 @@ fn system_drive_root() -> Option<PathBuf> {
             }
         })
         .or_else(|| Some(PathBuf::from("C:\\")))
+}
+
+/// Every fixed (non-removable) NTFS volume root, e.g. C:\ D:\ E:\.
+///
+/// Teaching / boot-restore mode protects all of them; exam mode uses only
+/// `system`. Removable/network volumes are intentionally skipped.
+#[cfg(windows)]
+fn fixed_volume_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for letter in b'C'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if !root.exists() {
+            continue;
+        }
+        let wide: Vec<u16> = {
+            use std::os::windows::ffi::OsStrExt;
+            root.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+        if drive_type != DRIVE_FIXED {
+            continue;
+        }
+        if !volume_is_ntfs(wide.as_ptr()) {
+            continue;
+        }
+        roots.push(root);
+    }
+    roots
+}
+
+#[cfg(not(windows))]
+fn fixed_volume_roots() -> Vec<PathBuf> {
+    system_drive_root().into_iter().collect()
+}
+
+#[cfg(windows)]
+const DRIVE_FIXED: u32 = 3;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    fn GetVolumeInformationW(
+        lp_root_path_name: *const u16,
+        lp_volume_name_buffer: *mut u16,
+        n_volume_name_size: u32,
+        lp_volume_serial_number: *mut u32,
+        lp_maximum_component_length: *mut u32,
+        lp_file_system_flags: *mut u32,
+        lp_file_system_name_buffer: *mut u16,
+        n_file_system_name_size: u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn volume_is_ntfs(root: *const u16) -> bool {
+    let mut fs_name = [0u16; 16];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    let len = fs_name
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(fs_name.len());
+    String::from_utf16_lossy(&fs_name[..len]).eq_ignore_ascii_case("NTFS")
 }
 
 #[cfg(windows)]
@@ -507,5 +606,12 @@ mod tests {
     fn volume_roots_system() {
         let roots = StateFileDriver::volume_roots(&["system".into()]);
         assert!(!roots.is_empty());
+    }
+
+    #[test]
+    fn all_fixed_scope_includes_system_drive() {
+        let roots = StateFileDriver::volume_roots(&["all_fixed".into()]);
+        let system = system_drive_root().expect("system drive");
+        assert!(roots.contains(&system), "roots={roots:?} system={system:?}");
     }
 }

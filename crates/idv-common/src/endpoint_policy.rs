@@ -72,24 +72,35 @@ pub struct EndpointAppliedStatus {
     pub driver_status: String,
 }
 
-/// Map ModePolicy.restore (+ optional mode name) to freeze DesiredState semantics.
+/// Map ModePolicy.restore (+ optional mode name/scope) to freeze DesiredState semantics.
 ///
 /// - `reboot` → frozen (teaching / exam style)
 /// - `off` → thawed (office)
 /// - `manual` → thawed by default; admin triggers protect via separate path
-pub fn restore_from_mode_policy(restore: &str, _mode_name: &str) -> RestoreCapability {
+/// - `protect_scope = all_fixed` → protect every fixed NTFS volume (teaching)
+/// - `protect_scope = system` (default) → protect only the system volume (exam/manual)
+pub fn restore_from_mode_policy(
+    restore: &str,
+    _mode_name: &str,
+    protect_scope: &str,
+) -> RestoreCapability {
     let restore = restore.trim().to_ascii_lowercase();
+    let volumes = if protect_scope.trim().eq_ignore_ascii_case("all_fixed") {
+        vec!["all_fixed".into()]
+    } else {
+        vec!["system".into()]
+    };
     match restore.as_str() {
         "reboot" => RestoreCapability {
             enabled: true,
             apply: ApplyWhen::NextReboot,
-            protect_volumes: vec!["system".into()],
+            protect_volumes: volumes,
             frozen: true,
         },
         "off" | "manual" => RestoreCapability {
             enabled: true,
             apply: ApplyWhen::NextReboot,
-            protect_volumes: vec!["system".into()],
+            protect_volumes: volumes,
             frozen: false,
         },
         _ => RestoreCapability::disabled(),
@@ -141,10 +152,21 @@ mod tests {
 
     #[test]
     fn mode_mapping() {
-        assert!(restore_from_mode_policy("reboot", "teaching").frozen);
-        assert!(!restore_from_mode_policy("off", "office").frozen);
-        assert!(!restore_from_mode_policy("manual", "manual").frozen);
-        assert!(!restore_from_mode_policy("unknown", "x").enabled);
+        assert!(restore_from_mode_policy("reboot", "teaching", "all_fixed").frozen);
+        assert!(!restore_from_mode_policy("off", "office", "system").frozen);
+        assert!(!restore_from_mode_policy("manual", "manual", "system").frozen);
+        assert!(!restore_from_mode_policy("unknown", "x", "system").enabled);
+    }
+
+    #[test]
+    fn scope_maps_to_protect_volumes() {
+        let teaching = restore_from_mode_policy("reboot", "teaching", "all_fixed");
+        assert_eq!(teaching.protect_volumes, vec!["all_fixed".to_string()]);
+        let exam = restore_from_mode_policy("reboot", "exam", "system");
+        assert_eq!(exam.protect_volumes, vec!["system".to_string()]);
+        // Unknown/empty scope falls back to system for safety.
+        let custom = restore_from_mode_policy("reboot", "custom", "");
+        assert_eq!(custom.protect_volumes, vec!["system".to_string()]);
     }
 
     #[test]

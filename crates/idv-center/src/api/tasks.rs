@@ -311,6 +311,232 @@ pub async fn create_deploy(
     Ok((StatusCode::CREATED, Json(TaskView { task, targets })))
 }
 
+pub async fn create_agent_update(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<crate::models::CreateAgentUpdateTask>,
+) -> Result<(StatusCode, Json<TaskView>), (StatusCode, String)> {
+    user.require_write()?;
+    let version = body.version.trim().to_string();
+    if !super::agent_packages::valid_version(&version) {
+        return Err((StatusCode::BAD_REQUEST, "invalid agent version".into()));
+    }
+    let meta = super::agent_packages::package_meta(&state, &version)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("agent package {version} not uploaded"),
+            )
+        })?;
+    if body.macs.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "macs required".into()));
+    }
+    let mut macs = Vec::with_capacity(body.macs.len());
+    for raw in &body.macs {
+        macs.push(normalize_mac(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?);
+    }
+    macs.sort();
+    macs.dedup();
+
+    let now = Utc::now();
+    let task = MaintenanceTask {
+        id: new_id(),
+        kind: "agent_update".into(),
+        state: "running".into(),
+        image_id: Some(version.clone()),
+        edge_id: None,
+        disk_plan: "none".into(),
+        name: if body.name.trim().is_empty() {
+            format!("agent-update-{version}")
+        } else {
+            body.name
+        },
+        error_message: String::new(),
+        created_by: user.0.username.clone(),
+        created_at: now,
+        updated_at: now,
+    };
+    insert_task(&state, &task).await?;
+    let payload = serde_json::json!({
+        "version": version,
+        "download_url": format!("/api/v1/agent/packages/{version}/download"),
+        "sha256": meta.sha256,
+    })
+    .to_string();
+    let mut targets = Vec::new();
+    for mac in macs {
+        let target = MaintenanceTaskTarget {
+            id: new_id(),
+            task_id: task.id.clone(),
+            mac: mac.clone(),
+            state: "pending".into(),
+            progress: 0.0,
+            error_message: String::new(),
+            detail: format!("waiting for client {version}"),
+            p2p_bytes: 0,
+            edge_bytes: 0,
+            updated_at: now,
+        };
+        insert_target(&state, &target).await?;
+        let _ = super::agent_commands::enqueue(
+            &state,
+            &mac,
+            "update_agent",
+            &payload,
+            &user.0.username,
+        )
+        .await;
+        targets.push(target);
+    }
+    let _ = super::audit::record(
+        &state.pool,
+        &user.0.username,
+        "task.agent_update",
+        "maintenance_task",
+        &task.id,
+        &format!("version={version} targets={}", targets.len()),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(TaskView { task, targets })))
+}
+
+/// Enqueue one update_agent command for the newest active agent_update target.
+/// Used right after the client reports `reboot_for_update`.
+pub async fn requeue_agent_update(state: &AppState, mac: &str) -> anyhow::Result<()> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT COALESCE(t.image_id, '') FROM maintenance_tasks t \
+         JOIN maintenance_task_targets mt ON mt.task_id = t.id \
+         WHERE t.kind = 'agent_update' AND mt.mac = ? \
+           AND mt.state IN ('pending', 'running') \
+         ORDER BY t.created_at DESC LIMIT 1",
+    )
+    .bind(mac)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((version,)) = row else {
+        return Ok(());
+    };
+    let version = version.trim().to_string();
+    if version.is_empty() {
+        return Ok(());
+    }
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_commands WHERE mac = ? AND kind = 'update_agent' \
+         AND state IN ('pending', 'delivered')",
+    )
+    .bind(mac)
+    .fetch_one(&state.pool)
+    .await?;
+    if pending > 0 {
+        return Ok(());
+    }
+    let sha = super::agent_packages::package_meta(state, &version)
+        .await
+        .map(|p| p.sha256)
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "version": version,
+        "download_url": format!("/api/v1/agent/packages/{version}/download"),
+        "sha256": sha,
+    })
+    .to_string();
+    let _ = super::agent_commands::enqueue(state, mac, "update_agent", &payload, "system").await;
+    Ok(())
+}
+
+/// Called from Agent heartbeat: advances `agent_update` tasks and retries the
+/// update command after the client rebooted to disarm restore (old version).
+pub async fn on_agent_heartbeat(
+    state: &AppState,
+    mac: &str,
+    agent_version: &str,
+) -> anyhow::Result<()> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT t.id, COALESCE(t.image_id, ''), mt.id \
+         FROM maintenance_tasks t \
+         JOIN maintenance_task_targets mt ON mt.task_id = t.id \
+         WHERE t.kind = 'agent_update' AND mt.mac = ? \
+           AND mt.state IN ('pending', 'running') \
+         ORDER BY t.created_at DESC",
+    )
+    .bind(mac)
+    .fetch_all(&state.pool)
+    .await?;
+
+    for (task_id, want_version, target_id) in rows {
+        let version = want_version.trim();
+        if version.is_empty() {
+            continue;
+        }
+        if version == agent_version.trim() {
+            sqlx::query(
+                "UPDATE maintenance_task_targets SET state = 'done', progress = 1.0, \
+                 detail = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(format!("updated to {version}"))
+            .bind(Utc::now())
+            .bind(&target_id)
+            .execute(&state.pool)
+            .await?;
+            refresh_task_aggregate(state, &task_id).await?;
+            // Let the new agent re-apply its restore policy (it will arm + reboot).
+            let _ = super::agent_commands::enqueue(
+                state,
+                mac,
+                "apply_policy",
+                "{\"force\":true}",
+                "system",
+            )
+            .await;
+            continue;
+        }
+
+        sqlx::query(
+            "UPDATE maintenance_task_targets SET state = 'running', detail = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(format!("current={agent_version} target={version}"))
+        .bind(Utc::now())
+        .bind(&target_id)
+        .execute(&state.pool)
+        .await?;
+
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_commands WHERE mac = ? AND kind = 'update_agent' \
+             AND state IN ('pending', 'delivered')",
+        )
+        .bind(mac)
+        .fetch_one(&state.pool)
+        .await?;
+        let last_attempt: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT created_at FROM agent_commands WHERE mac = ? AND kind = 'update_agent' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(mac)
+        .fetch_optional(&state.pool)
+        .await?;
+        let recently_attempted = last_attempt
+            .map(|t| Utc::now() - t < Duration::seconds(15))
+            .unwrap_or(false);
+        if pending == 0 && !recently_attempted {
+            let sha = super::agent_packages::package_meta(state, version)
+                .await
+                .map(|p| p.sha256)
+                .unwrap_or_default();
+            let payload = serde_json::json!({
+                "version": version,
+                "download_url": format!("/api/v1/agent/packages/{version}/download"),
+                "sha256": sha,
+            })
+            .to_string();
+            let _ = super::agent_commands::enqueue(state, mac, "update_agent", &payload, "system")
+                .await;
+        }
+    }
+    Ok(())
+}
+
 pub async fn preview_deploy(
     State(state): State<AppState>,
     _user: AuthUser,

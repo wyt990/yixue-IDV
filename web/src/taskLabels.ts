@@ -3,6 +3,7 @@
 const KIND: Record<string, string> = {
   capture: "采集",
   deploy: "部署",
+  agent_update: "Agent 更新",
 };
 
 const STATE: Record<string, string> = {

@@ -1,6 +1,7 @@
 mod admins;
 mod agent;
 mod agent_commands;
+mod agent_packages;
 mod assist;
 pub(crate) mod audit;
 mod auth;
@@ -21,6 +22,7 @@ mod software;
 pub mod tasks;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post, put};
 
 use crate::state::AppState;
@@ -171,6 +173,19 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/tasks/deploy/preview", post(tasks::preview_deploy))
         .route("/api/v1/tasks/{id}", get(tasks::get))
         .route("/api/v1/tasks/{id}/cancel", post(tasks::cancel))
+        .route(
+            "/api/v1/tasks/agent-update",
+            post(tasks::create_agent_update),
+        )
+        .route("/api/v1/agent/packages", get(agent_packages::list))
+        .route(
+            "/api/v1/agent/packages",
+            put(agent_packages::upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/agent/packages/{version}/download",
+            get(agent_packages::download),
+        )
         .route("/api/v1/edge/register", post(edge_agent::register))
         .route("/api/v1/edge/heartbeat", post(edge_agent::heartbeat))
         .route("/api/v1/edge/commands/next", get(edge_agent::next_command))

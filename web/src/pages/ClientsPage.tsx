@@ -520,6 +520,7 @@ export function ClientsPage() {
               <th>MAC</th>
               <th>在线</th>
               <th>还原状态</th>
+              <th>Agent 版本</th>
               <th>名称</th>
               <th>机房</th>
               <th>分配 IP</th>
@@ -532,7 +533,7 @@ export function ClientsPage() {
           <tbody>
             {clients.length === 0 ? (
               <tr>
-                <td colSpan={11} className="muted">
+                <td colSpan={12} className="muted">
                   暂无终端。可手动添加，或配置默认机房后由 Agent 自动上报入库。
                 </td>
               </tr>
@@ -558,6 +559,13 @@ export function ClientsPage() {
                     )}
                   </td>
                   <td className="muted">{restoreText(c)}</td>
+                  <td className="mono">
+                    {c.agent_version ? (
+                      c.agent_version
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
                   <td>
                     {editingId === c.id ? (
                       <input

@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::time::Duration;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
 use chrono::Utc;
 use rand_core::OsRng;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{SqlitePool, sqlite::SqliteRow};
 use tracing::info;
 
@@ -19,11 +20,27 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     }
 
     let options: SqliteConnectOptions = database_url.parse()?;
-    let options = options.create_if_missing(true).foreign_keys(true);
+    // WAL + NORMAL: concurrent readers no longer block on the writer, and each
+    // heartbeat commit no longer fsyncs the journal (the old DELETE+FULL setup
+    // produced multi-second slow-statement warnings on slow disks).
+    let options = options
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(10))
+        .pragma("cache_size", "-20000")
+        .pragma("temp_store", "memory");
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(8)
         .connect_with(options)
         .await?;
+
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+    info!(%journal_mode, "sqlite pool ready");
 
     sqlx::migrate!("./migrations").run(&pool).await?;
     seed_default_admin(&pool).await?;
@@ -46,7 +63,8 @@ async fn seed_default_modes(pool: &SqlitePool) -> anyhow::Result<()> {
             "restore",
             "keep",
             "wipe",
-            "教学还原：开机还原系统区，保留数据区",
+            "all_fixed",
+            "教学还原：开机还原所有固定盘（C/D/E…），含数据盘",
         ),
         (
             "office",
@@ -54,6 +72,7 @@ async fn seed_default_modes(pool: &SqlitePool) -> anyhow::Result<()> {
             "keep",
             "keep",
             "keep",
+            "system",
             "办公模式：不自动还原",
         ),
         (
@@ -62,7 +81,8 @@ async fn seed_default_modes(pool: &SqlitePool) -> anyhow::Result<()> {
             "restore",
             "keep",
             "wipe",
-            "考试模式：开机还原系统区",
+            "system",
+            "考试模式：仅还原系统盘，数据盘保留",
         ),
         (
             "manual",
@@ -70,13 +90,14 @@ async fn seed_default_modes(pool: &SqlitePool) -> anyhow::Result<()> {
             "restore",
             "keep",
             "wipe",
-            "仅手动触发还原",
+            "system",
+            "仅手动触发还原（默认只保护系统盘）",
         ),
     ];
-    for (name, restore, system, persistent, volatile, notes) in seeds {
+    for (name, restore, system, persistent, volatile, protect_scope, notes) in seeds {
         let usb = if name == "exam" { 1i64 } else { 0i64 };
         sqlx::query(
-            "INSERT INTO mode_policies (id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
+            "INSERT INTO mode_policies (id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, protect_scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
         )
         .bind(new_id())
         .bind(name)
@@ -86,6 +107,7 @@ async fn seed_default_modes(pool: &SqlitePool) -> anyhow::Result<()> {
         .bind(volatile)
         .bind(notes)
         .bind(usb)
+        .bind(protect_scope)
         .bind(now)
         .bind(now)
         .execute(pool)

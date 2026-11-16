@@ -103,6 +103,9 @@ pub async fn next(
     let wait = q.wait.min(30);
     let deadline = Instant::now() + Duration::from_secs(wait);
     loop {
+        // Register the wake future *before* checking the table so a command
+        // enqueued between the check and the await cannot be missed.
+        let notified = state.agent_notify.notified();
         match claim(&state, &mac).await {
             Ok(Some(cmd)) => return Ok(Json(Some(cmd))),
             Ok(None) => {}
@@ -112,8 +115,8 @@ pub async fn next(
         if now >= deadline {
             return Ok(Json(None));
         }
-        let step = (deadline - now).min(Duration::from_secs(1));
-        let _ = tokio::time::timeout(step, state.agent_notify.notified()).await;
+        let remaining = deadline - now;
+        let _ = tokio::time::timeout(remaining, notified).await;
     }
 }
 
@@ -124,6 +127,11 @@ pub async fn report(
     Json(body): Json<ReportBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let state_name = if body.ok { "done" } else { "failed" };
+    let mac: Option<String> = sqlx::query_scalar("SELECT mac FROM agent_commands WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?;
     sqlx::query(
         "UPDATE agent_commands SET state = ?, finished_at = ?, error_message = ? WHERE id = ?",
     )
@@ -134,6 +142,14 @@ pub async fn report(
     .execute(&state.pool)
     .await
     .map_err(internal)?;
+    // The client is about to reboot to disarm restore; pre-queue the retry so
+    // the agent can consume it before its first post-boot heartbeat re-arms.
+    if !body.ok
+        && body.detail.contains("reboot_for_update")
+        && let Some(mac) = mac
+    {
+        let _ = super::tasks::requeue_agent_update(&state, &mac).await;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -145,6 +161,7 @@ const ALLOWED_KINDS: &[&str] = &[
     "open_url",
     "run_program",
     "assist_ack",
+    "update_agent",
 ];
 
 /// Admin/API: queue a command for a MAC (used by UI/automation).

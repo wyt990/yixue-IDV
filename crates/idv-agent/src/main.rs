@@ -5,6 +5,18 @@ mod restore_driver;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Set while a new exe is being downloaded/replaced. The heartbeat loop keeps
+/// reporting but must not re-arm restore / reboot in the middle of an update.
+static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Set after `shutdown.exe /r|/s` succeeds; stop processing further commands.
+static REBOOT_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// Kept in the binary so Center can auto-detect the package version on upload.
+const BUILD_VERSION_MARKER: &str = concat!(
+    "IDV_AGENT_BUILD_VERSION=",
+    env!("CARGO_PKG_VERSION")
+);
+
 use clap::{Parser, Subcommand};
 use idv_common::endpoint_policy::DesiredEndpointState;
 use idv_common::image_format::{ImageHeader, default_partitions, pack_image, unpack_image};
@@ -277,6 +289,11 @@ struct HeartbeatBody<'a> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Runtime reference keeps the build-version marker in the binary so Center
+    // can auto-detect the package version on upload.
+    if std::env::var_os("IDV_BUILD_INFO").is_some() {
+        println!("{BUILD_VERSION_MARKER}");
+    }
     match cli.command {
         Commands::Status { config } => {
             let cfg = load_cfg(&config).await?;
@@ -652,6 +669,10 @@ async fn sync_and_maybe_apply(
     let policy = heartbeat(cfg, trigger, &status).await?;
     let mut lines = Vec::new();
     lines.push(format!("msg={}", policy.message));
+    if UPDATE_IN_PROGRESS.load(Ordering::SeqCst) {
+        lines.push("update_in_progress=skip_rearm".into());
+        return Ok(lines.join(" · "));
+    }
     if let Some(desired) = policy.desired_state.clone() {
         if store.queue_if_newer(desired.clone()) {
             store.save(state_dir).map_err(|e| Error::Other(e))?;
@@ -753,8 +774,22 @@ async fn sync_and_maybe_apply(
 
     // Reboot from Center: apply pending freeze first, then reboot.
     let should_apply = apply || power_kind == "reboot";
+    let mut pending_reboot = false;
     if should_apply {
-        lines.push(apply_pending_store(&mut store, state_dir)?);
+        let (msg, reboot) = apply_pending_store(&mut store, state_dir)?;
+        lines.push(msg);
+        pending_reboot = reboot;
+    }
+
+    // A pending restore-scope change (e.g. teaching now protects D/E too) only
+    // takes effect at next boot. Reboot automatically unless a power command is
+    // already about to reboot/shutdown the machine.
+    if pending_reboot && power_kind.is_empty() {
+        write_identity_report("apply_pending_reboot", "");
+        lines.push("pending_apply_reboot=1".into());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        issue_windows_power("reboot")?;
+        return Ok(lines.join(" · "));
     }
 
     if !power_id.is_empty() && (power_kind == "reboot" || power_kind == "shutdown") {
@@ -1067,7 +1102,7 @@ fn rename_windows_computer(name: &str) -> Result<()> {
 fn apply_pending_store(
     store: &mut LocalPolicyStore,
     state_dir: &std::path::Path,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     if let Some(pending) = store.pending.clone() {
         if pending.restore.enabled {
             let drv = default_driver();
@@ -1079,17 +1114,279 @@ fn apply_pending_store(
             .map_err(|e| Error::Other(e))?;
             store.clear_pending_applied(pending.revision, st.detail.clone());
             store.save(state_dir).map_err(|e| Error::Other(e))?;
-            Ok(format!(
-                "applied_revision={} frozen={} driver={}",
-                pending.revision, st.frozen, st.detail
+            Ok((
+                format!(
+                    "applied_revision={} frozen={} driver={}",
+                    pending.revision, st.frozen, st.detail
+                ),
+                true,
             ))
         } else {
             store.clear_pending_applied(pending.revision, "restore_disabled".into());
             store.save(state_dir).map_err(|e| Error::Other(e))?;
-            Ok("applied restore_disabled".into())
+            Ok(("applied restore_disabled".into(), true))
         }
     } else {
-        Ok("apply_skip reason=no_pending".into())
+        Ok(("apply_skip reason=no_pending".into(), false))
+    }
+}
+
+const UPDATER_SCRIPT: &str = r#"
+param(
+  [string]$NewExe,
+  [string]$TargetExe,
+  [string]$Service,
+  [string]$Task,
+  [string]$Config,
+  [string]$Log
+)
+function Write-Log([string]$m) {
+  Add-Content -LiteralPath $Log -Value ("{0} {1}" -f (Get-Date -Format o), $m)
+}
+Start-Sleep -Seconds 2
+$svc = Get-Service -Name $Service -ErrorAction SilentlyContinue
+if ($svc) { Write-Log "stopping service"; Stop-Service -Name $Service -Force -ErrorAction SilentlyContinue }
+$tsk = Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+if ($tsk) { Write-Log "stopping task"; Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue }
+for ($i = 0; $i -lt 40; $i++) {
+  if (-not (Get-Process -Name "idv-agent" -ErrorAction SilentlyContinue)) { break }
+  Start-Sleep -Milliseconds 500
+}
+$copied = $false
+$backup = $TargetExe + ".bak"
+if (Test-Path -LiteralPath $TargetExe) {
+  Copy-Item -LiteralPath $TargetExe -Destination $backup -Force
+  Write-Log "backup saved"
+}
+for ($i = 0; $i -lt 20; $i++) {
+  try {
+    Copy-Item -LiteralPath $NewExe -Destination $TargetExe -Force -ErrorAction Stop
+    $copied = $true
+    break
+  } catch {
+    Write-Log ("copy retry: " + $_.Exception.Message)
+    Start-Sleep -Milliseconds 500
+  }
+}
+if (-not $copied) { Write-Log "copy failed"; exit 1 }
+Write-Log "copied"
+if ($svc) {
+  for ($i = 0; $i -lt 10; $i++) {
+    try { Start-Service -Name $Service -ErrorAction Stop; break } catch { Start-Sleep -Seconds 1 }
+  }
+  Write-Log "service start requested"
+} elseif ($tsk) {
+  Start-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+  Write-Log "task start requested"
+} else {
+  Start-Process -FilePath $TargetExe -ArgumentList @("daemon", "--config", $Config) -WindowStyle Hidden
+  Write-Log "process start requested"
+}
+Start-Sleep -Seconds 3
+$running = $false
+if ($svc) { $running = ((Get-Service -Name $Service -ErrorAction SilentlyContinue).Status -eq "Running") }
+elseif ($tsk) { $running = ((Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue).State -eq "Running") }
+else { $running = [bool](Get-Process -Name "idv-agent" -ErrorAction SilentlyContinue) }
+Write-Log ("new agent running=" + $running)
+if (-not $running -and (Test-Path -LiteralPath $backup)) {
+  Copy-Item -LiteralPath $backup -Destination $TargetExe -Force -ErrorAction SilentlyContinue
+  if ($svc) { Start-Service -Name $Service -ErrorAction SilentlyContinue }
+  elseif ($tsk) { Start-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue }
+  Write-Log "rollback to backup"
+}
+Remove-Item -LiteralPath $NewExe -Force -ErrorAction SilentlyContinue
+Write-Log "done"
+"#;
+
+fn default_client_install_dir() -> PathBuf {
+    std::env::var_os("ProgramFiles")
+        .map(|p| PathBuf::from(p).join("YixueIDV"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\YixueIDV"))
+}
+
+struct UpdateFlagGuard {
+    keep: bool,
+}
+
+impl Drop for UpdateFlagGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Download + schedule a detached PowerShell updater.
+///
+/// While restore is active, writing a new exe would be redirected/lost, so the
+/// first phase disarms restore and reboots. The Center retries the update after
+/// the client heartbeats again (now unfrozen).
+async fn perform_agent_update(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    payload: &str,
+) -> Result<(bool, String)> {
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| Error::Other(anyhow::anyhow!("invalid update payload: {e}")))?;
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let download_url = value
+        .get("download_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let want_sha = value
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if version.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "update payload missing version"
+        )));
+    }
+    let current = env!("CARGO_PKG_VERSION");
+    if version == current {
+        return Ok((true, format!("already_version={version}")));
+    }
+
+    let driver = default_driver();
+    let st = driver
+        .status()
+        .map_err(|e| Error::Other(anyhow::anyhow!("driver status: {e}")))?;
+    if st.frozen || st.armed {
+        driver
+            .protect_off()
+            .map_err(|e| Error::Other(anyhow::anyhow!("disarm before update: {e}")))?;
+        write_identity_report("update_disarm_reboot", "");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        issue_windows_power("reboot")?;
+        return Ok((
+            false,
+            format!("reboot_for_update current={current} target={version}"),
+        ));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (cfg, state_dir, download_url, want_sha);
+        Ok((false, "self-update is only supported on Windows".into()))
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        // Keep the heartbeat loop from re-arming restore while we replace the exe.
+        UPDATE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let mut update_guard = UpdateFlagGuard { keep: false };
+
+        if download_url.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "update payload missing download_url"
+            )));
+        }
+        let url = if download_url.starts_with("http://") || download_url.starts_with("https://") {
+            download_url
+        } else {
+            format!(
+                "{}{}",
+                cfg.center_url.trim_end_matches('/'),
+                if download_url.starts_with('/') {
+                    download_url
+                } else {
+                    format!("/{download_url}")
+                }
+            )
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("download {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "download {url}: HTTP {}",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        if bytes.len() < 64 * 1024 {
+            return Err(Error::Other(anyhow::anyhow!(
+                "downloaded exe too small: {} bytes",
+                bytes.len()
+            )));
+        }
+        if !want_sha.is_empty() {
+            use sha2::{Digest, Sha256};
+            let got = hex::encode(Sha256::digest(&bytes));
+            if got != want_sha {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "sha256 mismatch: got {got} want {want_sha}"
+                )));
+            }
+        }
+
+        let update_dir = state_dir.join("update");
+        tokio::fs::create_dir_all(&update_dir)
+            .await
+            .map_err(Error::Io)?;
+        let new_exe = update_dir.join(format!("idv-agent-{version}.exe"));
+        tokio::fs::write(&new_exe, &bytes)
+            .await
+            .map_err(Error::Io)?;
+        let script = update_dir.join("apply-update.ps1");
+        tokio::fs::write(&script, UPDATER_SCRIPT)
+            .await
+            .map_err(Error::Io)?;
+        let current_exe = std::env::current_exe().map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        let log = update_dir.join("update.log");
+        let config = default_client_install_dir().join("agent.toml");
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script)
+            .arg("-NewExe")
+            .arg(&new_exe)
+            .arg("-TargetExe")
+            .arg(&current_exe)
+            .arg("-Service")
+            .arg("idv-agent")
+            .arg("-Task")
+            .arg("YixueIdvAgentDaemon")
+            .arg("-Config")
+            .arg(&config)
+            .arg("-Log")
+            .arg(&log);
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        cmd.spawn()
+            .map_err(|e| Error::Other(anyhow::anyhow!("spawn updater: {e}")))?;
+        update_guard.keep = true;
+        Ok((
+            true,
+            format!(
+                "update_scheduled version={version} bytes={} log={}",
+                bytes.len(),
+                log.display()
+            ),
+        ))
     }
 }
 
@@ -1106,6 +1403,7 @@ fn issue_windows_power(kind: &str) -> Result<()> {
                 "shutdown.exe failed: {status}"
             )));
         }
+        REBOOT_SCHEDULED.store(true, Ordering::SeqCst);
         Ok(())
     }
     #[cfg(not(windows))]
@@ -1416,14 +1714,22 @@ struct RunProgramPayload {
 
 /// Long-poll Center for one command (returns None on the wait timeout).
 async fn poll_command(cfg: &AgentConfig, mac: &str) -> Result<Option<AgentCommand>> {
+    poll_command_wait(cfg, mac, 20).await
+}
+
+async fn poll_command_wait(
+    cfg: &AgentConfig,
+    mac: &str,
+    wait_secs: u64,
+) -> Result<Option<AgentCommand>> {
     let url = format!(
-        "{}/api/v1/agent/commands/next?mac={}&wait=20",
+        "{}/api/v1/agent/commands/next?mac={}&wait={wait_secs}",
         cfg.center_url.trim_end_matches('/'),
         urlencoding_lite(mac)
     );
     let resp = http_client()
         .get(&url)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(wait_secs + 10))
         .send()
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
@@ -1472,6 +1778,16 @@ async fn execute_agent_command(
         let _guard = sync_lock.lock().await;
         let summary = sync_and_maybe_apply(cfg, state_dir, true, "command").await?;
         report_command(cfg, &cmd.id, true, &summary).await?;
+        return Ok(());
+    }
+
+    if kind == "update_agent" {
+        match perform_agent_update(cfg, state_dir, &cmd.payload).await {
+            Ok((ok, detail)) => report_command(cfg, &cmd.id, ok, &detail).await?,
+            Err(err) => {
+                report_command(cfg, &cmd.id, false, &format!("update_failed: {err}")).await?
+            }
+        }
         return Ok(());
     }
 
@@ -1546,13 +1862,23 @@ async fn run_daemon(
     let cfg = std::sync::Arc::new(cfg);
     let sync_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
+    // Before the first heartbeat sync (which may re-arm restore and reboot),
+    // give a pending update command a chance to run. This matters right after
+    // the "disarm for update" reboot: Center pre-queues update_agent so it is
+    // consumed here while the volumes are still thawed.
+    if let Ok(mac) = effective_mac(&cfg)
+        && let Ok(Some(cmd)) = poll_command_wait(&cfg, &mac, 3).await
+    {
+        let _ = execute_agent_command(&cfg, &state_dir, &sync_lock, &cmd, &mac).await;
+    }
+
     let hb_cfg = cfg.clone();
     let hb_dir = state_dir.clone();
     let hb_lock = sync_lock.clone();
     let hb_stop = stop.clone();
     let heartbeat_task = tokio::spawn(async move {
         loop {
-            if hb_stop.load(Ordering::SeqCst) {
+            if hb_stop.load(Ordering::SeqCst) || REBOOT_SCHEDULED.load(Ordering::SeqCst) {
                 break;
             }
             {
@@ -1565,7 +1891,7 @@ async fn run_daemon(
         }
     });
 
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && !REBOOT_SCHEDULED.load(Ordering::SeqCst) {
         let mac = match effective_mac(&cfg) {
             Ok(mac) => mac,
             Err(err) => {

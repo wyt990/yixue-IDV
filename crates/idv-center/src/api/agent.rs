@@ -14,7 +14,7 @@ use crate::models::{
 };
 use crate::state::AppState;
 
-const MODE_COLS: &str = "id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, created_at, updated_at";
+const MODE_COLS: &str = "id, name, restore, system_action, persistent_action, volatile_action, notes, schedule_start, schedule_end, usb_restricted, protect_scope, created_at, updated_at";
 
 pub async fn heartbeat(
     State(state): State<AppState>,
@@ -214,7 +214,7 @@ pub async fn heartbeat(
     }
 
     let desired_state = mode.as_ref().map(|m| {
-        let restore = restore_from_mode_policy(&m.restore, &m.name);
+        let restore = restore_from_mode_policy(&m.restore, &m.name, &m.protect_scope);
         let revision = binding_updated_at
             .as_deref()
             .map(revision_from_timestamp)
@@ -313,6 +313,10 @@ pub async fn heartbeat(
             mode.as_ref().unwrap().name
         )
     };
+
+    if let Err(err) = super::tasks::on_agent_heartbeat(&state, &mac, &body.agent_version).await {
+        tracing::warn!(%mac, error = %err, "agent update task bookkeeping failed");
+    }
 
     Ok(Json(AgentPolicyResponse {
         mac,
