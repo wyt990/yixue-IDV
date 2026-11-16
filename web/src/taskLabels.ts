@@ -4,6 +4,8 @@ const KIND: Record<string, string> = {
   capture: "采集",
   deploy: "部署",
   agent_update: "Agent 更新",
+  file_collect: "文件收集",
+  file_distribute: "文件分发",
 };
 
 const STATE: Record<string, string> = {

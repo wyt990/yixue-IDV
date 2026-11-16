@@ -47,7 +47,9 @@ pub fn extract_embedded_version(body: &[u8]) -> Option<String> {
     if end == start {
         return None;
     }
-    let version = String::from_utf8_lossy(&body[start..end]).trim().to_string();
+    let version = String::from_utf8_lossy(&body[start..end])
+        .trim()
+        .to_string();
     if valid_version(&version) {
         Some(version)
     } else {

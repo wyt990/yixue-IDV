@@ -92,6 +92,20 @@ pub async fn create(
         &format!("mac={} kind={}", row.mac, row.kind),
     )
     .await;
+    let payload = serde_json::json!({
+        "session_id": row.id,
+        "kind": row.kind,
+        "frame_ms": 500,
+    })
+    .to_string();
+    let _ = super::agent_commands::enqueue(
+        &state,
+        &row.mac,
+        "assist_start",
+        &payload,
+        &user.0.username,
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(row)))
 }
 

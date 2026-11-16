@@ -12,10 +12,7 @@ static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static REBOOT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 /// Kept in the binary so Center can auto-detect the package version on upload.
-const BUILD_VERSION_MARKER: &str = concat!(
-    "IDV_AGENT_BUILD_VERSION=",
-    env!("CARGO_PKG_VERSION")
-);
+const BUILD_VERSION_MARKER: &str = concat!("IDV_AGENT_BUILD_VERSION=", env!("CARGO_PKG_VERSION"));
 
 use clap::{Parser, Subcommand};
 use idv_common::endpoint_policy::DesiredEndpointState;
@@ -173,6 +170,20 @@ enum Commands {
     Service {
         #[arg(short, long, default_value = "deploy/config/agent.toml")]
         config: PathBuf,
+    },
+    /// Hidden: interactive remote-assist helper launched in the logged-in session.
+    #[command(hide = true)]
+    AssistHelper {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        center_url: String,
+        #[arg(long)]
+        mac: String,
+        #[arg(long, default_value = "view")]
+        kind: String,
+        #[arg(long, default_value_t = 500)]
+        frame_ms: u64,
     },
 }
 
@@ -654,6 +665,21 @@ async fn main() -> anyhow::Result<()> {
                 run_daemon(cfg, cfg.heartbeat_secs.max(2), stop).await?;
             }
         }
+        Commands::AssistHelper {
+            session_id,
+            center_url,
+            mac,
+            kind,
+            frame_ms,
+        } => {
+            #[cfg(windows)]
+            run_assist_helper(&session_id, &center_url, &mac, &kind, frame_ms).await?;
+            #[cfg(not(windows))]
+            {
+                let _ = (session_id, center_url, mac, kind, frame_ms);
+                eprintln!("assist-helper is only supported on Windows");
+            }
+        }
     }
     Ok(())
 }
@@ -1133,13 +1159,25 @@ fn apply_pending_store(
 
 const UPDATER_SCRIPT: &str = r#"
 param(
+  [string]$Job = "",
   [string]$NewExe,
   [string]$TargetExe,
   [string]$Service,
   [string]$Task,
   [string]$Config,
-  [string]$Log
+  [string]$Log,
+  [string]$UpdaterTask = ""
 )
+if ($Job) {
+  $j = Get-Content -LiteralPath $Job -Raw | ConvertFrom-Json
+  $NewExe = $j.new_exe
+  $TargetExe = $j.target_exe
+  $Service = $j.service
+  $Task = $j.task
+  $Config = $j.config
+  $Log = $j.log
+  $UpdaterTask = $j.updater_task
+}
 function Write-Log([string]$m) {
   Add-Content -LiteralPath $Log -Value ("{0} {1}" -f (Get-Date -Format o), $m)
 }
@@ -1195,6 +1233,9 @@ if (-not $running -and (Test-Path -LiteralPath $backup)) {
   Write-Log "rollback to backup"
 }
 Remove-Item -LiteralPath $NewExe -Force -ErrorAction SilentlyContinue
+if ($UpdaterTask) {
+  cmd /c "schtasks /Delete /TN `"$UpdaterTask`" /F >nul 2>&1" | Out-Null
+}
 Write-Log "done"
 "#;
 
@@ -1357,33 +1398,85 @@ async fn perform_agent_update(
         let current_exe = std::env::current_exe().map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
         let log = update_dir.join("update.log");
         let config = default_client_install_dir().join("agent.toml");
-        let mut cmd = std::process::Command::new("powershell.exe");
-        cmd.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(&script)
-            .arg("-NewExe")
-            .arg(&new_exe)
-            .arg("-TargetExe")
-            .arg(&current_exe)
-            .arg("-Service")
-            .arg("idv-agent")
-            .arg("-Task")
-            .arg("YixueIdvAgentDaemon")
-            .arg("-Config")
-            .arg(&config)
-            .arg("-Log")
-            .arg(&log);
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-        cmd.spawn()
-            .map_err(|e| Error::Other(anyhow::anyhow!("spawn updater: {e}")))?;
+        let updater_task = "YixueIdvAgentUpdate";
+        let job = update_dir.join("update-job.json");
+        let job_json = serde_json::json!({
+            "new_exe": new_exe.to_string_lossy(),
+            "target_exe": current_exe.to_string_lossy(),
+            "service": "idv-agent",
+            "task": "YixueIdvAgentDaemon",
+            "config": config.to_string_lossy(),
+            "log": log.to_string_lossy(),
+            "updater_task": updater_task,
+        });
+        tokio::fs::write(&job, job_json.to_string())
+            .await
+            .map_err(Error::Io)?;
+
+        // Launch through Task Scheduler (SYSTEM). A detached PowerShell child of
+        // the service can be killed when the service stops (job object), which
+        // leaves the old exe in place and the task forever "running".
+        let _ = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", updater_task, "/F"])
+            .output();
+        let tr = format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -Job \"{}\"",
+            script.display(),
+            job.display()
+        );
+        let created = std::process::Command::new("schtasks")
+            .args([
+                "/Create",
+                "/TN",
+                updater_task,
+                "/SC",
+                "ONCE",
+                "/ST",
+                "00:00",
+                "/RU",
+                "SYSTEM",
+                "/RL",
+                "HIGHEST",
+                "/TR",
+                &tr,
+                "/F",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let mut scheduled = false;
+        if created {
+            scheduled = std::process::Command::new("schtasks")
+                .args(["/Run", "/TN", updater_task])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        }
+        if !scheduled {
+            // Fallback for environments where Task Scheduler is unavailable.
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(&script)
+                .arg("-Job")
+                .arg(&job);
+            cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+            cmd.spawn()
+                .map_err(|e| Error::Other(anyhow::anyhow!("spawn updater: {e}")))?;
+        }
         update_guard.keep = true;
         Ok((
             true,
             format!(
-                "update_scheduled version={version} bytes={} log={}",
+                "update_scheduled version={version} bytes={} trigger={} log={}",
                 bytes.len(),
+                if scheduled {
+                    "task_scheduler"
+                } else {
+                    "detached"
+                },
                 log.display()
             ),
         ))
@@ -1791,6 +1884,86 @@ async fn execute_agent_command(
         return Ok(());
     }
 
+    if kind == "assist_start" {
+        let value: serde_json::Value = serde_json::from_str(&cmd.payload).unwrap_or_default();
+        let session_id = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mode = value
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("view")
+            .to_string();
+        let frame_ms = value
+            .get("frame_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500);
+        if session_id.is_empty() {
+            report_command(cfg, &cmd.id, false, "assist_start missing session_id").await?;
+            return Ok(());
+        }
+        stop_assist_helper();
+        #[cfg(windows)]
+        {
+            match launch_assist_helper(&session_id, &cfg.center_url, mac, &mode, frame_ms) {
+                Ok(pid) => {
+                    if let Ok(mut guard) = ASSIST_HELPER_SESSION.lock() {
+                        *guard = Some((session_id.clone(), pid));
+                    }
+                    report_command(cfg, &cmd.id, true, &format!("helper_pid={pid}")).await?;
+                }
+                Err(err) => {
+                    assist_helper_ack(
+                        &cfg.center_url,
+                        &session_id,
+                        "denied",
+                        &format!("cannot start helper: {err}"),
+                    )
+                    .await;
+                    report_command(cfg, &cmd.id, false, &format!("helper_start_failed: {err}"))
+                        .await?;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            report_command(cfg, &cmd.id, false, "assist helper requires Windows").await?;
+        }
+        return Ok(());
+    }
+
+    if kind == "assist_stop" {
+        stop_assist_helper();
+        report_command(cfg, &cmd.id, true, "assist_stopped").await?;
+        return Ok(());
+    }
+
+    if kind == "fs_collect" {
+        let value: serde_json::Value = serde_json::from_str(&cmd.payload).unwrap_or_default();
+        match handle_fs_collect(cfg, state_dir, mac, &value).await {
+            Ok(detail) => report_command(cfg, &cmd.id, true, &detail).await?,
+            Err(err) => {
+                fs_task_result(cfg, &value, mac, false, &err.to_string()).await;
+                report_command(cfg, &cmd.id, false, &format!("fs_collect_failed: {err}")).await?
+            }
+        }
+        return Ok(());
+    }
+
+    if kind == "fs_distribute" {
+        let value: serde_json::Value = serde_json::from_str(&cmd.payload).unwrap_or_default();
+        match handle_fs_distribute(cfg, state_dir, mac, &value).await {
+            Ok(detail) => report_command(cfg, &cmd.id, true, &detail).await?,
+            Err(err) => {
+                fs_task_result(cfg, &value, mac, false, &err.to_string()).await;
+                report_command(cfg, &cmd.id, false, &format!("fs_distribute_failed: {err}")).await?
+            }
+        }
+        return Ok(());
+    }
+
     if matches!(kind, "reboot" | "shutdown") {
         let power_id = serde_json::from_str::<serde_json::Value>(&cmd.payload)
             .ok()
@@ -1852,7 +2025,928 @@ async fn execute_agent_command(
     Ok(())
 }
 
-/// Resident loop shared by console daemon and Windows service.
+#[cfg(windows)]
+fn capture_screen_jpeg(max_width: u32, quality: u8) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BITMAPINFO, BI_RGB, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "invalid screen size {width}x{height}"
+        )));
+    }
+    let screen = unsafe { GetDC(std::ptr::null_mut()) };
+    if screen.is_null() {
+        return Err(Error::Other(anyhow::anyhow!("GetDC failed")));
+    }
+    let mem = unsafe { CreateCompatibleDC(screen) };
+    let bmp = unsafe { CreateCompatibleBitmap(screen, width, height) };
+    if mem.is_null() || bmp.is_null() {
+        unsafe {
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+        return Err(Error::Other(anyhow::anyhow!("GDI bitmap creation failed")));
+    }
+    let old = unsafe { SelectObject(mem, bmp) };
+    let blt = unsafe { BitBlt(mem, 0, 0, width, height, screen, 0, 0, SRCCOPY) };
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader.biSize = std::mem::size_of_val(&bmi.bmiHeader) as u32;
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
+    let lines = if blt != 0 {
+        unsafe {
+            GetDIBits(
+                mem,
+                bmp,
+                0,
+                height as u32,
+                bgra.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        }
+    } else {
+        0
+    };
+    unsafe {
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+    }
+    if lines == 0 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "screen capture failed (BitBlt/GetDIBits)"
+        )));
+    }
+
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for px in bgra.chunks_exact(4) {
+        rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("invalid RGB buffer")))?;
+    let img = if max_width > 0 && img.width() > max_width {
+        let nh = (img.height() as u64 * max_width as u64 / img.width() as u64) as u32;
+        image::imageops::resize(
+            &img,
+            max_width,
+            nh.max(1),
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let mut out = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+    encoder
+        .encode_image(&img)
+        .map_err(|e| Error::Other(anyhow::anyhow!("jpeg encode: {e}")))?;
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn capture_screen_jpeg(_max_width: u32, _quality: u8) -> Result<Vec<u8>> {
+    Err(Error::Other(anyhow::anyhow!(
+        "screen capture is only supported on Windows"
+    )))
+}
+
+fn run_powershell_command(script: &str) -> Result<std::process::Output> {
+    std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|e| Error::Other(anyhow::anyhow!("powershell: {e}")))
+}
+
+fn get_clipboard_text() -> Result<String> {
+    let out = run_powershell_command("[Console]::Out.Write((Get-Clipboard -Raw))")?;
+    if !out.status.success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "Get-Clipboard failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn assist_user_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("IDV_ASSIST_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("YixueIDV")
+        .join("assist")
+}
+
+fn set_clipboard_text(text: &str) -> Result<()> {
+    let dir = assist_user_dir();
+    std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+    let path = dir.join("clipboard.txt");
+    std::fs::write(&path, text).map_err(Error::Io)?;
+    let p = path.to_string_lossy().replace('\'', "''");
+    let script = format!("Set-Clipboard -Value ([System.IO.File]::ReadAllText('{p}'))");
+    let out = run_powershell_command(&script)?;
+    if !out.status.success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "Set-Clipboard failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn key_to_vk(key: &str) -> Option<u8> {
+    let lower = key.to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "enter" | "return" => 0x0D,
+        "backspace" => 0x08,
+        "tab" => 0x09,
+        "escape" | "esc" => 0x1B,
+        "space" | " " => 0x20,
+        "arrowup" | "up" => 0x26,
+        "arrowdown" | "down" => 0x28,
+        "arrowleft" | "left" => 0x25,
+        "arrowright" | "right" => 0x27,
+        "delete" | "del" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "shift" => 0x10,
+        "control" | "ctrl" => 0x11,
+        "alt" => 0x12,
+        "meta" | "win" => 0x5B,
+        "capslock" => 0x14,
+        _ => {
+            let mut chars = key.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            if c.is_ascii_alphabetic() {
+                c.to_ascii_uppercase() as u8
+            } else if c.is_ascii_digit() {
+                c as u8
+            } else if c == ' ' {
+                0x20
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(mapped)
+}
+
+#[cfg(windows)]
+fn assist_input(value: &serde_json::Value) -> Result<()> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+        keybd_event, mouse_event,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SetCursorPos};
+
+    let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match ty {
+        "mouse_move" => {
+            let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let w = unsafe { GetSystemMetrics(0) }.max(1);
+            let h = unsafe { GetSystemMetrics(1) }.max(1);
+            let px = ((x.clamp(0.0, 1.0)) * w as f64) as i32;
+            let py = ((y.clamp(0.0, 1.0)) * h as f64) as i32;
+            unsafe {
+                SetCursorPos(px, py);
+            }
+        }
+        "mouse_click" => {
+            let button = value
+                .get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or("left");
+            let down = value.get("down").and_then(|v| v.as_bool()).unwrap_or(true);
+            let flag = match (button, down) {
+                ("right", true) => MOUSEEVENTF_RIGHTDOWN,
+                ("right", false) => MOUSEEVENTF_RIGHTUP,
+                ("middle", true) => MOUSEEVENTF_MIDDLEDOWN,
+                ("middle", false) => MOUSEEVENTF_MIDDLEUP,
+                (_, true) => MOUSEEVENTF_LEFTDOWN,
+                (_, false) => MOUSEEVENTF_LEFTUP,
+            };
+            unsafe {
+                mouse_event(flag, 0, 0, 0, 0);
+            }
+        }
+        "mouse_wheel" => {
+            let delta = value.get("delta").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            unsafe {
+                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
+            }
+        }
+        "key" => {
+            let key = value.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let down = value.get("down").and_then(|v| v.as_bool()).unwrap_or(true);
+            if let Some(vk) = key_to_vk(key) {
+                let flags = if down { 0 } else { KEYEVENTF_KEYUP };
+                unsafe {
+                    keybd_event(vk, 0, flags, 0);
+                }
+            }
+        }
+        "text" => {
+            let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !text.is_empty() {
+                set_clipboard_text(text)?;
+                unsafe {
+                    keybd_event(0x11, 0, 0, 0);
+                    keybd_event(0x56, 0, 0, 0);
+                    keybd_event(0x56, 0, KEYEVENTF_KEYUP, 0);
+                    keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn launch_assist_helper(
+    session_id: &str,
+    center_url: &str,
+    mac: &str,
+    kind: &str,
+    frame_ms: u64,
+) -> anyhow::Result<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary,
+    };
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        anyhow::bail!("no active console session");
+    }
+    let mut user_token: HANDLE = std::ptr::null_mut();
+    if unsafe { WTSQueryUserToken(session, &mut user_token) } == 0 {
+        anyhow::bail!(
+            "WTSQueryUserToken failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut primary: HANDLE = std::ptr::null_mut();
+    let dup_ok = unsafe {
+        DuplicateTokenEx(
+            user_token,
+            TOKEN_ALL_ACCESS,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        )
+    };
+    unsafe {
+        CloseHandle(user_token);
+    }
+    if dup_ok == 0 {
+        anyhow::bail!(
+            "DuplicateTokenEx failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
+    let env_ok = unsafe { CreateEnvironmentBlock(&mut env, primary, 0) };
+    let exe = std::env::current_exe()?;
+    let cmd = format!(
+        "\"{}\" assist-helper --session-id {} --center-url {} --mac {} --kind {} --frame-ms {}",
+        exe.display(),
+        session_id,
+        center_url,
+        mac,
+        kind,
+        frame_ms
+    );
+    let mut cmdline: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // Explicit desktop: otherwise a helper launched from Session 0 may inherit
+    // the service desktop, making CopyFromScreen/clipboard/input fail.
+    let desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+    si.lpDesktop = desktop.as_ptr() as *mut u16;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        CreateProcessAsUserW(
+            primary,
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_UNICODE_ENVIRONMENT,
+            env,
+            std::ptr::null(),
+            &mut si,
+            &mut pi,
+        )
+    };
+    if env_ok != 0 && !env.is_null() {
+        unsafe {
+            DestroyEnvironmentBlock(env);
+        }
+    }
+    unsafe {
+        CloseHandle(primary);
+    }
+    if ok == 0 {
+        anyhow::bail!(
+            "CreateProcessAsUserW failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    Ok(pi.dwProcessId)
+}
+
+static ASSIST_HELPER_SESSION: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);
+
+fn stop_assist_helper() {
+    if let Ok(mut guard) = ASSIST_HELPER_SESSION.lock()
+        && let Some((_sid, pid)) = guard.take()
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .output();
+    }
+}
+
+async fn assist_helper_ack(center: &str, session_id: &str, state: &str, detail: &str) {
+    let url = format!(
+        "{}/api/v1/assist/sessions/{session_id}/ack",
+        center.trim_end_matches('/')
+    );
+    let _ = http_client()
+        .post(&url)
+        .json(&serde_json::json!({ "state": state, "detail": detail }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+}
+
+async fn assist_session_state(center: &str, session_id: &str) -> Option<String> {
+    let url = format!(
+        "{}/api/v1/assist/sessions/{session_id}/state",
+        center.trim_end_matches('/')
+    );
+    let resp = http_client().get(&url).send().await.ok()?;
+    let value: serde_json::Value = resp.json().await.ok()?;
+    value
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+#[cfg(windows)]
+async fn assist_frame_loop(
+    center: String,
+    session_id: String,
+    mac: String,
+    frame_ms: u64,
+    stop: std::sync::Arc<AtomicBool>,
+) {
+    let mut last_error_report = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let started = std::time::Instant::now();
+        match tokio::task::spawn_blocking(|| capture_screen_jpeg(1280, 60)).await {
+            Ok(Ok(bytes)) if bytes.len() > 256 => {
+                let url = format!(
+                    "{}/api/v1/assist/sessions/{session_id}/frame?mac={}",
+                    center.trim_end_matches('/'),
+                    urlencoding_lite(&mac)
+                );
+                match http_client()
+                    .put(&url)
+                    .header("Content-Type", "image/jpeg")
+                    .body(bytes)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if !resp.status().is_success() => {
+                        let msg = format!("frame_upload_error: {}", resp.status());
+                        if last_error_report.elapsed() > std::time::Duration::from_secs(10) {
+                            last_error_report = std::time::Instant::now();
+                            assist_helper_ack(&center, &session_id, "active", &msg).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => eprintln!("idv-agent: assist frame upload: {err}"),
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                eprintln!("idv-agent: assist capture: {err}");
+                if last_error_report.elapsed() > std::time::Duration::from_secs(10) {
+                    last_error_report = std::time::Instant::now();
+                    assist_helper_ack(
+                        &center,
+                        &session_id,
+                        "active",
+                        &format!("capture_error: {err}"),
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                eprintln!("idv-agent: assist capture task: {err}");
+            }
+        }
+        let elapsed = started.elapsed();
+        let wait = std::time::Duration::from_millis(frame_ms.max(200));
+        if elapsed < wait {
+            tokio::time::sleep(wait - elapsed).await;
+        }
+    }
+}
+
+fn fs_list_json(path: &str) -> Result<serde_json::Value> {
+    let dir = std::path::Path::new(path);
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| Error::Other(anyhow::anyhow!(e)))? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let meta = entry.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        entries.push(serde_json::json!({
+            "name": entry.file_name().to_string_lossy(),
+            "path": entry.path().to_string_lossy(),
+            "is_dir": is_dir,
+            "size": if is_dir { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) },
+            "modified": meta.as_ref().and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()).unwrap_or(0),
+        }));
+    }
+    entries.sort_by_key(|e| {
+        (
+            !e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false),
+            e.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase(),
+        )
+    });
+    Ok(serde_json::json!({ "ok": true, "entries": entries }))
+}
+
+async fn assist_report(center: &str, command_id: &str, ok: bool, detail: &str) {
+    let url = format!(
+        "{}/api/v1/assist/commands/{command_id}/report",
+        center.trim_end_matches('/')
+    );
+    let _ = http_client()
+        .post(&url)
+        .json(&serde_json::json!({ "ok": ok, "detail": detail }))
+        .send()
+        .await;
+}
+
+async fn handle_assist_fs_command(
+    center: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    let request_id = payload
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if request_id.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!("missing request_id")));
+    }
+    let base = center.trim_end_matches('/');
+    match kind {
+        "fs_list" => {
+            let path = payload
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("C:\\");
+            let body = fs_list_json(path)?;
+            let _ = http_client()
+                .put(format!("{base}/api/v1/assist/fs/{request_id}"))
+                .json(&body)
+                .send()
+                .await;
+        }
+        "fs_download" => {
+            let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            let _ = http_client()
+                .put(format!("{base}/api/v1/assist/fs/{request_id}/data"))
+                .body(bytes)
+                .send()
+                .await;
+        }
+        "fs_upload" => {
+            let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let rel = payload
+                .get("download_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if path.is_empty() || rel.is_empty() {
+                return Err(Error::Other(anyhow::anyhow!("invalid fs_upload payload")));
+            }
+            let url = format!(
+                "{base}{}",
+                if rel.starts_with('/') {
+                    rel.to_string()
+                } else {
+                    format!("/{rel}")
+                }
+            );
+            let resp = http_client()
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            if !resp.status().is_success() {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "download failed: {}",
+                    resp.status()
+                )));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            tokio::fs::write(path, &bytes)
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            let _ = http_client()
+                .put(format!("{base}/api/v1/assist/fs/{request_id}"))
+                .json(&serde_json::json!({ "ok": true }))
+                .send()
+                .await;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn run_assist_helper(
+    session_id: &str,
+    center_url: &str,
+    mac: &str,
+    kind: &str,
+    frame_ms: u64,
+) -> Result<()> {
+    let state_dir = assist_user_dir().join(session_id);
+    tokio::fs::create_dir_all(&state_dir).await.map_err(|e| {
+        Error::Other(anyhow::anyhow!(
+            "create assist dir {}: {e}",
+            state_dir.display()
+        ))
+    })?;
+    assist_helper_ack(center_url, session_id, "accepted", "helper_started").await;
+    assist_helper_ack(center_url, session_id, "active", "helper_active").await;
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let frame_stop = stop.clone();
+    let frame_task = tokio::spawn(assist_frame_loop(
+        center_url.to_string(),
+        session_id.to_string(),
+        mac.to_string(),
+        frame_ms,
+        frame_stop,
+    ));
+    let base = center_url.trim_end_matches('/');
+    let mut last_session_check = std::time::Instant::now();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let url = format!("{base}/api/v1/assist/sessions/{session_id}/commands/next?wait=10");
+        let cmd = match http_client()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp
+                .json::<Option<serde_json::Value>>()
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        if let Some(cmd) = cmd {
+            let command_id = cmd.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd_kind = cmd.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let payload_text = cmd.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+            let payload: serde_json::Value =
+                serde_json::from_str(payload_text).unwrap_or(serde_json::Value::Null);
+            let result: Result<()> = match cmd_kind {
+                "input" => {
+                    if kind == "control" {
+                        #[cfg(windows)]
+                        {
+                            assist_input(&payload)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            Ok(())
+                        }
+                    } else {
+                        Err(Error::Other(anyhow::anyhow!(
+                            "observe session is read-only"
+                        )))
+                    }
+                }
+                "clipboard_get" => match get_clipboard_text() {
+                    Ok(text) => {
+                        let _ = http_client()
+                            .put(format!(
+                                "{base}/api/v1/assist/sessions/{session_id}/clipboard"
+                            ))
+                            .body(text)
+                            .send()
+                            .await;
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+                "clipboard_set" => {
+                    let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    match set_clipboard_text(text) {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err(err),
+                    }
+                }
+                "fs_list" | "fs_download" | "fs_upload" => {
+                    handle_assist_fs_command(center_url, cmd_kind, &payload).await
+                }
+                "assist_stop" => {
+                    stop.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            match result {
+                Ok(()) => assist_report(center_url, command_id, true, "ok").await,
+                Err(err) => {
+                    if cmd_kind.starts_with("fs_")
+                        && let Some(rid) = payload.get("request_id").and_then(|v| v.as_str())
+                    {
+                        let _ = http_client()
+                            .put(format!("{base}/api/v1/assist/fs/{rid}"))
+                            .json(&serde_json::json!({ "ok": false, "error": err.to_string() }))
+                            .send()
+                            .await;
+                    }
+                    assist_report(center_url, command_id, false, &err.to_string()).await
+                }
+            }
+        }
+        if last_session_check.elapsed() > std::time::Duration::from_secs(5) {
+            last_session_check = std::time::Instant::now();
+            if let Some(state) = assist_session_state(center_url, session_id).await
+                && (state == "ended" || state == "denied")
+            {
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    frame_task.abort();
+    assist_helper_ack(center_url, session_id, "ended", "helper_stopped").await;
+    Ok(())
+}
+
+fn ps_quote(path: &str) -> String {
+    path.replace('\'', "''")
+}
+
+fn center_url_join(center: &str, path: &str) -> String {
+    format!(
+        "{}{}",
+        center.trim_end_matches('/'),
+        if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        }
+    )
+}
+
+async fn fs_task_result(
+    cfg: &AgentConfig,
+    payload: &serde_json::Value,
+    mac: &str,
+    ok: bool,
+    detail: &str,
+) {
+    let task_id = payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if task_id.is_empty() {
+        return;
+    }
+    let url = center_url_join(
+        &cfg.center_url,
+        &format!(
+            "/api/v1/file-tasks/{task_id}/{}/result",
+            mac.replace(':', "%3A")
+        ),
+    );
+    let _ = http_client()
+        .put(&url)
+        .json(&serde_json::json!({ "ok": ok, "detail": detail }))
+        .send()
+        .await;
+}
+
+async fn handle_fs_collect(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    mac: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    let task_id = payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let source_dir = payload
+        .get("source_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let upload_url = payload
+        .get("upload_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if task_id.is_empty() || source_dir.is_empty() || upload_url.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!("invalid fs_collect payload")));
+    }
+    if !std::path::Path::new(source_dir).is_dir() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "source_dir not found: {source_dir}"
+        )));
+    }
+    let work = state_dir.join("file-tasks").join(task_id);
+    tokio::fs::create_dir_all(&work).await.map_err(Error::Io)?;
+    let mac_file = mac.replace(':', "-");
+    let zip = work.join(format!("{mac_file}.zip"));
+    let zip_s = zip.to_string_lossy().to_string();
+    let script = format!(
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+         [System.IO.Compression.ZipFile]::CreateFromDirectory('{}','{}','Optimal',$true)",
+        ps_quote(source_dir),
+        ps_quote(&zip_s)
+    );
+    let out = tokio::task::spawn_blocking(move || run_powershell_command(&script))
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))??;
+    if !out.status.success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "zip failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let bytes = tokio::fs::read(&zip).await.map_err(Error::Io)?;
+    let url = center_url_join(&cfg.center_url, upload_url);
+    let resp = http_client()
+        .put(&url)
+        .header("Content-Type", "application/zip")
+        .body(bytes.clone())
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    let _ = tokio::fs::remove_file(&zip).await;
+    if !resp.status().is_success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "upload failed: {}",
+            resp.status()
+        )));
+    }
+    Ok(format!("collected {} bytes", bytes.len()))
+}
+
+async fn handle_fs_distribute(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    mac: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    let task_id = payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let target_dir = payload
+        .get("target_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let download_url = payload
+        .get("download_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if task_id.is_empty() || target_dir.is_empty() || download_url.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "invalid fs_distribute payload"
+        )));
+    }
+    let work = state_dir.join("file-tasks").join(task_id);
+    tokio::fs::create_dir_all(&work).await.map_err(Error::Io)?;
+    let mac_file = mac.replace(':', "-");
+    let zip = work.join(format!("{mac_file}.zip"));
+    let url = center_url_join(&cfg.center_url, download_url);
+    let resp = http_client()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    if !resp.status().is_success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "download bundle failed: {}",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    tokio::fs::write(&zip, &bytes).await.map_err(Error::Io)?;
+    let zip_s = zip.to_string_lossy().to_string();
+    let script = format!(
+        "New-Item -ItemType Directory -Force -Path '{}' | Out-Null; \
+         Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+        ps_quote(target_dir),
+        ps_quote(&zip_s),
+        ps_quote(target_dir)
+    );
+    let out = tokio::task::spawn_blocking(move || run_powershell_command(&script))
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))??;
+    let _ = tokio::fs::remove_file(&zip).await;
+    if !out.status.success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "expand failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    fs_task_result(cfg, payload, mac, true, "expanded").await;
+    Ok(format!("distributed {} bytes", bytes.len()))
+}
+
 async fn run_daemon(
     cfg: AgentConfig,
     heartbeat_secs: u64,

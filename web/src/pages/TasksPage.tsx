@@ -56,6 +56,7 @@ export function TasksPage() {
   const [agentPackages, setAgentPackages] = useState<AgentPackage[]>([]);
   const [agentVersion, setAgentVersion] = useState("");
   const [agentFile, setAgentFile] = useState<File | null>(null);
+  const [agentUploading, setAgentUploading] = useState(false);
   const [selectedMacs, setSelectedMacs] = useState<Set<string>>(new Set());
   const [filterCampusId, setFilterCampusId] = useState("");
   const [filterLabId, setFilterLabId] = useState("");
@@ -281,6 +282,23 @@ export function TasksPage() {
       await refresh();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "创建失败");
+    }
+  }
+
+  async function uploadAgentPackage(file: File) {
+    setAgentUploading(true);
+    setFormError("");
+    try {
+      const uploaded = await api.agentPackages.upload(file);
+      setAgentVersion(uploaded.version);
+      setAgentFile(null);
+      setAgentPackages(await api.agentPackages.list());
+      msg.success(`Agent 包已上传：${uploaded.version}`);
+    } catch (err) {
+      setAgentFile(file);
+      setFormError(err instanceof Error ? err.message : "上传失败");
+    } finally {
+      setAgentUploading(false);
     }
   }
 
@@ -819,11 +837,22 @@ export function TasksPage() {
             <input
               type="file"
               accept=".exe"
-              onChange={(e) => setAgentFile(e.target.files?.[0] ?? null)}
+              disabled={agentUploading}
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null;
+                setAgentFile(f);
+                if (f) void uploadAgentPackage(f);
+                e.currentTarget.value = "";
+              }}
             />
             <span className="muted">
-              直接选择新版 exe 即可，版本号会自动从程序内嵌版本标记读取并上传。
+              选择文件后会立即上传并从程序内嵌标记自动识别版本，成功后上方下拉框会出现该版本。
             </span>
+            {agentUploading ? (
+              <span className="muted">正在上传并识别版本…</span>
+            ) : agentVersion ? (
+              <span className="muted">当前选择版本：{agentVersion}</span>
+            ) : null}
           </div>
           <p className="muted">
             已选客户端：{selectedMacs.size} 台。管理员可在任务列表查看每台的更新状态。
@@ -839,9 +868,13 @@ export function TasksPage() {
             <button
               className="btn"
               type="submit"
-              disabled={selectedMacs.size === 0 || (!agentVersion && !agentFile)}
+              disabled={
+                agentUploading ||
+                selectedMacs.size === 0 ||
+                (!agentVersion && !agentFile)
+              }
             >
-              下发更新（{selectedMacs.size} 台）
+              {agentUploading ? "上传中…" : `下发更新（${selectedMacs.size} 台）`}
             </button>
           </div>
         </form>

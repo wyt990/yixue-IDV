@@ -679,6 +679,134 @@ export const api = {
         },
       ),
   },
+  remote: {
+    get: (id: string) =>
+      request<{
+        id: string;
+        mac: string;
+        kind: string;
+        state: string;
+        detail: string;
+        clipboard: string;
+        frame_count: number;
+        last_frame_at: string | null;
+      }>(`/api/v1/assist/sessions/${id}`),
+    end: (id: string) =>
+      request(`/api/v1/assist/sessions/${id}/end`, { method: "POST" }),
+    input: (id: string, event: unknown) =>
+      request(`/api/v1/assist/sessions/${id}/input`, {
+        method: "POST",
+        body: JSON.stringify(event),
+      }),
+    frame: async (id: string): Promise<Blob | null> => {
+      const token = getToken();
+      const res = await fetch(`/api/v1/assist/sessions/${id}/frame`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        cache: "no-store",
+      });
+      if (res.status === 204) return null;
+      if (!res.ok) throw new ApiError(res.status, await res.text());
+      return await res.blob();
+    },
+    clipboardShow: (id: string) =>
+      request<{ text: string }>(`/api/v1/assist/sessions/${id}/clipboard`),
+    clipboardRead: (id: string) =>
+      request(`/api/v1/assist/sessions/${id}/clipboard/read`, { method: "POST" }),
+    clipboardSet: (id: string, text: string) =>
+      request(`/api/v1/assist/sessions/${id}/clipboard`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      }),
+    fsList: (id: string, path: string) =>
+      request<{ request_id: string }>(`/api/v1/assist/sessions/${id}/fs/list`, {
+        method: "POST",
+        body: JSON.stringify({ path }),
+      }),
+    fsDownload: (id: string, path: string) =>
+      request<{ request_id: string }>(
+        `/api/v1/assist/sessions/${id}/fs/download`,
+        { method: "POST", body: JSON.stringify({ path }) },
+      ),
+    fsStatus: (requestId: string) =>
+      request<{
+        id: string;
+        kind: string;
+        path: string;
+        state: string;
+        file_name: string;
+        size_bytes: number;
+        payload: string;
+        error_message: string;
+      }>(`/api/v1/assist/fs/${requestId}`),
+    fsUpload: async (id: string, path: string, file: File) => {
+      const token = getToken();
+      const q = new URLSearchParams({ path, file_name: file.name });
+      const res = await fetch(
+        `/api/v1/assist/sessions/${id}/fs/upload?${q.toString()}`,
+        {
+          method: "POST",
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          body: file,
+        },
+      );
+      if (!res.ok) throw new ApiError(res.status, await res.text());
+      return (await res.json()) as { request_id: string };
+    },
+    fsData: async (requestId: string, filename: string) => {
+      const token = getToken();
+      const res = await fetch(`/api/v1/assist/fs/${requestId}/data`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new ApiError(res.status, await res.text());
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename || "download.bin";
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    fileCollect: (payload: { macs: string[]; source_dir: string; name?: string }) =>
+      request<{ task_id: string; targets: number }>("/api/v1/tasks/file-collect", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    collectArchive: async (taskId: string, mac: string) => {
+      const token = getToken();
+      const res = await fetch(
+        `/api/v1/file-tasks/${taskId}/${encodeURIComponent(mac)}/archive`,
+        { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      );
+      if (!res.ok) throw new ApiError(res.status, await res.text());
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${mac.replace(/:/g, "-")}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    fileDistribute: async (
+      targetDir: string,
+      macs: string[],
+      file: File,
+      name = "",
+    ) => {
+      const token = getToken();
+      const q = new URLSearchParams({
+        target_dir: targetDir,
+        macs: macs.join(","),
+        name,
+      });
+      const res = await fetch(`/api/v1/tasks/file-distribute?${q.toString()}`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: file,
+      });
+      if (!res.ok) throw new ApiError(res.status, await res.text());
+      return (await res.json()) as { task_id: string; targets: number };
+    },
+  },
   phase3: {
     getClassLock: () =>
       request<{ enabled: boolean; start_hour_utc: number; end_hour_utc: number }>(

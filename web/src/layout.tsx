@@ -6,6 +6,7 @@ const links = [
   { to: "/", label: "工作台", end: true },
   { to: "/labs", label: "校区 / 机房" },
   { to: "/clients", label: "终端" },
+  { to: "/remote", label: "远程控制" },
   { to: "/images", label: "镜像库" },
   { to: "/edges", label: "边缘节点" },
   { to: "/pe-sessions", label: "PE 会话" },

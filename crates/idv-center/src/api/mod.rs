@@ -18,6 +18,7 @@ mod modes;
 pub mod ops;
 mod pe_sessions;
 mod power;
+mod remote;
 mod software;
 pub mod tasks;
 
@@ -135,6 +136,83 @@ pub fn router() -> Router<AppState> {
             get(assist::list).post(assist::create),
         )
         .route("/api/v1/assist/sessions/{id}/ack", post(assist::ack))
+        .route("/api/v1/assist/sessions/{id}", get(remote::get))
+        .route(
+            "/api/v1/assist/sessions/{id}/state",
+            get(remote::helper_state),
+        )
+        .route("/api/v1/assist/sessions/{id}/end", post(remote::end))
+        .route(
+            "/api/v1/assist/sessions/{id}/frame",
+            get(remote::frame_get)
+                .put(remote::frame_put)
+                .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/assist/sessions/{id}/commands/next",
+            get(remote::commands_next),
+        )
+        .route(
+            "/api/v1/assist/commands/{id}/report",
+            post(remote::command_report),
+        )
+        .route("/api/v1/assist/sessions/{id}/input", post(remote::input))
+        .route(
+            "/api/v1/assist/sessions/{id}/clipboard",
+            get(remote::clipboard_show)
+                .post(remote::clipboard_set)
+                .put(remote::clipboard_upload),
+        )
+        .route(
+            "/api/v1/assist/sessions/{id}/clipboard/read",
+            post(remote::clipboard_read),
+        )
+        .route(
+            "/api/v1/assist/sessions/{id}/fs/list",
+            post(remote::fs_list),
+        )
+        .route(
+            "/api/v1/assist/sessions/{id}/fs/download",
+            post(remote::fs_download),
+        )
+        .route(
+            "/api/v1/assist/sessions/{id}/fs/upload",
+            post(remote::fs_upload).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/assist/fs/{id}",
+            get(remote::fs_status).put(remote::fs_result_put),
+        )
+        .route(
+            "/api/v1/assist/fs/{id}/data",
+            get(remote::fs_data_get)
+                .put(remote::fs_data_put)
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/tasks/file-collect",
+            post(remote::create_file_collect),
+        )
+        .route(
+            "/api/v1/tasks/file-distribute",
+            post(remote::create_file_distribute).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/file-tasks/{task_id}/bundle",
+            get(remote::file_task_bundle),
+        )
+        .route(
+            "/api/v1/file-tasks/{task_id}/{mac}/collect",
+            put(remote::collect_upload).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/file-tasks/{task_id}/{mac}/result",
+            put(remote::file_target_result),
+        )
+        .route(
+            "/api/v1/file-tasks/{task_id}/{mac}/archive",
+            get(remote::collect_download),
+        )
         .route("/api/v1/agent/heartbeat", post(agent::heartbeat))
         .route("/api/v1/agent/commands/next", get(agent_commands::next))
         .route(

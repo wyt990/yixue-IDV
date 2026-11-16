@@ -401,6 +401,27 @@ pub async fn create_agent_update(
     Ok((StatusCode::CREATED, Json(TaskView { task, targets })))
 }
 
+pub async fn update_agent_progress(
+    state: &AppState,
+    mac: &str,
+    progress: f64,
+    detail: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE maintenance_task_targets SET progress = ?, detail = ?, updated_at = ? \
+         WHERE mac = ? AND state IN ('pending', 'running') \
+           AND task_id IN (SELECT id FROM maintenance_tasks \
+                           WHERE kind = 'agent_update' AND state IN ('pending', 'running'))",
+    )
+    .bind(progress)
+    .bind(detail)
+    .bind(Utc::now())
+    .bind(mac)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
 /// Enqueue one update_agent command for the newest active agent_update target.
 /// Used right after the client reports `reboot_for_update`.
 pub async fn requeue_agent_update(state: &AppState, mac: &str) -> anyhow::Result<()> {
@@ -493,8 +514,8 @@ pub async fn on_agent_heartbeat(
         }
 
         sqlx::query(
-            "UPDATE maintenance_task_targets SET state = 'running', detail = ?, updated_at = ? \
-             WHERE id = ?",
+            "UPDATE maintenance_task_targets SET state = 'running', progress = 0.3, \
+             detail = ?, updated_at = ? WHERE id = ?",
         )
         .bind(format!("current={agent_version} target={version}"))
         .bind(Utc::now())
@@ -654,7 +675,7 @@ async fn fail_active_targets(state: &AppState, task_id: &str, message: &str) -> 
     Ok(())
 }
 
-async fn refresh_task_aggregate(state: &AppState, task_id: &str) -> anyhow::Result<()> {
+pub(crate) async fn refresh_task_aggregate(state: &AppState, task_id: &str) -> anyhow::Result<()> {
     let states: Vec<(String,)> =
         sqlx::query_as("SELECT state FROM maintenance_task_targets WHERE task_id = ?")
             .bind(task_id)

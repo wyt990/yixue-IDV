@@ -11,6 +11,7 @@ import { LabsPage } from "./pages/LabsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { PeSessionsPage } from "./pages/PeSessionsPage";
 import { Phase3Page } from "./pages/Phase3Page";
+import { RemotePage } from "./pages/RemotePage";
 import { TasksPage } from "./pages/TasksPage";
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -39,6 +40,7 @@ export default function App() {
         <Route path="edges" element={<EdgesPage />} />
         <Route path="pe-sessions" element={<PeSessionsPage />} />
         <Route path="tasks" element={<TasksPage />} />
+        <Route path="remote" element={<RemotePage />} />
         <Route path="modes" element={<Navigate to="/labs" replace />} />
         <Route path="phase3" element={<Phase3Page />} />
         <Route path="admins" element={<AdminsPage />} />

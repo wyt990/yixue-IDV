@@ -126,11 +126,23 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     tokio::fs::create_dir_all(&agent_dir)
         .await
         .map_err(Error::Io)?;
+    let assist_fs_dir = images_dir
+        .parent()
+        .map(|p| p.join("assist-fs"))
+        .unwrap_or_else(|| PathBuf::from("data/assist-fs"));
+    tokio::fs::create_dir_all(&assist_fs_dir)
+        .await
+        .map_err(Error::Io)?;
     let state = AppState {
         pool: pool.clone(),
         images_dir,
         software_dir,
         agent_dir,
+        assist_fs_dir,
+        assist_frames: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        assist_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         max_concurrent_deploy_targets: cfg.max_concurrent_deploy_targets.max(1),
         max_pending_sync_per_edge: cfg.max_pending_sync_per_edge.max(1),
         recommended_deploy_batch: cfg.recommended_deploy_batch.max(1),

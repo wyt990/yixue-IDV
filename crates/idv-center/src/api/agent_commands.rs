@@ -127,11 +127,12 @@ pub async fn report(
     Json(body): Json<ReportBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let state_name = if body.ok { "done" } else { "failed" };
-    let mac: Option<String> = sqlx::query_scalar("SELECT mac FROM agent_commands WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(internal)?;
+    let meta: Option<(String, String)> =
+        sqlx::query_as("SELECT mac, kind FROM agent_commands WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
     sqlx::query(
         "UPDATE agent_commands SET state = ?, finished_at = ?, error_message = ? WHERE id = ?",
     )
@@ -142,13 +143,25 @@ pub async fn report(
     .execute(&state.pool)
     .await
     .map_err(internal)?;
+    if let Some((mac, kind)) = &meta
+        && kind == "update_agent"
+    {
+        let progress = if body.ok && body.detail.contains("update_scheduled") {
+            0.5
+        } else if body.detail.contains("reboot_for_update") {
+            0.2
+        } else {
+            0.1
+        };
+        let _ = super::tasks::update_agent_progress(&state, mac, progress, &body.detail).await;
+    }
     // The client is about to reboot to disarm restore; pre-queue the retry so
     // the agent can consume it before its first post-boot heartbeat re-arms.
     if !body.ok
         && body.detail.contains("reboot_for_update")
-        && let Some(mac) = mac
+        && let Some((mac, _)) = &meta
     {
-        let _ = super::tasks::requeue_agent_update(&state, &mac).await;
+        let _ = super::tasks::requeue_agent_update(&state, mac).await;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }

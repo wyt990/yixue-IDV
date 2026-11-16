@@ -134,7 +134,7 @@ Center 上传 exe 时自动扫描该标记得到版本号，并以此命名包�
 3. 客户端心跳的 `agent_version` 与包内标记一致，Center 才能正确判断更新完成；
 4. 如果上传的 exe 找不到标记（例如 0.1.0 旧包），Center 会拒绝并提示。
 
-当前版本：`0.2.0`（旧客户端 `0.1.0`）。
+当前版本：`0.3.2`（旧客户端 `0.1.0` / `0.2.0` / `0.3.0` / `0.3.1`）。
 
 ### 4.1 首次启用（必须手动一次）
 
@@ -150,7 +150,7 @@ Get-Service idv-agent
 
 （计划任务模式：`schtasks /End /TN YixueIdvAgentDaemon` → 覆盖 → `schtasks /Run /TN YixueIdvAgentDaemon`）
 
-只要客户端到 `0.2.0`，后续版本都可以用维护任务自动升级。
+只要客户端到 `0.2.0+`，后续版本都可以用维护任务自动升级。
 
 ### 4.2 回滚
 
@@ -163,6 +163,33 @@ Copy-Item "C:\Program Files\YixueIDV\idv-agent.exe.bak" `
   "C:\Program Files\YixueIDV\idv-agent.exe" -Force
 Start-Service idv-agent
 ```
+
+### 4.3 0.2.0 更新卡住时的手动恢复
+
+0.2.0 的 updater 是服务的子进程，服务停止时可能被一起结束，表现为命令一直
+`update_scheduled` 但版本不变。最后手动升一次 0.3.0：
+
+```powershell
+# 客户端管理员 PowerShell
+$dst = "C:\Program Files\YixueIDV\idv-agent.exe"
+Invoke-WebRequest "http://10.110.0.1:8080/api/v1/agent/packages/0.3.2/download" `
+  -OutFile "$env:ProgramData\YixueIDV\idv-agent-0.3.0.exe"
+Stop-Service idv-agent -Force -ErrorAction SilentlyContinue
+Copy-Item "$env:ProgramData\YixueIDV\idv-agent-0.3.0.exe" $dst -Force
+Start-Service idv-agent
+Get-Service idv-agent
+Get-Content "C:\ProgramData\YixueIDV\update\update.log" -Tail 30
+```
+
+计划任务模式：
+
+```powershell
+schtasks /End /TN YixueIdvAgentDaemon
+Copy-Item ... $dst -Force
+schtasks /Run /TN YixueIdvAgentDaemon
+```
+
+0.3.0 起 updater 通过 **Task Scheduler(SYSTEM)** 运行，不再随 Agent 服务停止被杀。
 
 ---
 
@@ -193,6 +220,7 @@ Start-Service idv-agent
 | 现象 | 排查 |
 |---|---|
 | 任务一直 running，客户端不重启 | Agent 未以服务/计划任务运行；看 `update.log`、agent 日志 |
+| 命令反复 `update_scheduled` 但版本仍不变 | 0.2.0 updater 作为服务子进程可能随服务停止被杀；0.3.0 改为 Task Scheduler(SYSTEM) 启动，需手动升一次 |
 | 回执 `download ...` 失败 | Center 下载地址/防火墙；`center_url` 必须客户端可达 |
 | 回执 `sha256 mismatch` | 上传包与生成的 sha 不一致，重新上传 |
 | 更新后仍显示旧版本 | 版本号未改二进制 `CARGO_PKG_VERSION`；或服务未重启成功 |
