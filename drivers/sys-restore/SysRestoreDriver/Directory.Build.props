@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <PropertyGroup>
+    <WDKContentRoot Condition="'$(WDKContentRoot)' == ''">H:\Windows Kits\10\</WDKContentRoot>
+    <WindowsKitsRoot Condition="'$(WindowsKitsRoot)' == ''">H:\Windows Kits\10\</WindowsKitsRoot>
+    <WindowsSdkDir Condition="'$(WindowsSdkDir)' == ''">H:\Windows Kits\10\</WindowsSdkDir>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
+    <WindowsSDKVersion>10.0.26100.0</WindowsSDKVersion>
+    <WDKBuildFolder>10.0.26100.0</WDKBuildFolder>
+    <DDKPlatform Condition="'$(Platform)' == 'x64'">x64</DDKPlatform>
+    <SpectreMitigation>false</SpectreMitigation>
+    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+    <KM_IncludePath>$(WDKContentRoot)Include\$(WindowsTargetPlatformVersion)\km</KM_IncludePath>
+    <CRT_IncludePath>$(WDKContentRoot)Include\$(WindowsTargetPlatformVersion)\km\crt</CRT_IncludePath>
+    <KIT_SHARED_IncludePath>$(WDKContentRoot)Include\$(WindowsTargetPlatformVersion)\shared</KIT_SHARED_IncludePath>
+    <KIT_SHARED_INC_PATH_WDK>$(WDKContentRoot)Include\$(WindowsTargetPlatformVersion)\shared</KIT_SHARED_INC_PATH_WDK>
+    <IncludePath>$(CRT_IncludePath);$(KM_IncludePath);$(KIT_SHARED_IncludePath)</IncludePath>
+    <LibraryPath>$(WDKContentRoot)Lib\$(WindowsTargetPlatformVersion)\km\$(DDKPlatform);$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(KM_IncludePath);$(CRT_IncludePath);$(KIT_SHARED_IncludePath);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WindowsTargetPlatformVersion)\km\$(DDKPlatform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>

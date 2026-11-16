@@ -48,10 +48,16 @@ deploy/config/*.local.toml
 /drivers/sys-restore/**/Debug/
 /drivers/sys-restore/**/Release/
 /drivers/sys-restore/**/.vs/
+/drivers/sys-restore/.nuget-wdk/
 *.sys
 *.cer
 *.pfx
 /drivers/sys-restore/testcert/
+
+# --- 客户端整包二进制（源码/脚本入库，exe 本地打包） ---
+/deploy/client-package/*.exe
+/deploy/client-package/driver/*.sys
+/deploy/client-package/driver/*.cer
 
 # --- 日志与杂项 ---
 *.log

@@ -1,0 +1,44 @@
+SysRestore 自签测试证书版（Secure Boot=False 的试点机）
+======================================================
+
+把本包（或至少 driver\ + scripts\）拷到学生机：
+  C:\Program Files\YixueIDV\
+
+一、顺序（管理员）
+----------------
+  cd "C:\Program Files\YixueIDV"
+
+  1) 开测试模式并重启
+       powershell -ExecutionPolicy Bypass -File .\scripts\enable-testsigning.ps1
+
+  2) 重启后：导入测试证书 + 安装驱动
+       powershell -ExecutionPolicy Bypass -File .\scripts\install-testcert.ps1
+       powershell -ExecutionPolicy Bypass -File .\scripts\install-driver.ps1
+     （install-driver 会自动再跑一次 install-testcert）
+
+  3) 再重启一次（BOOT_START 过滤驱动生效）
+     不应再出现 0xc0000428；也不必再按 F8→7。
+
+  4) 开保护测试
+       .\scripts\restore-driver.ps1 protect-on
+       # 再重启后保护激活
+
+二、driver 目录应有
+------------------
+  SysRestoreDriver.sys          （已用测试证书签名）
+  SysRestoreDriver.inf
+  YixueIDV-SysRestore-Test.cer  （公钥，导入本机信任）
+  LICENSE / NOTICE
+
+  不要把 .pfx 放到学生机。
+
+三、若仍签名失败
+----------------
+  - bcdedit 确认 testsigning = Yes
+  - Confirm-SecureBootUEFI 应为 False
+  - certmgr 里本机「受信任的根证书颁发机构」和「受信任的发布者」应有 CN=YixueIDV-SysRestore-Test
+  - 进 WinRE 可删 Windows\System32\drivers\SysRestoreDriver.sys 急救
+
+四、构建机重新签名
+----------------
+  powershell -ExecutionPolicy Bypass -File deploy\scripts\sign-sysrestore-testcert.ps1
