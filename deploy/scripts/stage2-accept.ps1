@@ -1,4 +1,4 @@
-# 阶段 2 验收：Edge 在线、同步 checksum、清空缓存、Center 断开后 Edge 仍存活
+﻿# 阶段 2 验收：Edge 在线、同步 checksum、清空缓存、Center 断开后 Edge 仍存活
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

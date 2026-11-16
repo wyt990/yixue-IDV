@@ -5,8 +5,8 @@ use chrono::Utc;
 
 use crate::auth::AuthUser;
 use crate::models::{
-    DashboardEdgeRow, DashboardLabRow, DashboardOverview, DashboardStats, DashboardTaskRow,
-    Edge, edge_online,
+    DashboardEdgeRow, DashboardLabRow, DashboardOverview, DashboardStats, DashboardTaskRow, Edge,
+    edge_online,
 };
 use crate::state::AppState;
 
@@ -22,12 +22,11 @@ pub async fn stats(
     let images = count(&state, "SELECT COUNT(*) FROM images").await?;
     let edges_total = count(&state, "SELECT COUNT(*) FROM edges").await?;
 
-    let edge_rows = sqlx::query_as::<_, Edge>(&format!(
-        "SELECT {EDGE_COLS} FROM edges ORDER BY name"
-    ))
-    .fetch_all(&state.pool)
-    .await
-    .map_err(internal)?;
+    let edge_rows =
+        sqlx::query_as::<_, Edge>(&format!("SELECT {EDGE_COLS} FROM edges ORDER BY name"))
+            .fetch_all(&state.pool)
+            .await
+            .map_err(internal)?;
     let edges: Vec<DashboardEdgeRow> = edge_rows
         .into_iter()
         .map(|e| {
@@ -95,10 +94,7 @@ pub async fn stats(
     for (id, name, campus_name, lab_img, campus_img, client_count) in lab_rows {
         let (image_id, from_campus) = match lab_img.filter(|s| !s.is_empty()) {
             Some(id) => (Some(id), false),
-            None => (
-                campus_img.filter(|s| !s.is_empty()),
-                true,
-            ),
+            None => (campus_img.filter(|s| !s.is_empty()), true),
         };
         let default_image_name = if let Some(iid) = image_id {
             let n: Option<String> = sqlx::query_scalar("SELECT name FROM images WHERE id = ?")
@@ -146,11 +142,17 @@ async fn load_tasks(
     state: &AppState,
     sql: &str,
 ) -> Result<Vec<DashboardTaskRow>, (StatusCode, String)> {
-    let rows: Vec<(String, String, String, String, String, chrono::DateTime<Utc>)> =
-        sqlx::query_as(sql)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(internal)?;
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        chrono::DateTime<Utc>,
+    )> = sqlx::query_as(sql)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal)?;
     let mut out = Vec::with_capacity(rows.len());
     for (id, kind, state_s, name, error_message, updated_at) in rows {
         let progress_text = task_progress_text(state, &id).await?;
@@ -208,10 +210,13 @@ async fn task_progress_text(
     let Some((_, progress, detail)) = preferred else {
         return Ok("—".into());
     };
-    if !detail.is_empty()
-        && regex_like_gb(detail)
-    {
-        return Ok(detail.split('·').next().unwrap_or(detail).trim().to_string());
+    if !detail.is_empty() && regex_like_gb(detail) {
+        return Ok(detail
+            .split('·')
+            .next()
+            .unwrap_or(detail)
+            .trim()
+            .to_string());
     }
     if *progress > 0.0 {
         return Ok(format!("{}%", (*progress * 100.0).round() as i64));

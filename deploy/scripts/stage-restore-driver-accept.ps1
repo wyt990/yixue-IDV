@@ -1,4 +1,4 @@
-# Smoke: Center heartbeat returns desired_state; agent mock protect roundtrip.
+﻿# Smoke: Center heartbeat returns desired_state; agent mock protect roundtrip.
 # Usage: powershell -ExecutionPolicy Bypass -File deploy/scripts/stage-restore-driver-accept.ps1
 $ErrorActionPreference = "Stop"
 $Root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent

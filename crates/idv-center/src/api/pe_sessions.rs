@@ -105,13 +105,8 @@ pub async fn upsert_from_edge(
     }
 
     let note = format!("pe-checkin source={}", body.source);
-    let enrolled = crate::enroll::ensure_client_enrolled(
-        &state,
-        &body.mac,
-        &note,
-        body.last_seen,
-    )
-    .await?;
+    let enrolled =
+        crate::enroll::ensure_client_enrolled(&state, &body.mac, &note, body.last_seen).await?;
 
     if let Some(ref e) = enrolled {
         info!(

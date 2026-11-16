@@ -192,12 +192,23 @@ pub async fn bind_lab(
     let mut reboot_n = 0usize;
     if mode_changed {
         reboot_n = super::power::enqueue_reboots_for_lab(
-            &state.pool,
+            &state,
             &lab_id,
             &format!("mode_bind→{} auto-reboot", mode.name),
         )
         .await
         .unwrap_or(0);
+    }
+    // Push an immediate policy apply to every client in the lab (persistent
+    // agents receive it via long-poll; old agents still get it on heartbeat).
+    let macs: Vec<(String,)> = sqlx::query_as("SELECT mac FROM clients WHERE lab_id = ?")
+        .bind(&lab_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal)?;
+    for (mac,) in &macs {
+        let _ =
+            super::agent_commands::enqueue(&state, mac, "apply_policy", "", &user.0.username).await;
     }
     let _ = super::audit::record(
         &state.pool,

@@ -1,4 +1,4 @@
-# Stage 6 rolling: delta build/apply, exam schedule window, WOL/shutdown commands
+﻿# Stage 6 rolling: delta build/apply, exam schedule window, WOL/shutdown commands
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

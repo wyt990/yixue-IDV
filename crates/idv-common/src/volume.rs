@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn windows_lab_restore_keeps_persistent() {
-        let root = std::env::temp_dir().join(format!("idv-vol-{}", std::process::id()));
+        let root = crate::test_paths::temp_dir(&format!("idv-vol-{}", std::process::id()));
         let base = root.join("baseline");
         let live = root.join("live");
         let _ = std::fs::remove_dir_all(&root);

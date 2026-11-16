@@ -1,4 +1,4 @@
-# 阶段 1 API 验收：2 机房、≥10 MAC、镜像 checksum、重启持久化
+﻿# 阶段 1 API 验收：2 机房、≥10 MAC、镜像 checksum、重启持久化
 $ErrorActionPreference = "Stop"
 $base = "http://127.0.0.1:8080"
 

@@ -1,4 +1,4 @@
-# 阶段 3 验收：DHCP Offer、TFTP boot.ipxe、PE checkin、Center/Edge 可见会话、无任务提示
+﻿# 阶段 3 验收：DHCP Offer、TFTP boot.ipxe、PE checkin、Center/Edge 可见会话、无任务提示
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

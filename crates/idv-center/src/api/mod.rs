@@ -1,5 +1,6 @@
 mod admins;
 mod agent;
+mod agent_commands;
 mod assist;
 pub(crate) mod audit;
 mod auth;
@@ -8,6 +9,7 @@ mod clients;
 mod dashboard;
 mod delta_images;
 mod edge_agent;
+mod edge_bindings;
 mod edges;
 mod images;
 mod labs;
@@ -80,17 +82,11 @@ pub fn router() -> Router<AppState> {
             post(edges::purge_replica),
         )
         .route("/api/v1/edges/{id}/purge_all", post(edges::purge_all))
-        .route(
-            "/api/v1/edges/{id}/rotate_token",
-            post(edges::rotate_token),
-        )
+        .route("/api/v1/edges/{id}/rotate_token", post(edges::rotate_token))
         .route("/api/v1/scale/limits", get(edges::scale_limits))
         .route("/api/v1/modes", get(modes::list).post(modes::create))
         .route("/api/v1/modes/bindings", get(modes::list_bindings))
-        .route(
-            "/api/v1/modes/{id}/schedule",
-            post(modes::update_schedule),
-        )
+        .route("/api/v1/modes/{id}/schedule", post(modes::update_schedule))
         .route("/api/v1/modes/{id}", delete(modes::delete))
         .route("/api/v1/labs/{id}/mode", post(modes::bind_lab))
         .route("/api/v1/audit", get(audit::list))
@@ -138,10 +134,22 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/assist/sessions/{id}/ack", post(assist::ack))
         .route("/api/v1/agent/heartbeat", post(agent::heartbeat))
+        .route("/api/v1/agent/commands/next", get(agent_commands::next))
+        .route(
+            "/api/v1/agent/commands/{id}/report",
+            post(agent_commands::report),
+        )
+        .route(
+            "/api/v1/clients/{mac}/commands",
+            post(agent_commands::create),
+        )
         .route("/api/v1/agent/restore/report", post(agent::report_restore))
         .route("/api/v1/agent/usb/report", post(agent::report_usb))
         .route("/api/v1/agent/sessions", get(agent::list_sessions))
-        .route("/api/v1/images/recommend-delta", post(agent::recommend_delta))
+        .route(
+            "/api/v1/images/recommend-delta",
+            post(agent::recommend_delta),
+        )
         .route(
             "/api/v1/images/build-delta",
             post(delta_images::build_delta_image),
@@ -150,7 +158,10 @@ pub fn router() -> Router<AppState> {
             "/api/v1/images/apply-delta",
             post(delta_images::apply_delta_image),
         )
-        .route("/api/v1/power/commands", get(power::list).post(power::create))
+        .route(
+            "/api/v1/power/commands",
+            get(power::list).post(power::create),
+        )
         .route("/api/v1/power/commands/bulk", post(power::create_bulk))
         .route("/api/v1/power/commands/{id}/ack", post(power::ack))
         .route("/api/v1/tasks", get(tasks::list))
@@ -168,19 +179,14 @@ pub fn router() -> Router<AppState> {
             post(edge_agent::report_command),
         )
         .route("/api/v1/edge/images/{id}", get(edge_agent::image_meta))
-        .route(
-            "/api/v1/edge/images/{id}/blob",
-            get(edge_agent::image_blob),
-        )
+        .route("/api/v1/edge/images/{id}/blob", get(edge_agent::image_blob))
         .route("/api/v1/edge/tasks/claim", get(edge_agent::claim_task))
+        .route("/api/v1/edge/ip-bindings", get(edge_bindings::list))
         .route(
             "/api/v1/edge/tasks/targets/{id}/report",
             post(edge_agent::report_target),
         )
-        .route(
-            "/api/v1/edge/images/ingest",
-            put(edge_agent::ingest_image),
-        )
+        .route("/api/v1/edge/images/ingest", put(edge_agent::ingest_image))
         .route("/api/v1/pe-sessions", get(pe_sessions::list))
         .route(
             "/api/v1/edge/pe-sessions",

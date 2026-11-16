@@ -26,6 +26,8 @@ pub struct EdgeRuntime {
     pub client: reqwest::Client,
     pub sync_slots: Arc<tokio::sync::Semaphore>,
     pub host_metrics: Arc<crate::host_metrics::HostMetricsSampler>,
+    /// MAC -> Center-assigned IPv4 for the DHCP server (batch identity).
+    pub ip_bindings: crate::ip_bindings::IpBindings,
 }
 
 impl EdgeRuntime {
@@ -91,6 +93,24 @@ impl EdgeRuntime {
             self.node_token.parse().expect("token header"),
         );
         headers
+    }
+
+    /// Pull MAC -> assigned IPv4 bindings for this Edge's labs and cache them for DHCP.
+    pub async fn refresh_ip_bindings(&self) -> anyhow::Result<usize> {
+        let url = format!("{}/api/v1/edge/ip-bindings", self.center_url);
+        let resp = self.client.get(url).headers(self.headers()).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("ip-bindings failed: {status} {body}");
+        }
+        let doc: crate::ip_bindings::BindingsDoc = resp.json().await?;
+        let count = self.ip_bindings.replace(&doc).await;
+        let path = self.cache_dir.join("ip-bindings.json");
+        if let Err(err) = self.ip_bindings.save(&path).await {
+            warn!(error = %err, path = %path.display(), "persist DHCP reservations failed");
+        }
+        Ok(count)
     }
 
     pub async fn report_pe_session(
@@ -222,12 +242,7 @@ impl EdgeRuntime {
 
     pub async fn fetch_image_meta(&self, image_id: &str) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}/api/v1/edge/images/{image_id}", self.center_url);
-        let resp = self
-            .client
-            .get(url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let resp = self.client.get(url).headers(self.headers()).send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -322,12 +337,7 @@ impl EdgeRuntime {
 
     async fn next_command(&self) -> anyhow::Result<Option<EdgeCommand>> {
         let url = format!("{}/api/v1/edge/commands/next", self.center_url);
-        let resp = self
-            .client
-            .get(url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let resp = self.client.get(url).headers(self.headers()).send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -514,7 +524,11 @@ impl EdgeRuntime {
         Ok(())
     }
 
-    async fn sync_image(&self, command_id: &str, image_id: &str) -> anyhow::Result<(String, String)> {
+    async fn sync_image(
+        &self,
+        command_id: &str,
+        image_id: &str,
+    ) -> anyhow::Result<(String, String)> {
         let meta_url = format!("{}/api/v1/edge/images/{image_id}", self.center_url);
         let meta = self
             .client
@@ -533,7 +547,14 @@ impl EdgeRuntime {
         }
 
         let _ = self
-            .report(command_id, "running", 0.02, "", tmp.display().to_string(), "")
+            .report(
+                command_id,
+                "running",
+                0.02,
+                "",
+                tmp.display().to_string(),
+                "",
+            )
             .await;
 
         // Same-machine / shared volume: hardlink or copy instead of HTTP-pulling tens of GB.
@@ -627,7 +648,8 @@ impl EdgeRuntime {
                 let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
                 let allowed = self.sync_bandwidth_bps as f64 * elapsed;
                 if window_bytes as f64 > allowed {
-                    let sleep_secs = (window_bytes as f64 / self.sync_bandwidth_bps as f64) - elapsed;
+                    let sleep_secs =
+                        (window_bytes as f64 / self.sync_bandwidth_bps as f64) - elapsed;
                     if sleep_secs > 0.0 {
                         tokio::time::sleep(Duration::from_secs_f64(sleep_secs.min(2.0))).await;
                     }

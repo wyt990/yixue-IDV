@@ -1,0 +1,59 @@
+SysRestore 驱动导致开机蓝屏（0xC0000428 / 0x7B / 0xC0000225）的 WinRE 恢复步骤
+================================================================================
+
+前提：驱动被注册为 BOOT_START 卷过滤驱动（UpperFilters）。签名无效或驱动加载
+失败时，Windows 无法挂载启动卷，于是报：
+  0xC0000428  Windows cannot verify the digital signature for this file
+  0x7B        INACCESSIBLE_BOOT_DEVICE
+  0xC0000225  设备/启动项异常
+仅删除 SysRestoreDriver.sys 文件不能修复（服务/过滤项仍引用它），必须移除
+UpperFilters 与服务注册项。
+
+一、进入 WinRE
+--------------
+方式 A：开机看到 Windows 徽标前强制关机（长按电源 4 秒），连续 2~3 次，进入
+        “自动修复” → 疑难解答 → 高级选项 → 命令提示符。
+方式 B：用 Windows 安装 U 盘启动 → 修复计算机 → 疑难解答 → 高级选项 →
+        命令提示符。
+
+二、确认系统盘和当前 ControlSet
+------------------------------
+  dir C:\Windows\System32\config\SYSTEM        （不是 C: 就换 D:）
+  reg load HKLM\IDV C:\Windows\System32\config\SYSTEM
+  reg query HKLM\IDV\Select /v Current
+  :: 输出 Current = 0x1 表示 ControlSet001，0x2 即 ControlSet002
+
+三、移除 UpperFilters 中的 SysRestoreDriver
+------------------------------------------
+  reg query "HKLM\IDV\ControlSet001\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}" /v UpperFilters
+
+  :: 若输出中包含 SysRestoreDriver，执行（会清空该值）：
+  reg add "HKLM\IDV\ControlSet001\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}" /v UpperFilters /t REG_MULTI_SZ /d "" /f
+
+  :: 注意：UpperFilters 正常可能还有 volsnap 等其它过滤驱动。若原列表不止
+  :: SysRestoreDriver 一个，请改用以下命令保留其它项（示例假设只剩 volsnap）：
+  :: reg add "HKLM\IDV\ControlSet001\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}" /v UpperFilters /t REG_MULTI_SZ /d "volsnap" /f
+
+  :: 若 Current 是 0x2，把上面的 ControlSet001 换成 ControlSet002。
+
+四、删除服务注册项（避免下次启动再加载）
+--------------------------------------
+  reg query "HKLM\IDV\ControlSet001\Services\SysRestoreDriver"
+  reg delete "HKLM\IDV\ControlSet001\Services\SysRestoreDriver" /f
+
+五、卸载注册表 hive 并重启
+--------------------------
+  reg unload HKLM\IDV
+  wpeutil reboot        （或直接关闭 WinRE 重启）
+
+六、进入系统后（可选清理）
+--------------------------
+  - 删除 C:\Windows\System32\drivers\SysRestoreDriver.sys
+  - 若不再测试测试签名：bcdedit /set testsigning off
+  - 用正常的 uninstall-driver.ps1 做一次完整清理/确认
+
+七、预防
+--------
+  - 安装驱动前务必通过 install-driver.ps1 的签名/测试模式/Secure Boot 校验
+  - 在虚拟机（快照）或可随时重装的试点机上先验证
+  - 驱动签名必须用构建机 sign-sysrestore-testcert.ps1 生成，禁止手工拷贝未签名 .sys

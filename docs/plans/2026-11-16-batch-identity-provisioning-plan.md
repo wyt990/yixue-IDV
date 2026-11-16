@@ -2,7 +2,7 @@
 
 > 日期：2026-11-16
 > 设计：[2026-11-16-batch-identity-provisioning-design.md](./2026-11-16-batch-identity-provisioning-design.md)
-> 状态：待实施
+> 状态：**已实施（2026-11-16）**；真机/VM 验收（阶段 7）待执行
 
 ## 阶段 0：准备
 

@@ -1,18 +1,18 @@
+mod netinfo;
 mod policy_store;
 mod restore_driver;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
 use idv_common::endpoint_policy::DesiredEndpointState;
-use idv_common::image_format::{
-    ImageHeader, default_partitions, pack_image, unpack_image,
-};
+use idv_common::image_format::{ImageHeader, default_partitions, pack_image, unpack_image};
 use idv_common::restore::{apply_partition_restore, should_restore_now};
 use idv_common::usb_policy::apply_usb_policy;
 use idv_common::volume::{
-    BootHookInstall, VolumeBackend, VolumeLayout, apply_windows_lab_restore, write_boot_hook,
-    write_lab_baseline, LabVolumeSnapshot,
+    BootHookInstall, LabVolumeSnapshot, VolumeBackend, VolumeLayout, apply_windows_lab_restore,
+    write_boot_hook, write_lab_baseline,
 };
 use idv_common::{Error, Result, init_tracing, load_toml_file};
 use policy_store::{LocalPolicyStore, default_state_dir};
@@ -21,7 +21,11 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 #[derive(Debug, Parser)]
-#[command(name = "idv-agent", about = "易学 IDV 客户端代理（还原/模式）", version)]
+#[command(
+    name = "idv-agent",
+    about = "易学 IDV 客户端代理（还原/模式）",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -146,6 +150,18 @@ enum Commands {
         #[arg(long, default_value = "heartbeat")]
         trigger: String,
     },
+    /// Resident daemon: heartbeat loop + long-poll command channel (console mode)
+    Daemon {
+        #[arg(short, long, default_value = "deploy/config/agent.toml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        heartbeat_secs: u64,
+    },
+    /// Windows service entry (falls back to console daemon if not started by SCM)
+    Service {
+        #[arg(short, long, default_value = "deploy/config/agent.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,10 +178,15 @@ enum RestoreDriverCmd {
 struct AgentConfig {
     #[serde(default = "default_center")]
     center_url: String,
+    /// Empty / "auto" = auto-detect the NIC MAC that routes to Center.
     #[serde(default = "default_mac")]
     mac: String,
+    /// Empty = use the current Windows computer name.
     #[serde(default)]
     hostname: String,
+    /// Heartbeat interval for daemon/service mode (seconds).
+    #[serde(default = "default_heartbeat_secs")]
+    heartbeat_secs: u64,
     #[serde(default = "default_log")]
     log: String,
 }
@@ -174,10 +195,16 @@ fn default_center() -> String {
     "http://127.0.0.1:8080".into()
 }
 fn default_mac() -> String {
-    "02:00:00:00:00:01".into()
+    String::new()
 }
 fn default_log() -> String {
     "info,idv_agent=debug".into()
+}
+fn default_heartbeat_secs() -> u64 {
+    5
+}
+fn default_ip_mode() -> String {
+    "static".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +243,9 @@ struct DesiredIdentity {
     gateway: String,
     #[serde(default)]
     dns: String,
+    /// dhcp = IP comes from Edge DHCP reservation; static = agent configures it.
+    #[serde(default = "default_ip_mode")]
+    ip_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +267,11 @@ struct HeartbeatBody<'a> {
     pending_reboot: bool,
     driver_status: &'a str,
     local_ip: &'a str,
+    current_hostname: &'a str,
+    identity_state: &'a str,
+    last_error: &'a str,
+    frozen: bool,
+    armed: bool,
 }
 
 #[tokio::main]
@@ -248,7 +283,8 @@ async fn main() -> anyhow::Result<()> {
             init_tracing(&cfg.log);
             println!(
                 "service=idv-agent status=ok center={} mac={}",
-                cfg.center_url, cfg.mac
+                cfg.center_url,
+                effective_mac(&cfg).unwrap_or_else(|_| "auto".into())
             );
         }
         Commands::Heartbeat { config, trigger } => {
@@ -263,11 +299,7 @@ async fn main() -> anyhow::Result<()> {
                 policy.should_restore,
                 policy.schedule_active,
                 policy.usb_restricted,
-                policy
-                    .mode
-                    .as_ref()
-                    .map(|m| m.name.as_str())
-                    .unwrap_or("-"),
+                policy.mode.as_ref().map(|m| m.name.as_str()).unwrap_or("-"),
                 policy.message
             );
             if let Some(ref d) = policy.desired_state {
@@ -416,17 +448,12 @@ async fn main() -> anyhow::Result<()> {
                 "{}/api/v1/software/jobs/{}/blob?mac={}",
                 cfg.center_url.trim_end_matches('/'),
                 job_id,
-                urlencoding_lite(&cfg.mac)
+                urlencoding_lite(&effective_mac(&cfg)?)
             );
             let client = http_client();
-            let size_hint = job
-                .get("size_bytes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let size_hint = job.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
             let resp = client.get(&url).send().await?.error_for_status()?;
-            let total = resp
-                .content_length()
-                .unwrap_or(size_hint);
+            let total = resp.content_length().unwrap_or(size_hint);
             use futures_util::StreamExt;
             use idv_common::image_format::format_bytes_progress;
             let mut stream = resp.bytes_stream();
@@ -562,17 +589,11 @@ async fn main() -> anyhow::Result<()> {
                         .filter(|s| !s.is_empty())
                         .collect();
                     let st = drv.protect_on(&vols)?;
-                    println!(
-                        "protect_on_ok frozen={} detail={}",
-                        st.frozen, st.detail
-                    );
+                    println!("protect_on_ok frozen={} detail={}", st.frozen, st.detail);
                 }
                 RestoreDriverCmd::ProtectOff => {
                     let st = drv.protect_off()?;
-                    println!(
-                        "protect_off_ok frozen={} detail={}",
-                        st.frozen, st.detail
-                    );
+                    println!("protect_off_ok frozen={} detail={}", st.frozen, st.detail);
                 }
             }
         }
@@ -587,6 +608,34 @@ async fn main() -> anyhow::Result<()> {
             let dir = state_dir.unwrap_or_else(default_state_dir);
             let summary = sync_and_maybe_apply(&cfg, &dir, apply, &trigger).await?;
             println!("{summary}");
+        }
+        Commands::Daemon {
+            config,
+            heartbeat_secs,
+        } => {
+            let cfg = load_cfg(&config).await?;
+            init_tracing(&cfg.log);
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let stop_ctrlc = stop.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    stop_ctrlc.store(true, Ordering::SeqCst);
+                }
+            });
+            run_daemon(cfg, heartbeat_secs.max(2), stop).await?;
+        }
+        Commands::Service { config } => {
+            let cfg = load_cfg(&config).await?;
+            init_tracing(&cfg.log);
+            #[cfg(windows)]
+            {
+                winsvc::run(config.clone(), cfg.heartbeat_secs.max(2)).await?;
+            }
+            #[cfg(not(windows))]
+            {
+                let stop = std::sync::Arc::new(AtomicBool::new(false));
+                run_daemon(cfg, cfg.heartbeat_secs.max(2), stop).await?;
+            }
         }
     }
     Ok(())
@@ -603,7 +652,7 @@ async fn sync_and_maybe_apply(
     let policy = heartbeat(cfg, trigger, &status).await?;
     let mut lines = Vec::new();
     lines.push(format!("msg={}", policy.message));
-    if let Some(desired) = policy.desired_state {
+    if let Some(desired) = policy.desired_state.clone() {
         if store.queue_if_newer(desired.clone()) {
             store.save(state_dir).map_err(|e| Error::Other(e))?;
             lines.push(format!(
@@ -637,17 +686,73 @@ async fn sync_and_maybe_apply(
 
     let mut need_rename_reboot = false;
     if let Some(ref ident) = policy.desired_identity {
-        match apply_desired_identity(ident) {
-            Ok((msg, reboot)) => {
-                lines.push(msg);
+        let driver = default_driver();
+        let drv_status = driver
+            .status()
+            .map_err(|e| Error::Other(anyhow::anyhow!("driver status: {e}")))?;
+        let want_host = ident.hostname.trim().to_string();
+        let want_ip = ident.ip.trim().to_string();
+        let ip_mode = if ident.ip_mode.trim().is_empty() {
+            "static".to_string()
+        } else {
+            ident.ip_mode.trim().to_ascii_lowercase()
+        };
+        let have_host = current_computer_name();
+        let have_ip = netinfo::detect_local_ip(&cfg.center_url);
+        let want_frozen = policy
+            .desired_state
+            .as_ref()
+            .map(|d| d.restore.enabled && d.restore.frozen)
+            .unwrap_or(false);
+        let volumes = policy
+            .desired_state
+            .as_ref()
+            .map(|d| d.restore.protect_volumes.clone())
+            .unwrap_or_else(|| vec!["system".into()]);
+
+        let action = decide_identity_action(&IdentityDecisionInput {
+            want_host: want_host.clone(),
+            have_host: have_host.clone(),
+            want_ip: want_ip.clone(),
+            have_ip: have_ip.clone(),
+            ip_mode: ip_mode.clone(),
+            want_frozen,
+            frozen: drv_status.frozen,
+            armed: drv_status.armed,
+        });
+        match execute_identity_action(
+            action,
+            ident,
+            &ip_mode,
+            driver.as_ref(),
+            want_frozen,
+            &volumes,
+            &cfg.center_url,
+        ) {
+            Ok((state, reboot)) => {
+                lines.push(format!("identity={state}"));
+                write_identity_report(&state, "");
                 need_rename_reboot = reboot;
             }
-            Err(e) => lines.push(format!("identity_err={e}")),
+            Err(err) => {
+                let msg = format!("identity_err={err}");
+                lines.push(msg);
+                write_identity_report("error", &err.to_string());
+            }
         }
     }
 
+    // Identity convergence may need a reboot (rename / arm / disarm). Do it
+    // before pending-store application to avoid fighting the protection state.
+    if need_rename_reboot {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        issue_windows_power("reboot")?;
+        lines.push("identity_reboot=1".into());
+        return Ok(lines.join(" · "));
+    }
+
     // Reboot from Center: apply pending freeze first, then reboot.
-    let should_apply = apply || power_kind == "reboot" || need_rename_reboot;
+    let should_apply = apply || power_kind == "reboot";
     if should_apply {
         lines.push(apply_pending_store(&mut store, state_dir)?);
     }
@@ -658,53 +763,197 @@ async fn sync_and_maybe_apply(
         // Give ack a moment to flush before process dies with the OS.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         issue_windows_power(&power_kind)?;
-    } else if need_rename_reboot {
-        lines.push("identity_rename_reboot=1".into());
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        issue_windows_power("reboot")?;
     }
 
     Ok(lines.join(" · "))
 }
 
-/// Returns (detail, needs_reboot_for_rename).
-fn apply_desired_identity(ident: &DesiredIdentity) -> Result<(String, bool)> {
-    let want_host = ident.hostname.trim();
-    let want_ip = ident.ip.trim();
-    if want_host.is_empty() && want_ip.is_empty() {
-        return Ok(("identity_skip=empty".into(), false));
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityAction {
+    None,
+    /// Hostname mismatch while volume protection is on: disarm, reboot.
+    DisarmReboot,
+    /// Hostname mismatch while unprotected: set IP (static), rename, reboot.
+    RenameReboot,
+    /// Static IP mismatch only: configure the address, no reboot.
+    SetStaticIp,
+    /// Identity already correct and policy wants freeze: arm, reboot.
+    ArmReboot,
+    /// DHCP mode: release + renew to pick up Center's reservation.
+    RenewDhcp,
+}
 
-    let mut parts = Vec::new();
-    let mut need_reboot = false;
+#[derive(Debug, Clone)]
+struct IdentityDecisionInput {
+    want_host: String,
+    have_host: String,
+    want_ip: String,
+    have_ip: String,
+    ip_mode: String,
+    want_frozen: bool,
+    frozen: bool,
+    armed: bool,
+}
 
-    if !want_ip.is_empty() {
-        let cur = detect_local_ip("8.8.8.8:80");
-        if cur != want_ip {
-            set_windows_static_ip(
-                want_ip,
-                ident.netmask.trim(),
-                ident.gateway.trim(),
-                ident.dns.trim(),
-            )?;
-            parts.push(format!("ip_set={want_ip}"));
+/// Pure decision logic (unit tested). At most one action per call.
+fn decide_identity_action(i: &IdentityDecisionInput) -> IdentityAction {
+    let host_mismatch =
+        !i.want_host.is_empty() && !i.have_host.eq_ignore_ascii_case(i.want_host.trim());
+    let ip_mismatch =
+        i.ip_mode == "static" && !i.want_ip.is_empty() && i.have_ip.trim() != i.want_ip.trim();
+
+    if host_mismatch {
+        return if i.frozen || i.armed {
+            IdentityAction::DisarmReboot
         } else {
-            parts.push(format!("ip_ok={want_ip}"));
+            IdentityAction::RenameReboot
+        };
+    }
+    if ip_mismatch {
+        return IdentityAction::SetStaticIp;
+    }
+    if i.want_frozen && !(i.frozen || i.armed) {
+        return IdentityAction::ArmReboot;
+    }
+    if i.ip_mode == "dhcp" && !i.want_ip.is_empty() && i.have_ip.trim() != i.want_ip.trim() {
+        return IdentityAction::RenewDhcp;
+    }
+    IdentityAction::None
+}
+
+/// Execute at most one convergence action. Returns `(state, reboot_required)`.
+#[allow(clippy::too_many_arguments)]
+fn execute_identity_action(
+    action: IdentityAction,
+    ident: &DesiredIdentity,
+    ip_mode: &str,
+    driver: &dyn restore_driver::RestoreDriver,
+    want_frozen: bool,
+    volumes: &[String],
+    center_url: &str,
+) -> Result<(String, bool)> {
+    match action {
+        IdentityAction::None => Ok(("ok".into(), false)),
+        IdentityAction::DisarmReboot => {
+            apply_frozen_state(driver, false, volumes)?;
+            Ok(("disarm_reboot".into(), true))
+        }
+        IdentityAction::RenameReboot => {
+            if ip_mode == "static" {
+                let iface = netinfo::interface_for_center(center_url);
+                set_static_ip_with_interface(ident, iface.as_ref())?;
+            }
+            rename_windows_computer(ident.hostname.trim())?;
+            Ok(("rename_reboot".into(), true))
+        }
+        IdentityAction::SetStaticIp => {
+            let iface = netinfo::interface_for_center(center_url);
+            set_static_ip_with_interface(ident, iface.as_ref())?;
+            Ok(("static_ip_set".into(), false))
+        }
+        IdentityAction::ArmReboot => {
+            if ip_mode == "static" {
+                let iface = netinfo::interface_for_center(center_url);
+                let _ = set_static_ip_with_interface(ident, iface.as_ref());
+            }
+            apply_frozen_state(driver, want_frozen, volumes)?;
+            Ok(("arm_reboot".into(), true))
+        }
+        IdentityAction::RenewDhcp => {
+            let iface = netinfo::interface_for_center(center_url)
+                .ok_or_else(|| anyhow::anyhow!("cannot find interface that routes to center"))?;
+            if should_renew_dhcp(&iface.ip, ident.ip.trim()) {
+                netinfo::renew_dhcp(&iface.alias)?;
+                Ok(("dhcp_renew".into(), false))
+            } else {
+                Ok(("dhcp_wait".into(), false))
+            }
         }
     }
+}
 
-    if !want_host.is_empty() {
-        let cur = current_computer_name();
-        if !cur.eq_ignore_ascii_case(want_host) {
-            rename_windows_computer(want_host)?;
-            parts.push(format!("hostname_set={want_host}"));
-            need_reboot = true;
-        } else {
-            parts.push(format!("hostname_ok={want_host}"));
-        }
+fn set_static_ip_with_interface(
+    ident: &DesiredIdentity,
+    iface: Option<&netinfo::NetInterface>,
+) -> Result<()> {
+    let want = ident.ip.trim();
+    if want.is_empty() {
+        return Ok(());
     }
+    let iface = iface.ok_or_else(|| {
+        Error::Other(anyhow::anyhow!(
+            "cannot find interface that routes to center (required for static IP)"
+        ))
+    })?;
+    if iface.ip.trim() == want {
+        return Ok(());
+    }
+    set_windows_static_ip(
+        &iface.alias,
+        want,
+        ident.netmask.trim(),
+        ident.gateway.trim(),
+        ident.dns.trim(),
+    )
+}
 
-    Ok((parts.join(","), need_reboot))
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IdentityReport {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    last_error: String,
+    #[serde(default)]
+    last_renew_ip: String,
+    #[serde(default)]
+    last_renew_at: u64,
+}
+
+fn identity_report_path() -> PathBuf {
+    default_state_dir().join("identity-state.json")
+}
+
+fn load_identity_report() -> IdentityReport {
+    std::fs::read(identity_report_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<IdentityReport>(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_identity_report(report: &IdentityReport) {
+    let path = identity_report_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(report) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn write_identity_report(state: &str, error: &str) {
+    let mut report = load_identity_report();
+    report.state = state.to_string();
+    report.last_error = error.to_string();
+    save_identity_report(&report);
+}
+
+/// Avoid DHCP release/renew storms: at most once per 5 minutes for the same IP.
+fn should_renew_dhcp(have_ip: &str, want_ip: &str) -> bool {
+    if want_ip.is_empty() || have_ip.trim() == want_ip.trim() {
+        return false;
+    }
+    let mut report = load_identity_report();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if report.last_renew_ip == have_ip.trim() && now.saturating_sub(report.last_renew_at) < 300 {
+        return false;
+    }
+    report.last_renew_ip = have_ip.trim().to_string();
+    report.last_renew_at = now;
+    save_identity_report(&report);
+    true
 }
 
 fn current_computer_name() -> String {
@@ -713,7 +962,13 @@ fn current_computer_name() -> String {
         .unwrap_or_default()
 }
 
-fn set_windows_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) -> Result<()> {
+fn set_windows_static_ip(
+    alias: &str,
+    ip: &str,
+    netmask: &str,
+    gateway: &str,
+    dns: &str,
+) -> Result<()> {
     #[cfg(windows)]
     {
         let mask = if netmask.is_empty() {
@@ -722,18 +977,7 @@ fn set_windows_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) -> R
             netmask
         };
         let dns_arg = if dns.is_empty() { gateway } else { dns };
-        let alias_cmd = r#"$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1; if (-not $a) { throw 'no adapter' }; $a.Name"#;
-        let alias_out = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", alias_cmd])
-            .output()
-            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-        if !alias_out.status.success() {
-            return Err(Error::Other(anyhow::anyhow!(
-                "adapter lookup failed: {}",
-                String::from_utf8_lossy(&alias_out.stderr)
-            )));
-        }
-        let alias = String::from_utf8_lossy(&alias_out.stdout).trim().to_string();
+        let alias = alias.trim();
         if alias.is_empty() {
             return Err(Error::Other(anyhow::anyhow!("empty adapter alias")));
         }
@@ -778,7 +1022,7 @@ fn set_windows_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) -> R
     }
     #[cfg(not(windows))]
     {
-        let _ = (ip, netmask, gateway, dns);
+        let _ = (alias, ip, netmask, gateway, dns);
         Err(Error::Other(anyhow::anyhow!(
             "static IP only supported on Windows"
         )))
@@ -895,26 +1139,6 @@ async fn ack_power(cfg: &AgentConfig, id: &str, ok: bool, detail: &str) -> Resul
     Ok(())
 }
 
-fn detect_local_ip(center_url: &str) -> String {
-    let host = center_url
-        .trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("8.8.8.8");
-    let addr = format!("{host}:80");
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect(&addr)?;
-            s.local_addr()
-        })
-        .ok()
-        .map(|a| a.ip().to_string())
-        .filter(|ip| ip != "0.0.0.0")
-        .unwrap_or_default()
-}
-
 async fn load_cfg(path: &PathBuf) -> Result<AgentConfig> {
     if path.exists() {
         load_toml_file(path)
@@ -922,9 +1146,45 @@ async fn load_cfg(path: &PathBuf) -> Result<AgentConfig> {
         Ok(AgentConfig {
             center_url: default_center(),
             mac: default_mac(),
-            hostname: "lab-pc".into(),
+            hostname: String::new(),
+            heartbeat_secs: default_heartbeat_secs(),
             log: default_log(),
         })
+    }
+}
+
+/// Explicit `mac` wins; empty/"auto" resolves the NIC that routes to Center.
+fn effective_mac(cfg: &AgentConfig) -> Result<String> {
+    let configured = cfg.mac.trim();
+    if !configured.is_empty() && !configured.eq_ignore_ascii_case("auto") {
+        let mac = netinfo::normalize_mac(configured);
+        if mac.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "invalid mac in agent.toml: '{configured}'"
+            )));
+        }
+        return Ok(mac);
+    }
+    let iface = netinfo::interface_for_center(&cfg.center_url).ok_or_else(|| {
+        Error::Other(anyhow::anyhow!(
+            "cannot auto-detect MAC for center {}; set mac explicitly or check network/PowerShell",
+            cfg.center_url
+        ))
+    })?;
+    if iface.mac.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "auto-detected interface has empty MAC"
+        )));
+    }
+    Ok(iface.mac)
+}
+
+fn effective_hostname(cfg: &AgentConfig) -> String {
+    let configured = cfg.hostname.trim();
+    if configured.is_empty() {
+        current_computer_name()
+    } else {
+        configured.to_string()
     }
 }
 
@@ -937,19 +1197,31 @@ async fn heartbeat(
         "{}/api/v1/agent/heartbeat",
         cfg.center_url.trim_end_matches('/')
     );
-    let local_ip = detect_local_ip(&cfg.center_url);
+    let mac = effective_mac(cfg)?;
+    let hostname = effective_hostname(cfg);
+    let current_hostname = current_computer_name();
+    let local_ip = netinfo::detect_local_ip(&cfg.center_url);
+    let report = load_identity_report();
+    let driver = default_driver().status().ok();
+    let frozen = driver.as_ref().map(|s| s.frozen).unwrap_or(false);
+    let armed = driver.as_ref().map(|s| s.armed).unwrap_or(false);
     let client = http_client();
     let resp = client
         .post(url)
         .json(&HeartbeatBody {
-            mac: &cfg.mac,
-            hostname: &cfg.hostname,
+            mac: &mac,
+            hostname: &hostname,
             agent_version: env!("CARGO_PKG_VERSION"),
             trigger,
             applied_revision: status.applied_revision,
             pending_reboot: status.pending_reboot,
             driver_status: &status.driver_status,
             local_ip: &local_ip,
+            current_hostname: &current_hostname,
+            identity_state: &report.state,
+            last_error: &report.last_error,
+            frozen,
+            armed,
         })
         .send()
         .await
@@ -976,9 +1248,10 @@ async fn run_restore(
     baseline_root: Option<&PathBuf>,
     trigger: &str,
 ) -> Result<()> {
-    let mode = policy.mode.as_ref().ok_or_else(|| {
-        Error::Other(anyhow::anyhow!("no mode policy; bind lab mode first"))
-    })?;
+    let mode = policy
+        .mode
+        .as_ref()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("no mode policy; bind lab mode first")))?;
     if !should_restore_now(&mode.restore, trigger) {
         println!("skip_restore mode={} restore={}", mode.name, mode.restore);
         report(cfg, true, "skipped by policy").await?;
@@ -1047,7 +1320,10 @@ async fn run_restore(
     let detail = log.join("; ");
     report(cfg, true, &detail).await?;
     info!(%detail, "restore applied");
-    println!("restore_ok mode={} backend={} detail={}", mode.name, backend, detail);
+    println!(
+        "restore_ok mode={} backend={} detail={}",
+        mode.name, backend, detail
+    );
     Ok(())
 }
 
@@ -1056,11 +1332,12 @@ async fn report(cfg: &AgentConfig, ok: bool, detail: &str) -> Result<()> {
         "{}/api/v1/agent/restore/report",
         cfg.center_url.trim_end_matches('/')
     );
+    let mac = effective_mac(cfg)?;
     let client = http_client();
     let resp = client
         .post(url)
         .json(&serde_json::json!({
-            "mac": cfg.mac,
+            "mac": mac,
             "ok": ok,
             "detail": detail,
         }))
@@ -1100,11 +1377,12 @@ async fn report_usb(cfg: &AgentConfig, enforced: bool, detail: &str) -> Result<(
         "{}/api/v1/agent/usb/report",
         cfg.center_url.trim_end_matches('/')
     );
+    let mac = effective_mac(cfg)?;
     let client = http_client();
     let resp = client
         .post(url)
         .json(&serde_json::json!({
-            "mac": cfg.mac,
+            "mac": mac,
             "enforced": enforced,
             "detail": detail,
         }))
@@ -1121,3 +1399,411 @@ async fn report_usb(cfg: &AgentConfig, enforced: bool, detail: &str) -> Result<(
     Ok(())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AgentCommand {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunProgramPayload {
+    path: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+/// Long-poll Center for one command (returns None on the wait timeout).
+async fn poll_command(cfg: &AgentConfig, mac: &str) -> Result<Option<AgentCommand>> {
+    let url = format!(
+        "{}/api/v1/agent/commands/next?mac={}&wait=20",
+        cfg.center_url.trim_end_matches('/'),
+        urlencoding_lite(mac)
+    );
+    let resp = http_client()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Other(anyhow::anyhow!(
+            "command poll failed: {status} {body}"
+        )));
+    }
+    resp.json::<Option<AgentCommand>>()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))
+}
+
+async fn report_command(cfg: &AgentConfig, id: &str, ok: bool, detail: &str) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/agent/commands/{id}/report",
+        cfg.center_url.trim_end_matches('/')
+    );
+    let resp = http_client()
+        .post(&url)
+        .json(&serde_json::json!({ "ok": ok, "detail": detail }))
+        .send()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Other(anyhow::anyhow!(
+            "command report failed: {status} {body}"
+        )));
+    }
+    Ok(())
+}
+
+async fn execute_agent_command(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    sync_lock: &tokio::sync::Mutex<()>,
+    cmd: &AgentCommand,
+    mac: &str,
+) -> Result<()> {
+    let kind = cmd.kind.as_str();
+    if matches!(kind, "apply_policy" | "sync_policy") {
+        let _guard = sync_lock.lock().await;
+        let summary = sync_and_maybe_apply(cfg, state_dir, true, "command").await?;
+        report_command(cfg, &cmd.id, true, &summary).await?;
+        return Ok(());
+    }
+
+    if matches!(kind, "reboot" | "shutdown") {
+        let power_id = serde_json::from_str::<serde_json::Value>(&cmd.payload)
+            .ok()
+            .and_then(|v| {
+                v.get("power_id")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if !power_id.is_empty() {
+            let _ = ack_power(cfg, &power_id, true, "agent_command").await;
+        }
+        report_command(cfg, &cmd.id, true, &format!("{kind}_issued")).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        issue_windows_power(kind)?;
+        return Ok(());
+    }
+
+    if kind == "open_url" {
+        let url = serde_json::from_str::<serde_json::Value>(&cmd.payload)
+            .ok()
+            .and_then(|v| v.get("url").and_then(|x| x.as_str()).map(str::to_string))
+            .unwrap_or_else(|| cmd.payload.trim().to_string());
+        if url.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!("open_url missing url")));
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", &url])
+                .spawn()
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        }
+        report_command(cfg, &cmd.id, true, &format!("open_url={url}")).await?;
+        return Ok(());
+    }
+
+    if kind == "run_program" {
+        let payload: RunProgramPayload = serde_json::from_str(&cmd.payload)
+            .map_err(|e| Error::Other(anyhow::anyhow!("invalid run_program payload: {e}")))?;
+        #[cfg(windows)]
+        {
+            std::process::Command::new(&payload.path)
+                .args(&payload.args)
+                .spawn()
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        }
+        report_command(cfg, &cmd.id, true, &format!("run_program={}", payload.path)).await?;
+        return Ok(());
+    }
+
+    if kind == "assist_ack" {
+        report_command(cfg, &cmd.id, true, "assist_signaled").await?;
+        return Ok(());
+    }
+
+    report_command(cfg, &cmd.id, false, &format!("unsupported kind: {kind}")).await?;
+    let _ = mac;
+    Ok(())
+}
+
+/// Resident loop shared by console daemon and Windows service.
+async fn run_daemon(
+    cfg: AgentConfig,
+    heartbeat_secs: u64,
+    stop: std::sync::Arc<AtomicBool>,
+) -> Result<()> {
+    let state_dir = default_state_dir();
+    let cfg = std::sync::Arc::new(cfg);
+    let sync_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+    let hb_cfg = cfg.clone();
+    let hb_dir = state_dir.clone();
+    let hb_lock = sync_lock.clone();
+    let hb_stop = stop.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        loop {
+            if hb_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            {
+                let _guard = hb_lock.lock().await;
+                if let Err(err) = sync_and_maybe_apply(&hb_cfg, &hb_dir, true, "heartbeat").await {
+                    eprintln!("idv-agent: heartbeat failed: {err}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(heartbeat_secs.max(2))).await;
+        }
+    });
+
+    while !stop.load(Ordering::SeqCst) {
+        let mac = match effective_mac(&cfg) {
+            Ok(mac) => mac,
+            Err(err) => {
+                eprintln!("idv-agent: {err}");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        match poll_command(&cfg, &mac).await {
+            Ok(Some(cmd)) => {
+                if let Err(err) =
+                    execute_agent_command(&cfg, &state_dir, &sync_lock, &cmd, &mac).await
+                {
+                    eprintln!("idv-agent: command {} failed: {err}", cmd.id);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("idv-agent: {err}");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+    heartbeat_task.abort();
+    Ok(())
+}
+
+#[cfg(windows)]
+mod winsvc {
+    use std::ffi::{OsStr, c_void};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    use windows_sys::Win32::Foundation::{ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, GetLastError};
+    use windows_sys::Win32::System::Services::*;
+
+    static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    static CONFIG: OnceLock<PathBuf> = OnceLock::new();
+    static HEARTBEAT: OnceLock<u64> = OnceLock::new();
+
+    const SERVICE_NAME: &str = "idv-agent";
+
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn report(handle: SERVICE_STATUS_HANDLE, state: u32, accepted: u32) {
+        let status = SERVICE_STATUS {
+            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState: state,
+            dwControlsAccepted: accepted,
+            dwWin32ExitCode: 0,
+            dwServiceSpecificExitCode: 0,
+            dwCheckPoint: 1,
+            dwWaitHint: 10_000,
+        };
+        unsafe {
+            SetServiceStatus(handle, &status);
+        }
+    }
+
+    unsafe extern "system" fn handler(
+        control: u32,
+        _event: u32,
+        _data: *mut c_void,
+        _context: *mut c_void,
+    ) -> u32 {
+        if (control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN)
+            && let Some(stop) = STOP.get()
+        {
+            stop.store(true, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
+        let name = wide(SERVICE_NAME);
+        let handle = unsafe {
+            RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(handler), std::ptr::null())
+        };
+        report(handle, SERVICE_START_PENDING, 0);
+        report(
+            handle,
+            SERVICE_RUNNING,
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        );
+        let config = CONFIG.get().cloned().unwrap_or_default();
+        let heartbeat = *HEARTBEAT.get().unwrap_or(&5);
+        if let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            && let Ok(cfg) = runtime.block_on(super::load_cfg(&config))
+        {
+            super::init_tracing(&cfg.log);
+            let stop = STOP
+                .get()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            let _ = runtime.block_on(super::run_daemon(cfg, heartbeat, stop));
+        }
+        report(handle, SERVICE_STOPPED, 0);
+    }
+
+    /// Run as SCM service; if launched from a console, fall back to daemon mode.
+    pub async fn run(config: PathBuf, heartbeat_secs: u64) -> crate::Result<()> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let _ = STOP.set(stop.clone());
+        let _ = CONFIG.set(config.clone());
+        let _ = HEARTBEAT.set(heartbeat_secs);
+        let name = wide(SERVICE_NAME);
+        let table = [
+            SERVICE_TABLE_ENTRYW {
+                lpServiceName: name.as_ptr() as *mut u16,
+                lpServiceProc: Some(service_main),
+            },
+            SERVICE_TABLE_ENTRYW::default(),
+        ];
+        let ok = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
+                // Console fallback: behave like `daemon`.
+                let cfg = super::load_cfg(&config).await?;
+                return super::run_daemon(cfg, heartbeat_secs, stop).await;
+            }
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "StartServiceCtrlDispatcherW failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn input(
+        want_host: &str,
+        have_host: &str,
+        want_ip: &str,
+        have_ip: &str,
+        ip_mode: &str,
+        want_frozen: bool,
+        frozen: bool,
+        armed: bool,
+    ) -> IdentityDecisionInput {
+        IdentityDecisionInput {
+            want_host: want_host.into(),
+            have_host: have_host.into(),
+            want_ip: want_ip.into(),
+            have_ip: have_ip.into(),
+            ip_mode: ip_mode.into(),
+            want_frozen,
+            frozen,
+            armed,
+        }
+    }
+
+    #[test]
+    fn hostname_mismatch_while_protected_disarms_first() {
+        let action = decide_identity_action(&input(
+            "stu001", "BASE-PC", "", "", "static", true, true, true,
+        ));
+        assert_eq!(action, IdentityAction::DisarmReboot);
+    }
+
+    #[test]
+    fn hostname_mismatch_unprotected_renames() {
+        let action = decide_identity_action(&input(
+            "stu001", "BASE-PC", "", "", "static", true, false, false,
+        ));
+        assert_eq!(action, IdentityAction::RenameReboot);
+    }
+
+    #[test]
+    fn static_ip_mismatch_while_frozen_does_not_disarm() {
+        let action = decide_identity_action(&input(
+            "stu001",
+            "stu001",
+            "10.110.0.31",
+            "10.110.0.50",
+            "static",
+            true,
+            true,
+            true,
+        ));
+        assert_eq!(action, IdentityAction::SetStaticIp);
+    }
+
+    #[test]
+    fn identity_ok_arms_protection() {
+        let action = decide_identity_action(&input(
+            "stu001",
+            "stu001",
+            "10.110.0.31",
+            "10.110.0.31",
+            "dhcp",
+            true,
+            false,
+            false,
+        ));
+        assert_eq!(action, IdentityAction::ArmReboot);
+    }
+
+    #[test]
+    fn dhcp_ip_mismatch_renews() {
+        let action = decide_identity_action(&input(
+            "stu001",
+            "stu001",
+            "10.110.0.31",
+            "10.110.0.50",
+            "dhcp",
+            false,
+            false,
+            false,
+        ));
+        assert_eq!(action, IdentityAction::RenewDhcp);
+    }
+
+    #[test]
+    fn converged_is_noop() {
+        let action = decide_identity_action(&input(
+            "stu001",
+            "stu001",
+            "10.110.0.31",
+            "10.110.0.31",
+            "dhcp",
+            true,
+            true,
+            true,
+        ));
+        assert_eq!(action, IdentityAction::None);
+    }
+}

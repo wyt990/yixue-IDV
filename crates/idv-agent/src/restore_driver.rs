@@ -185,17 +185,14 @@ impl StateFileDriver {
     fn arm_volume(root: &Path) -> anyhow::Result<()> {
         let path = Self::state_path(root);
         if path.exists() {
-            let _ = fs::set_permissions(
-                &path,
+            let _ = fs::set_permissions(&path, {
+                let mut p = fs::metadata(&path)?.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
                 {
-                    let mut p = fs::metadata(&path)?.permissions();
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    {
-                        p.set_readonly(false);
-                    }
-                    p
-                },
-            );
+                    p.set_readonly(false);
+                }
+                p
+            });
             #[cfg(windows)]
             clear_hidden_system(&path);
         }
@@ -255,10 +252,7 @@ impl StateFileDriver {
 impl RestoreDriver for StateFileDriver {
     fn status(&self) -> anyhow::Result<DriverStatus> {
         let roots = Self::volume_roots(&["system".into()]);
-        let armed = roots
-            .iter()
-            .filter_map(|r| Self::read_armed(r))
-            .any(|a| a);
+        let armed = roots.iter().filter_map(|r| Self::read_armed(r)).any(|a| a);
         let live = Self::ioctl_live_protecting();
         let frozen = live.unwrap_or(armed);
         let detail = format!(
@@ -363,10 +357,7 @@ fn set_hidden_system(path: &Path) {
         .chain(std::iter::once(0))
         .collect();
     unsafe {
-        SetFileAttributesW(
-            wide.as_ptr(),
-            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-        );
+        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
     }
 }
 
@@ -404,7 +395,10 @@ fn query_protect_status_ioctl() -> Option<bool> {
     const OPEN_EXISTING: u32 = 3;
     const INVALID: isize = -1;
     // Prefer Global\ DOS device namespace; fall back to short name.
-    let candidates = [r"\\.\Global\QHEngineControlDevice", r"\\.\QHEngineControlDevice"];
+    let candidates = [
+        r"\\.\Global\QHEngineControlDevice",
+        r"\\.\QHEngineControlDevice",
+    ];
     unsafe {
         unsafe extern "system" {
             fn GetLastError() -> u32;
@@ -443,7 +437,11 @@ fn query_protect_status_ioctl() -> Option<bool> {
             let ioctl_err = if ok == 0 { GetLastError() } else { 0 };
             CloseHandle(h);
             if ok == 0 {
-                tracing::debug!(device = name, ioctl_err, "IOCTL_QH_QUERY_PROTECT_STATUS failed");
+                tracing::debug!(
+                    device = name,
+                    ioctl_err,
+                    "IOCTL_QH_QUERY_PROTECT_STATUS failed"
+                );
                 continue;
             }
             return Some(result != 0);
@@ -474,12 +472,26 @@ pub fn mock_state_path_for_tests(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_dir() -> PathBuf {
+        let name = format!("idv-restore-driver-test-{}", std::process::id());
+        let primary = std::env::temp_dir().join(&name);
+        if fs::create_dir_all(&primary).is_ok() {
+            return primary;
+        }
+        // Sandboxed/CI environments may expose a non-writable TEMP; fall back
+        // to the workspace target dir.
+        let fallback = std::env::current_dir()
+            .unwrap_or_default()
+            .join("target")
+            .join("tmp")
+            .join(name);
+        fs::create_dir_all(&fallback).unwrap();
+        fallback
+    }
+
     #[test]
     fn mock_protect_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "idv-restore-driver-test-{}",
-            std::process::id()
-        ));
+        let dir = test_dir();
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let d = MockFileDriver::with_path(mock_state_path_for_tests(&dir));

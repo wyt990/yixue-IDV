@@ -1,4 +1,4 @@
-# Stage 6c: P2P stop seeding, USB enforce, PE network wizard, themes present
+﻿# Stage 6c: P2P stop seeding, USB enforce, PE network wizard, themes present
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

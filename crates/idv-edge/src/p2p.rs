@@ -124,12 +124,9 @@ pub async fn get_chunk(
     }
 
     let path = state.runtime.cache_file(&image_id);
-    let data = tokio::fs::read(&path).await.map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("edge cache missing: {e}"),
-        )
-    })?;
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("edge cache missing: {e}")))?;
     let manifest = build_manifest(&image_id, &data, state.chunk_size.max(1));
     let info = manifest
         .chunks

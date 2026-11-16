@@ -1,5 +1,6 @@
 mod dhcp;
 mod host_metrics;
+mod ip_bindings;
 mod p2p;
 mod pe_api;
 mod tftp;
@@ -16,8 +17,8 @@ use axum::Router;
 use axum::routing::{get, post, put};
 use clap::{Parser, Subcommand};
 use dhcp::{DhcpConfig, DhcpService};
-use idv_common::{Error, Result, init_tracing, load_toml_file};
 use idv_common::chunking::DEFAULT_CHUNK_SIZE;
+use idv_common::{Error, Result, init_tracing, load_toml_file};
 use p2p::P2pState;
 use pe_api::PeState;
 use serde::{Deserialize, Serialize};
@@ -84,8 +85,15 @@ struct EdgeConfig {
     /// Required for WiFi PE checkin / claim (empty rejects wifi source).
     #[serde(default = "default_pe_deploy_token")]
     pe_deploy_token: String,
+    /// How often to refresh MAC -> IP reservations from Center (seconds).
+    #[serde(default = "default_ip_bindings_refresh")]
+    ip_bindings_refresh_secs: u64,
     #[serde(default)]
     pxe: PxeConfig,
+}
+
+fn default_ip_bindings_refresh() -> u64 {
+    30
 }
 
 fn default_pe_deploy_token() -> String {
@@ -247,20 +255,14 @@ async fn dhcp_probe(server: &str, mac: &str) -> Result<()> {
     pkt.extend_from_slice(&[55, 4, 1, 3, 66, 67]); // param request
     pkt.push(255);
 
-    let sock = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(Error::Io)?;
-    sock.send_to(&pkt, server)
-        .await
-        .map_err(Error::Io)?;
+    let sock = UdpSocket::bind("0.0.0.0:0").await.map_err(Error::Io)?;
+    sock.send_to(&pkt, server).await.map_err(Error::Io)?;
     let mut buf = vec![0u8; 1500];
-    let (n, peer) = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        sock.recv_from(&mut buf),
-    )
-    .await
-    .map_err(|_| Error::Other(anyhow::anyhow!("DHCP probe timeout")))?
-    .map_err(Error::Io)?;
+    let (n, peer) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv_from(&mut buf))
+            .await
+            .map_err(|_| Error::Other(anyhow::anyhow!("DHCP probe timeout")))?
+            .map_err(Error::Io)?;
 
     let msg = buf.get(240..).and_then(|opts| {
         let mut i = 0;
@@ -305,8 +307,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     let cfg: EdgeConfig = load_toml_file(&config_path)?;
     init_tracing(&cfg.log);
 
-    if cfg.node_token.trim().is_empty()
-        || cfg.node_token.contains("REPLACE_WITH_CENTER_EDGE_TOKEN")
+    if cfg.node_token.trim().is_empty() || cfg.node_token.contains("REPLACE_WITH_CENTER_EDGE_TOKEN")
     {
         return Err(Error::Config(
             "node_token is required in edge.toml (create edge in center first)".into(),
@@ -332,6 +333,14 @@ async fn serve(config_path: PathBuf) -> Result<()> {
         .await
         .map_err(Error::Io)?;
 
+    // DHCP reservations (MAC -> Center-assigned IP), restored from disk so DHCP
+    // keeps working when Center is unreachable.
+    let ip_bindings_path = PathBuf::from(&cfg.cache_dir).join("ip-bindings.json");
+    let ip_bindings = ip_bindings::IpBindings::load(&ip_bindings_path).await;
+    if !ip_bindings.is_empty().await {
+        info!("loaded DHCP reservations from disk");
+    }
+
     let addr: SocketAddr = cfg
         .listen
         .parse()
@@ -356,10 +365,9 @@ async fn serve(config_path: PathBuf) -> Result<()> {
             .no_proxy()
             .build()
             .expect("reqwest client"),
-        sync_slots: Arc::new(tokio::sync::Semaphore::new(
-            cfg.max_concurrent_syncs.max(1),
-        )),
+        sync_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_syncs.max(1))),
         host_metrics: Arc::new(host_metrics::HostMetricsSampler::new()),
+        ip_bindings: ip_bindings.clone(),
     };
 
     if let Err(err) = runtime.register().await {
@@ -374,6 +382,25 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     tokio::spawn(async move {
         worker_runtime.run_loops(heartbeat_secs, poll_secs).await;
     });
+
+    // Refresh DHCP reservations from Center periodically; cache on disk.
+    {
+        let bindings_runtime = runtime.clone();
+        let refresh_secs = cfg.ip_bindings_refresh_secs.max(5);
+        tokio::spawn(async move {
+            loop {
+                match bindings_runtime.refresh_ip_bindings().await {
+                    Ok(n) => {
+                        info!(count = n, "refreshed DHCP reservations from center");
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "refresh DHCP reservations failed; keeping cached bindings");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(refresh_secs)).await;
+            }
+        });
+    }
 
     if cfg.pxe.enabled {
         let mode = if cfg.pxe.mode == "off" {
@@ -392,6 +419,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
             offer_end: parse_v4(&cfg.pxe.offer_end)?,
             lease_secs: cfg.pxe.lease_secs,
             dns: None,
+            reservations: ip_bindings.clone(),
         };
         let dhcp = DhcpService::new(dhcp_cfg);
         tokio::spawn(async move {
@@ -451,17 +479,17 @@ async fn serve(config_path: PathBuf) -> Result<()> {
         },
     };
     let p2p_routes = Router::new()
-        .route("/api/v1/p2p/peers", post(p2p::register_peer).get(p2p::list_peers))
+        .route(
+            "/api/v1/p2p/peers",
+            post(p2p::register_peer).get(p2p::list_peers),
+        )
         .route("/api/v1/p2p/manifest/{image_id}", get(p2p::manifest))
         .route(
             "/api/v1/p2p/chunk/{image_id}/{index}",
             get(p2p::get_chunk).put(p2p::put_chunk),
         )
         .route("/api/v1/p2p/swarm/{image_id}", get(p2p::swarm_stats))
-        .route(
-            "/api/v1/p2p/swarm/{image_id}/stop",
-            post(p2p::stop_swarm),
-        )
+        .route("/api/v1/p2p/swarm/{image_id}/stop", post(p2p::stop_swarm))
         .with_state(p2p_state);
 
     let app = Router::new()

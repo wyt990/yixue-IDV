@@ -126,6 +126,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
         max_concurrent_deploy_targets: cfg.max_concurrent_deploy_targets.max(1),
         max_pending_sync_per_edge: cfg.max_pending_sync_per_edge.max(1),
         recommended_deploy_batch: cfg.recommended_deploy_batch.max(1),
+        agent_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
     // Phase-3: tick power schedules every 30s
     {

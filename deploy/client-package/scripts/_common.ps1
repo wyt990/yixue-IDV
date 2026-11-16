@@ -1,4 +1,4 @@
-function Get-YixueRoot {
+﻿function Get-YixueRoot {
   Split-Path $PSScriptRoot -Parent
 }
 

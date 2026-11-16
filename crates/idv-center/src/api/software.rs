@@ -5,8 +5,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use idv_common::image_format::hex_sha256;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthUser;
 use crate::mac::normalize_mac;
@@ -192,7 +192,10 @@ pub async fn report_job(
 ) -> Result<Json<SoftwareJob>, (StatusCode, String)> {
     let state_name = body.state.trim().to_ascii_lowercase();
     if !matches!(state_name.as_str(), "running" | "done" | "failed") {
-        return Err((StatusCode::BAD_REQUEST, "state must be running|done|failed".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "state must be running|done|failed".into(),
+        ));
     }
     let now = Utc::now().to_rfc3339();
     sqlx::query("UPDATE software_jobs SET state = ?, detail = ?, updated_at = ? WHERE id = ?")

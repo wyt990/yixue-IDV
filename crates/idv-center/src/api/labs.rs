@@ -27,9 +27,7 @@ pub async fn list(
             .await
     } else {
         let sql = format!("SELECT {LAB_COLS} FROM labs ORDER BY name");
-        sqlx::query_as::<_, Lab>(&sql)
-            .fetch_all(&state.pool)
-            .await
+        sqlx::query_as::<_, Lab>(&sql).fetch_all(&state.pool).await
     }
     .map_err(internal)?;
     let mut rows = rows;
@@ -47,6 +45,17 @@ pub async fn get(
     Ok(Json(lab))
 }
 
+fn normalize_ip_mode(value: &str) -> Result<String, (StatusCode, String)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "static" => Ok("static".into()),
+        "dhcp" => Ok("dhcp".into()),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("ip_mode must be dhcp|static, got '{other}'"),
+        )),
+    }
+}
+
 pub async fn create(
     State(state): State<AppState>,
     user: AuthUser,
@@ -57,6 +66,7 @@ pub async fn create(
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name required".into()));
     }
+    let ip_mode = normalize_ip_mode(&body.ip_mode)?;
     let width = body.suffix_width.clamp(1, 8);
     let start = body.suffix_start.max(1);
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM campuses WHERE id = ?")
@@ -81,12 +91,13 @@ pub async fn create(
         netmask: body.netmask.trim().to_string(),
         gateway: body.gateway.trim().to_string(),
         dns: body.dns.trim().to_string(),
+        ip_mode,
         default_image_id: None,
         created_at: Utc::now(),
         edge_ids: Vec::new(),
     };
     sqlx::query(
-        "INSERT INTO labs (id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, netmask, gateway, dns, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO labs (id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, netmask, gateway, dns, ip_mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&lab.id)
     .bind(&lab.campus_id)
@@ -100,6 +111,7 @@ pub async fn create(
     .bind(&lab.netmask)
     .bind(&lab.gateway)
     .bind(&lab.dns)
+    .bind(&lab.ip_mode)
     .bind(lab.created_at)
     .execute(&state.pool)
     .await
@@ -166,6 +178,7 @@ pub async fn update(
         .dns
         .map(|s| s.trim().to_string())
         .unwrap_or(existing.dns);
+    let ip_mode = normalize_ip_mode(body.ip_mode.as_deref().unwrap_or(&existing.ip_mode))?;
 
     let campus_ok: Option<(String,)> = sqlx::query_as("SELECT id FROM campuses WHERE id = ?")
         .bind(&campus_id)
@@ -176,7 +189,7 @@ pub async fn update(
         return Err((StatusCode::BAD_REQUEST, "campus not found".into()));
     }
     sqlx::query(
-        "UPDATE labs SET campus_id = ?, name = ?, name_prefix = ?, suffix_width = ?, suffix_start = ?, next_suffix = ?, ip_start = ?, ip_end = ?, netmask = ?, gateway = ?, dns = ? WHERE id = ?",
+        "UPDATE labs SET campus_id = ?, name = ?, name_prefix = ?, suffix_width = ?, suffix_start = ?, next_suffix = ?, ip_start = ?, ip_end = ?, netmask = ?, gateway = ?, dns = ?, ip_mode = ? WHERE id = ?",
     )
     .bind(&campus_id)
     .bind(&name)
@@ -189,6 +202,7 @@ pub async fn update(
     .bind(&netmask)
     .bind(&gateway)
     .bind(&dns)
+    .bind(&ip_mode)
     .bind(&id)
     .execute(&state.pool)
     .await

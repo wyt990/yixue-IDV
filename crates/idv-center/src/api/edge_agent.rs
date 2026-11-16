@@ -230,14 +230,7 @@ pub async fn next_command(
         if let Some(image_id) = &c.image_id {
             if matches!(c.kind.as_str(), "sync" | "purge_and_sync") {
                 let _ = crate::api::edges::upsert_replica(
-                    &state,
-                    &edge.id,
-                    image_id,
-                    "syncing",
-                    0.01,
-                    "",
-                    "",
-                    "",
+                    &state, &edge.id, image_id, "syncing", 0.01, "", "", "",
                 )
                 .await;
             }
@@ -422,12 +415,14 @@ pub async fn claim_task(
     .await
     .map_err(internal)?;
 
-    sqlx::query("UPDATE maintenance_task_targets SET state = 'running', updated_at = ? WHERE id = ?")
-        .bind(now)
-        .bind(&target.id)
-        .execute(&state.pool)
-        .await
-        .map_err(internal)?;
+    sqlx::query(
+        "UPDATE maintenance_task_targets SET state = 'running', updated_at = ? WHERE id = ?",
+    )
+    .bind(now)
+    .bind(&target.id)
+    .execute(&state.pool)
+    .await
+    .map_err(internal)?;
     sqlx::query(
         "UPDATE maintenance_tasks SET state = 'running', edge_id = COALESCE(NULLIF(edge_id, ''), ?), updated_at = ? WHERE id = ?",
     )
@@ -564,7 +559,10 @@ pub async fn ingest_image(
     .map_err(internal)?
     .ok_or((StatusCode::NOT_FOUND, "task not found".into()))?;
     if task.kind != "capture" {
-        return Err((StatusCode::BAD_REQUEST, "ingest only for capture tasks".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ingest only for capture tasks".into(),
+        ));
     }
 
     let image_id = new_id();
@@ -654,8 +652,7 @@ pub async fn ingest_image(
         "finalize_captured_image done"
     );
 
-    let partition_map =
-        serde_json::to_string(&header.partitions).unwrap_or_else(|_| "[]".into());
+    let partition_map = serde_json::to_string(&header.partitions).unwrap_or_else(|_| "[]".into());
     let name = if q.name.trim().is_empty() {
         if task.name.trim().is_empty() {
             format!("capture-{}", &image_id[..8])
@@ -742,9 +739,7 @@ async fn refresh_task_aggregate(
     }
     let all_done = states.iter().all(|(s,)| s == "done");
     let any_failed = states.iter().any(|(s,)| s == "failed");
-    let any_active = states
-        .iter()
-        .any(|(s,)| s == "pending" || s == "running");
+    let any_active = states.iter().any(|(s,)| s == "pending" || s == "running");
     let state_name = if all_done {
         "done"
     } else if any_failed && !any_active {
@@ -766,7 +761,10 @@ async fn refresh_task_aggregate(
 fn resolve_storage_path(storage_uri: &str) -> Result<PathBuf, (StatusCode, String)> {
     let raw = storage_uri.trim();
     if raw.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "image has empty storage_uri".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "image has empty storage_uri".into(),
+        ));
     }
     if let Some(rest) = raw.strip_prefix("file:///") {
         return Ok(PathBuf::from(rest));

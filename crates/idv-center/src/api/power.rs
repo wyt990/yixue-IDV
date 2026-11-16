@@ -25,6 +25,12 @@ pub async fn create(
         ));
     }
     let cmd = enqueue_power(&state.pool, &mac, &kind, &body.detail).await?;
+    if matches!(kind.as_str(), "shutdown" | "reboot") {
+        let payload = serde_json::json!({ "power_id": cmd.id }).to_string();
+        let _ =
+            crate::api::agent_commands::enqueue(&state, &mac, &kind, &payload, &user.0.username)
+                .await;
+    }
     Ok((StatusCode::CREATED, Json(cmd)))
 }
 
@@ -66,7 +72,20 @@ pub async fn create_bulk(
             }
         };
         match enqueue_power(&state.pool, &mac, &kind, &body.detail).await {
-            Ok(_) => created += 1,
+            Ok(cmd) => {
+                created += 1;
+                if matches!(kind.as_str(), "shutdown" | "reboot") {
+                    let payload = serde_json::json!({ "power_id": cmd.id }).to_string();
+                    let _ = crate::api::agent_commands::enqueue(
+                        &state,
+                        &mac,
+                        &kind,
+                        &payload,
+                        &user.0.username,
+                    )
+                    .await;
+                }
+            }
             Err((_, msg)) => errors.push(format!("{mac}: {msg}")),
         }
     }
@@ -75,18 +94,21 @@ pub async fn create_bulk(
 
 /// Enqueue reboot for every client in a lab (mode-change path A).
 pub async fn enqueue_reboots_for_lab(
-    pool: &SqlitePool,
+    state: &AppState,
     lab_id: &str,
     detail: &str,
 ) -> Result<usize, (StatusCode, String)> {
     let macs: Vec<(String,)> = sqlx::query_as("SELECT mac FROM clients WHERE lab_id = ?")
         .bind(lab_id)
-        .fetch_all(pool)
+        .fetch_all(&state.pool)
         .await
         .map_err(internal)?;
     let mut n = 0usize;
     for (mac,) in macs {
-        enqueue_power(pool, &mac, "reboot", detail).await?;
+        let cmd = enqueue_power(&state.pool, &mac, "reboot", detail).await?;
+        let payload = serde_json::json!({ "power_id": cmd.id }).to_string();
+        let _ =
+            crate::api::agent_commands::enqueue(state, &mac, "reboot", &payload, "system").await;
         n += 1;
     }
     Ok(n)
@@ -107,14 +129,28 @@ pub async fn enqueue_power(
     let now = Utc::now();
     let mut detail = detail_in.to_string();
     if kind == "wol" {
-        match send_wol(mac) {
+        // Prefer the lab's directed broadcast so the packet egresses the lab VLAN
+        // interface instead of relying on the default route.
+        let subnet: Option<(String, String)> = sqlx::query_as(
+            "SELECT l.ip_start, l.netmask FROM clients c JOIN labs l ON l.id = c.lab_id WHERE c.mac = ?",
+        )
+        .bind(mac)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?;
+        let directed = subnet
+            .as_ref()
+            .and_then(|(ip, mask)| idv_common::wol::directed_broadcast(ip, mask));
+        match idv_common::wol::send_magic_packet_to(mac, directed) {
             Ok(msg) => {
-                if detail.is_empty() {
-                    detail = msg;
-                }
+                detail = if detail.is_empty() {
+                    msg
+                } else {
+                    format!("{detail} | {msg}")
+                };
             }
             Err(err) => {
-                detail = format!("wol_send_failed: {err}");
+                detail = format!("{detail} | wol_send_failed: {err}");
             }
         }
     }
@@ -155,10 +191,7 @@ pub async fn ack(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<PowerCommand>, (StatusCode, String)> {
-    let ok = body
-        .get("ok")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
     let detail = body
         .get("detail")
         .and_then(|v| v.as_str())
@@ -196,12 +229,6 @@ pub async fn list(
     .await
     .map_err(internal)?;
     Ok(Json(rows))
-}
-
-fn send_wol(mac: &str) -> Result<String, String> {
-    idv_common::wol::send_magic_packet(mac)
-        .map(|_| format!("wol_sent mac={mac}"))
-        .map_err(|e| e.to_string())
 }
 
 fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {

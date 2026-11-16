@@ -1,44 +1,102 @@
-SysRestore 自签测试证书版（Secure Boot=False 的试点机）
-======================================================
+SysRestore 测试签名驱动包（试点机专用，Secure Boot 必须关闭）
+==============================================================
 
-把本包（或至少 driver\ + scripts\）拷到学生机：
+重要前提
+--------
+1. testsigning 只允许“已用测试证书签名”的驱动加载；未签名驱动开测试模式也加载不了。
+   本包 driver\SysRestoreDriver.sys 必须是通过构建机 sign-sysrestore-testcert.ps1
+   签名后的文件；可用下面命令确认：
+     Get-AuthenticodeSignature .\driver\SysRestoreDriver.sys   -> Status = Valid
+     Get-AuthenticodeSignature .\driver\SysRestoreDriver.cat   -> Status = Valid
+   两者缺一（或 .cat 缺失）都不要安装。
+2. 该驱动是 BOOT_START 卷过滤驱动（UpperFilters）。加载失败 = 开机蓝屏/无法启动
+   （0xC0000428 / 0x7B）。请务必先在虚拟机或可重装试点机验证，并准备 WinRE。
+3. 安装脚本已做硬校验：非管理员、Secure Boot 开启、testsigning 未生效、签名无效
+   任一条件不满足会直接中止，不会再写入 UpperFilters。
+
+一、把包放到学生机
+------------------
   C:\Program Files\YixueIDV\
+    idv-agent.exe
+    agent.toml              （必须存在，install-client.ps1 会检查）
+    driver\SysRestoreDriver.sys / .cat / .inf / YixueIDV-SysRestore-Test.cer
+    scripts\enable-testsigning.ps1 / install-testcert.ps1 / install-driver.ps1
+            uninstall-driver.ps1 / recover-boot.txt
 
-一、顺序（管理员）
-----------------
+不要拷 .pfx（私钥只留在构建机 drivers\sys-restore\testcert\）。
+
+二、安装顺序（管理员 PowerShell）
+--------------------------------
   cd "C:\Program Files\YixueIDV"
 
-  1) 开测试模式并重启
-       powershell -ExecutionPolicy Bypass -File .\scripts\enable-testsigning.ps1
+  1) 关闭 Secure Boot，开测试模式并重启
+       .\scripts\enable-testsigning.ps1
+       Restart-Computer
 
-  2) 重启后：导入测试证书 + 安装驱动
-       powershell -ExecutionPolicy Bypass -File .\scripts\install-testcert.ps1
-       powershell -ExecutionPolicy Bypass -File .\scripts\install-driver.ps1
-     （install-driver 会自动再跑一次 install-testcert）
+  2) 重启后：导入测试证书 + 安装驱动（脚本会再次校验签名）
+       .\scripts\install-testcert.ps1
+       .\scripts\install-driver.ps1
+     install-driver 会检查：
+       - 管理员、Secure Boot=False、testsigning=Yes
+       - sys/cat 签名 Status=Valid
+       任一不满足直接报错退出，不会写 UpperFilters。
 
   3) 再重启一次（BOOT_START 过滤驱动生效）
-     不应再出现 0xc0000428；也不必再按 F8→7。
+       正常应能进系统；若蓝屏，按 scripts\recover-boot.txt 回滚。
 
-  4) 开保护测试
+  4) 开保护并验证
        .\scripts\restore-driver.ps1 protect-on
-       # 再重启后保护激活
+       Restart-Computer
+       .\scripts\restore-driver.ps1 status
 
-二、driver 目录应有
+三、结果判定（关键）
 ------------------
-  SysRestoreDriver.sys          （已用测试证书签名）
-  SysRestoreDriver.inf
-  YixueIDV-SysRestore-Test.cer  （公钥，导入本机信任）
-  LICENSE / NOTICE
+  - 驱动是否加载：设备管理器/`sc query SysRestoreDriver` 应为 RUNNING；
+    或 `fltmc`（卷过滤驱动可能不显示在 fltmc，用 sc query 更可靠）。
+  - 保护是否生效：保护开启后写入系统盘测试文件，重启应回滚。
+  - 若蓝屏代码是：
+      0xC0000428 / 0x7B / 0xC0000225  -> 签名/过滤驱动加载问题（按 recover-boot.txt）
+      0x7E / 0x50 / 0xD1 / 0x3B / 0x1E -> 驱动内部缺陷或与当前系统不兼容，
+                                          需保留 MEMORY.DMP 交开发分析，不要再反复装。
 
-  不要把 .pfx 放到学生机。
+四、失败回滚
+------------
+  能进系统：
+    .\scripts\uninstall-driver.ps1
+    .\scripts\uninstall-driver.ps1 -DisableTestSigning   # 同时关测试模式
+    Restart-Computer
 
-三、若仍签名失败
-----------------
-  - bcdedit 确认 testsigning = Yes
-  - Confirm-SecureBootUEFI 应为 False
-  - certmgr 里本机「受信任的根证书颁发机构」和「受信任的发布者」应有 CN=YixueIDV-SysRestore-Test
-  - 进 WinRE 可删 Windows\System32\drivers\SysRestoreDriver.sys 急救
+  不能进系统：进 WinRE，按 scripts\recover-boot.txt 移除 UpperFilters 与服务项，
+  重启后再进系统清理。
 
-四、构建机重新签名
-----------------
+五、构建机重新签名（生成/更新驱动包）
+-----------------------------------
+  # 1) 编译（需要 WDK/VS，见 drivers/sys-restore/build-driver-x64.ps1）
+  powershell -ExecutionPolicy Bypass -File drivers\sys-restore\build-driver-x64.ps1
+
+  # 2) 用现有测试证书签名 sys + 生成并签名 cat，输出到本包 driver\
   powershell -ExecutionPolicy Bypass -File deploy\scripts\sign-sysrestore-testcert.ps1
+
+  脚本会：
+    - 复用 drivers\sys-restore\testcert\YixueIDV-SysRestore-Test.pfx（缺失才新建，
+      新建后所有客户端必须重新导入 .cer）
+    - 先在临时目录签名并校验，成功后才覆盖 deploy\client-package\driver
+    - 生成 SysRestoreDriver.cat 并签名（INF 里声明了 CatalogFile）
+  最后务必确认：
+    Get-AuthenticodeSignature .\deploy\client-package\driver\SysRestoreDriver.sys
+    Get-AuthenticodeSignature .\deploy\client-package\driver\SysRestoreDriver.cat
+  两者都应为 Valid。
+
+六、常见问题
+------------
+  Q: 已开测试模式，为何还加载失败/蓝屏？
+  A: 因为旧包里的 .sys 是未签名的（Get-AuthenticodeSignature 为 NotSigned），
+     测试模式并不放行未签名文件；且它作为 BOOT_START 过滤驱动注册，加载失败
+     就表现为开机蓝屏。本包已重新签名并生成 cat，请使用新包重装。
+
+  Q: 旧机器已经蓝屏了怎么办？
+  A: 进 WinRE 按 scripts\recover-boot.txt 移除 UpperFilters 与
+     Services\SysRestoreDriver，reg unload 后重启。
+
+  Q: 能否不关 Secure Boot？
+  A: 测试签名不行。生产环境需要微软正式签名（EV/WHQL），届时去掉 testsigning。

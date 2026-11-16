@@ -55,6 +55,9 @@ pub struct Lab {
     pub gateway: String,
     #[serde(default)]
     pub dns: String,
+    /// dhcp = Edge reservation by MAC; static = agent writes static IP.
+    #[serde(default = "default_ip_mode")]
+    pub ip_mode: String,
     #[serde(default)]
     pub default_image_id: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -62,6 +65,10 @@ pub struct Lab {
     #[sqlx(skip)]
     #[serde(default)]
     pub edge_ids: Vec<String>,
+}
+
+fn default_ip_mode() -> String {
+    "static".into()
 }
 
 fn default_suffix_width() -> i64 {
@@ -86,6 +93,76 @@ pub struct Client {
     pub assigned_ip: String,
     pub last_seen: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Client row joined with agent session state for the terminal page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientView {
+    pub id: String,
+    pub lab_id: String,
+    pub mac: String,
+    pub name: String,
+    pub notes: String,
+    pub last_ip: String,
+    pub assigned_ip: String,
+    /// Last PXE/agent report (kept for compatibility).
+    pub last_seen: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    /// Last Agent heartbeat (None = agent never reported; PXE only).
+    pub agent_last_seen: Option<DateTime<Utc>>,
+    pub online: bool,
+    pub frozen: bool,
+    pub armed: bool,
+    pub mode_name: String,
+    pub current_hostname: String,
+    pub identity_state: String,
+}
+
+/// Raw row for [`ClientView`] (sqlx mapping + computed fields).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ClientViewRow {
+    pub id: String,
+    pub lab_id: String,
+    pub mac: String,
+    pub name: String,
+    pub notes: String,
+    pub last_ip: String,
+    pub assigned_ip: String,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub agent_last_seen: Option<DateTime<Utc>>,
+    pub frozen: i64,
+    pub armed: i64,
+    pub mode_name: String,
+    pub current_hostname: String,
+    pub identity_state: String,
+}
+
+impl From<ClientViewRow> for ClientView {
+    fn from(r: ClientViewRow) -> Self {
+        let online = r
+            .agent_last_seen
+            .map(|t| (Utc::now() - t).num_seconds() <= 15)
+            .unwrap_or(false);
+        Self {
+            id: r.id,
+            lab_id: r.lab_id,
+            mac: r.mac,
+            name: r.name,
+            notes: r.notes,
+            last_ip: r.last_ip,
+            assigned_ip: r.assigned_ip,
+            last_seen: r.last_seen,
+            created_at: r.created_at,
+            agent_last_seen: r.agent_last_seen,
+            online,
+            frozen: r.frozen != 0,
+            armed: r.armed != 0,
+            mode_name: r.mode_name,
+            current_hostname: r.current_hostname,
+            identity_state: r.identity_state,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -155,6 +232,8 @@ pub struct CreateLab {
     pub gateway: String,
     #[serde(default)]
     pub dns: String,
+    #[serde(default = "default_ip_mode")]
+    pub ip_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +260,8 @@ pub struct UpdateLab {
     pub gateway: Option<String>,
     #[serde(default)]
     pub dns: Option<String>,
+    #[serde(default)]
+    pub ip_mode: Option<String>,
     /// When `edge_ids` is `Some`, also apply this (empty/None clears).
     #[serde(default)]
     pub default_image_id: Option<String>,
@@ -219,7 +300,7 @@ pub struct UpdateClient {
     pub assigned_ip: Option<String>,
 }
 
-/// Hostname + static IPv4 the agent should enforce for this MAC.
+/// Hostname + IPv4 the agent should enforce for this MAC.
 #[derive(Debug, Clone, Serialize)]
 pub struct DesiredIdentity {
     pub hostname: String,
@@ -227,6 +308,9 @@ pub struct DesiredIdentity {
     pub netmask: String,
     pub gateway: String,
     pub dns: String,
+    /// dhcp = Edge DHCP reservation; static = agent configures static IP.
+    #[serde(default = "default_ip_mode")]
+    pub ip_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +440,21 @@ pub struct AgentHeartbeat {
     /// Best-effort local IPv4 reported by agent.
     #[serde(default)]
     pub local_ip: String,
+    /// Current Windows computer name reported by agent (identity convergence).
+    #[serde(default)]
+    pub current_hostname: String,
+    /// Agent identity convergence state: ok | disable_protect | rename | arm | ...
+    #[serde(default)]
+    pub identity_state: String,
+    /// Last identity-convergence error, if any.
+    #[serde(default)]
+    pub last_error: String,
+    /// Restore driver currently freezing the volume.
+    #[serde(default)]
+    pub frozen: bool,
+    /// Protection armed for next boot.
+    #[serde(default)]
+    pub armed: bool,
 }
 
 fn default_trigger() -> String {

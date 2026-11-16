@@ -1,4 +1,4 @@
-# Stage 6e software closeout: mode audit, exam fallback, WOL packet
+﻿# Stage 6e software closeout: mode audit, exam fallback, WOL packet
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

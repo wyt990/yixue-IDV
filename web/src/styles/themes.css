@@ -314,6 +314,15 @@ table td select {
   min-width: 8rem;
 }
 
+/* Checkboxes must not inherit the 8rem min-width used for text inputs. */
+table th input[type="checkbox"],
+table td input[type="checkbox"] {
+  min-width: 0;
+  width: auto;
+  margin: 0;
+  vertical-align: middle;
+}
+
 .field {
   display: flex;
   flex-direction: column;

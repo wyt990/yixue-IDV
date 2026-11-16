@@ -123,7 +123,10 @@ pub async fn apply_delta_image(
         return Err((StatusCode::BAD_REQUEST, "base must be full image".into()));
     }
     if delta.content_type != "delta" {
-        return Err((StatusCode::BAD_REQUEST, "delta_image_id must be delta".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "delta_image_id must be delta".into(),
+        ));
     }
     if let Some(ref bid) = delta.base_image_id {
         if bid != &base.id {

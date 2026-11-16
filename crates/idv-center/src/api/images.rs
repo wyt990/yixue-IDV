@@ -92,9 +92,17 @@ pub async fn create(
 
     let content_type = body.content_type.trim().to_ascii_lowercase();
     if !matches!(content_type.as_str(), "full" | "delta") {
-        return Err((StatusCode::BAD_REQUEST, "content_type must be full|delta".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "content_type must be full|delta".into(),
+        ));
     }
-    if content_type == "delta" && body.base_image_id.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
+    if content_type == "delta"
+        && body
+            .base_image_id
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
     {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -155,12 +163,11 @@ pub async fn delete(
     Query(q): Query<DeleteImageQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     user.require_write()?;
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT storage_uri FROM images WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal)?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT storage_uri FROM images WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?;
     let Some((storage_uri,)) = row else {
         return Err((StatusCode::NOT_FOUND, "image not found".into()));
     };
@@ -206,14 +213,11 @@ fn storage_uri_to_images_file(images_dir: &Path, storage_uri: &str) -> Option<Pa
     let canon_dir = images_dir
         .canonicalize()
         .unwrap_or_else(|_| images_dir.to_path_buf());
-    let candidate = path
-        .canonicalize()
-        .ok()
-        .or_else(|| {
-            let name = path.file_name()?.to_string_lossy();
-            let joined = images_dir.join(name.as_ref());
-            joined.canonicalize().ok()
-        })?;
+    let candidate = path.canonicalize().ok().or_else(|| {
+        let name = path.file_name()?.to_string_lossy();
+        let joined = images_dir.join(name.as_ref());
+        joined.canonicalize().ok()
+    })?;
     if candidate.starts_with(&canon_dir) && candidate.is_file() {
         Some(candidate)
     } else {
@@ -294,10 +298,7 @@ pub async fn upload_file(
         .map_err(internal)?;
     let dest = state.images_dir.join(&name);
     if dest.exists() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("file already exists: {name}"),
-        ));
+        return Err((StatusCode::CONFLICT, format!("file already exists: {name}")));
     }
 
     let mut file = tokio::fs::File::create(&dest).await.map_err(internal)?;
@@ -359,15 +360,10 @@ fn is_allowed_image_name(name: &str) -> bool {
     let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    ALLOWED_EXTS
-        .iter()
-        .any(|a| ext.eq_ignore_ascii_case(a))
+    ALLOWED_EXTS.iter().any(|a| ext.eq_ignore_ascii_case(a))
 }
 
-fn resolve_images_file(
-    images_dir: &Path,
-    name: &str,
-) -> Result<PathBuf, (StatusCode, String)> {
+fn resolve_images_file(images_dir: &Path, name: &str) -> Result<PathBuf, (StatusCode, String)> {
     let name = sanitize_upload_name(name)?;
     let path = images_dir.join(&name);
     // Reject any unexpected components after join (defense in depth).

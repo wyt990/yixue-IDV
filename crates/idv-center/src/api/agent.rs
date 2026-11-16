@@ -9,8 +9,8 @@ use idv_common::restore::should_restore_now;
 
 use crate::mac::normalize_mac;
 use crate::models::{
-    AgentHeartbeat, AgentPolicyResponse, AgentRestoreReport, AgentUsbReport, DesiredIdentity,
-    DeltaRecommendRequest, DeltaRecommendResponse, Image, ModePolicy, PowerCommand, new_id,
+    AgentHeartbeat, AgentPolicyResponse, AgentRestoreReport, AgentUsbReport, DeltaRecommendRequest,
+    DeltaRecommendResponse, DesiredIdentity, Image, ModePolicy, PowerCommand, new_id,
 };
 use crate::state::AppState;
 
@@ -39,17 +39,12 @@ pub async fn heartbeat(
                 .map_err(internal)?;
             (Some(cid), Some(lid))
         }
-        None => match crate::enroll::ensure_client_enrolled(
-            &state,
-            &mac,
-            &body.hostname,
-            now,
-        )
-        .await?
-        {
-            Some(e) => (Some(e.client_id), Some(e.lab_id)),
-            None => (None, None),
-        },
+        None => {
+            match crate::enroll::ensure_client_enrolled(&state, &mac, &body.hostname, now).await? {
+                Some(e) => (Some(e.client_id), Some(e.lab_id)),
+                None => (None, None),
+            }
+        }
     };
 
     let mut binding_updated_at: Option<String> = None;
@@ -154,12 +149,12 @@ pub async fn heartbeat(
         .map_err(internal)?;
 
     let mode_id = mode.as_ref().map(|m| m.id.clone());
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM agent_sessions WHERE mac = ?")
-            .bind(&mac)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal)?;
+    let mode_name = mode.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM agent_sessions WHERE mac = ?")
+        .bind(&mac)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?;
     if !body.local_ip.trim().is_empty() {
         if let Some(ref cid) = client_id {
             let _ = sqlx::query("UPDATE clients SET last_ip = ?, last_seen = ? WHERE id = ?")
@@ -179,20 +174,26 @@ pub async fn heartbeat(
 
     if let Some((id,)) = existing {
         sqlx::query(
-            "UPDATE agent_sessions SET client_id = ?, hostname = ?, agent_version = ?, mode_policy_id = ?, last_seen = ?, status = 'online' WHERE id = ?",
+            "UPDATE agent_sessions SET client_id = ?, hostname = ?, agent_version = ?, mode_policy_id = ?, last_seen = ?, status = 'online', frozen = ?, armed = ?, mode_name = ?, current_hostname = ?, identity_state = ?, last_error = ? WHERE id = ?",
         )
         .bind(&client_id)
         .bind(&body.hostname)
         .bind(&body.agent_version)
         .bind(&mode_id)
         .bind(now)
+        .bind(body.frozen as i64)
+        .bind(body.armed as i64)
+        .bind(&mode_name)
+        .bind(&body.current_hostname)
+        .bind(&body.identity_state)
+        .bind(&body.last_error)
         .bind(id)
         .execute(&state.pool)
         .await
         .map_err(internal)?;
     } else {
         sqlx::query(
-            "INSERT INTO agent_sessions (id, client_id, mac, hostname, agent_version, mode_policy_id, last_seen, status, detail) VALUES (?, ?, ?, ?, ?, ?, ?, 'online', '')",
+            "INSERT INTO agent_sessions (id, client_id, mac, hostname, agent_version, mode_policy_id, last_seen, status, detail, frozen, armed, mode_name, current_hostname, identity_state, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, 'online', '', ?, ?, ?, ?, ?, ?)",
         )
         .bind(new_id())
         .bind(&client_id)
@@ -201,6 +202,12 @@ pub async fn heartbeat(
         .bind(&body.agent_version)
         .bind(&mode_id)
         .bind(now)
+        .bind(body.frozen as i64)
+        .bind(body.armed as i64)
+        .bind(&mode_name)
+        .bind(&body.current_hostname)
+        .bind(&body.identity_state)
+        .bind(&body.last_error)
         .execute(&state.pool)
         .await
         .map_err(internal)?;
@@ -239,15 +246,14 @@ pub async fn heartbeat(
             Some(DesiredIdentity {
                 hostname,
                 ip: assigned_ip,
-                netmask: lab
-                    .as_ref()
-                    .map(|l| l.netmask.clone())
-                    .unwrap_or_default(),
-                gateway: lab
-                    .as_ref()
-                    .map(|l| l.gateway.clone())
-                    .unwrap_or_default(),
+                netmask: lab.as_ref().map(|l| l.netmask.clone()).unwrap_or_default(),
+                gateway: lab.as_ref().map(|l| l.gateway.clone()).unwrap_or_default(),
                 dns: lab.as_ref().map(|l| l.dns.clone()).unwrap_or_default(),
+                ip_mode: lab
+                    .as_ref()
+                    .map(|l| l.ip_mode.clone())
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| "static".into()),
             })
         } else {
             None
@@ -256,11 +262,21 @@ pub async fn heartbeat(
         None
     };
 
-    // Persist agent-reported freeze status into session detail (lightweight).
-    if !body.driver_status.is_empty() || body.applied_revision > 0 || body.pending_reboot {
+    // Persist agent-reported freeze/identity status into session detail (lightweight).
+    if !body.driver_status.is_empty()
+        || body.applied_revision > 0
+        || body.pending_reboot
+        || !body.identity_state.is_empty()
+        || !body.last_error.is_empty()
+    {
         let detail = format!(
-            "applied_revision={} pending_reboot={} driver_status={}",
-            body.applied_revision, body.pending_reboot, body.driver_status
+            "applied_revision={} pending_reboot={} driver_status={} current_hostname={} identity_state={} last_error={}",
+            body.applied_revision,
+            body.pending_reboot,
+            body.driver_status,
+            body.current_hostname,
+            body.identity_state,
+            body.last_error
         );
         let _ = sqlx::query("UPDATE agent_sessions SET detail = ? WHERE mac = ?")
             .bind(&detail)
@@ -340,7 +356,11 @@ pub async fn report_restore(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mac = normalize_mac(&body.mac).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let now = Utc::now();
-    let status = if body.ok { "restored" } else { "restore_failed" };
+    let status = if body.ok {
+        "restored"
+    } else {
+        "restore_failed"
+    };
     let result = sqlx::query(
         "UPDATE agent_sessions SET last_restore_at = ?, status = ?, detail = ?, last_seen = ? WHERE mac = ?",
     )
@@ -353,7 +373,10 @@ pub async fn report_restore(
     .await
     .map_err(internal)?;
     if result.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, "agent session not found; heartbeat first".into()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "agent session not found; heartbeat first".into(),
+        ));
     }
     Ok(Json(serde_json::json!({ "ok": true, "status": status })))
 }
@@ -376,7 +399,10 @@ pub async fn report_usb(
     .await
     .map_err(internal)?;
     if result.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, "agent session not found; heartbeat first".into()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "agent session not found; heartbeat first".into(),
+        ));
     }
     Ok(Json(serde_json::json!({
         "ok": true,

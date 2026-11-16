@@ -1,4 +1,4 @@
-# Stage 7 / Phase 3: roles, tags, software, assist, class lock, schedules, audit csv
+﻿# Stage 7 / Phase 3: roles, tags, software, assist, class lock, schedules, audit csv
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

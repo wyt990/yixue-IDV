@@ -43,7 +43,9 @@ pub async fn set_class_lock(
     Json(body): Json<ClassLockSettings>,
 ) -> Result<Json<ClassLockSettings>, (StatusCode, String)> {
     user.require_write()?;
-    if body.start_hour_utc > 23 || body.end_hour_utc > 24 || body.start_hour_utc >= body.end_hour_utc
+    if body.start_hour_utc > 23
+        || body.end_hour_utc > 24
+        || body.start_hour_utc >= body.end_hour_utc
     {
         return Err((StatusCode::BAD_REQUEST, "invalid hour range".into()));
     }
@@ -181,7 +183,10 @@ pub async fn set_task_lifecycle(
 ) -> Result<Json<TaskLifecycleSettings>, (StatusCode, String)> {
     user.require_write()?;
     if body.stale_after_secs < 0 {
-        return Err((StatusCode::BAD_REQUEST, "stale_after_secs must be >= 0".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "stale_after_secs must be >= 0".into(),
+        ));
     }
     let value = serde_json::to_string(&body).map_err(internal)?;
     sqlx::query(
@@ -280,7 +285,10 @@ pub async fn create_schedule(
     }
     let target_type = body.target_type.trim().to_ascii_lowercase();
     if !matches!(target_type.as_str(), "mac" | "tag") {
-        return Err((StatusCode::BAD_REQUEST, "target_type must be mac|tag".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "target_type must be mac|tag".into(),
+        ));
     }
     if !(0..60).contains(&body.minute_utc) || !(0..24).contains(&body.hour_utc) {
         return Err((StatusCode::BAD_REQUEST, "invalid hour/minute".into()));

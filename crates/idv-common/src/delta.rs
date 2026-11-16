@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn file_delta_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("idv-delta-{}", std::process::id()));
+        let dir = crate::test_paths::temp_dir(&format!("idv-delta-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let base_p = dir.join("base.bin");
         let target_p = dir.join("target.bin");

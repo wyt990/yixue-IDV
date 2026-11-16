@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn loads_valid_toml() {
-        let dir = std::env::temp_dir();
+        let dir = crate::test_paths::temp_dir("idv-config-test");
         let path = dir.join(format!("idv-common-config-{}.toml", uuid::Uuid::new_v4()));
         {
             let mut file = fs::File::create(&path).expect("create temp toml");

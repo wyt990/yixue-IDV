@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn pack_to_path_and_inspect() {
-        let dir = std::env::temp_dir().join(format!("idv-img-{}", std::process::id()));
+        let dir = crate::test_paths::temp_dir(&format!("idv-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let payload_path = dir.join("payload.bin");
         let out_path = dir.join("out.bin");
@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn finalize_patches_pending_sha() {
-        let dir = std::env::temp_dir().join(format!("idv-fin-{}", std::process::id()));
+        let dir = crate::test_paths::temp_dir(&format!("idv-fin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("img.bin");
         let payload = b"pending-sha-payload";

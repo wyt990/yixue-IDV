@@ -233,9 +233,9 @@ async fn checkin_inner(
 
     let message = match (&enroll.client_name, has_task) {
         (Some(name), true) => format!("Registered as {name}. {message}"),
-        (Some(name), false) => format!(
-            "Registered as {name}. No maintenance task; boot local disk."
-        ),
+        (Some(name), false) => {
+            format!("Registered as {name}. No maintenance task; boot local disk.")
+        }
         (None, _) => message,
     };
 
@@ -267,21 +267,13 @@ pub async fn checkin_ipxe(
         .client_name
         .clone()
         .unwrap_or_else(|| "(unregistered)".into());
-    let created = if body.client_created {
-        "new"
-    } else {
-        "known"
-    };
+    let created = if body.client_created { "new" } else { "known" };
     let mut script = String::from("#!ipxe\n");
     script.push_str("echo\n");
     script.push_str("echo === Yixue IDV Check-in ===\n");
     script.push_str(&format!("echo MAC: {}\n", body.mac));
     script.push_str(&format!("echo Registered: {name} ({created})\n"));
-    let kind = body
-        .task
-        .as_ref()
-        .map(|t| t.kind.as_str())
-        .unwrap_or("");
+    let kind = body.task.as_ref().map(|t| t.kind.as_str()).unwrap_or("");
     if body.has_task && (kind == "capture" || kind == "deploy") {
         // Alpine netboot + idv apkovl; pe-agent run handles capture or deploy (see pe/linux).
         script.push_str("isset ${edge-http} || set edge-http http://${next-server}:8081\n");
@@ -412,13 +404,7 @@ pub async fn capture_upload(
 
     let image = match state
         .runtime
-        .ingest_capture(
-            &q.task_id,
-            &target_id,
-            &q.name,
-            &q.version_label,
-            &tmp,
-        )
+        .ingest_capture(&q.task_id, &target_id, &q.name, &q.version_label, &tmp)
         .await
     {
         Ok(v) => v,

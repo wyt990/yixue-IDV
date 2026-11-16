@@ -49,10 +49,7 @@ pub struct AuthUser(pub Admin);
 impl AuthUser {
     pub fn require_write(&self) -> Result<(), (StatusCode, String)> {
         if self.0.role == "readonly" {
-            Err((
-                StatusCode::FORBIDDEN,
-                "readonly role cannot mutate".into(),
-            ))
+            Err((StatusCode::FORBIDDEN, "readonly role cannot mutate".into()))
         } else {
             Ok(())
         }
@@ -112,10 +109,8 @@ impl FromRequestParts<AppState> for AuthEdge {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = edge_token(&parts.headers).ok_or((
-            StatusCode::UNAUTHORIZED,
-            "missing X-Idv-Edge-Token".into(),
-        ))?;
+        let token = edge_token(&parts.headers)
+            .ok_or((StatusCode::UNAUTHORIZED, "missing X-Idv-Edge-Token".into()))?;
         let edge = edge_from_token(&state.pool, &token)
             .await
             .ok_or((StatusCode::UNAUTHORIZED, "invalid edge token".into()))?;

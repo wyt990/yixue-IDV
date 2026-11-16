@@ -116,9 +116,7 @@ pub async fn create_capture(
     let edge_id = match body.edge_id.filter(|s| !s.trim().is_empty()) {
         Some(id) => Some(id),
         None => {
-            if let Some(lab_id) =
-                crate::site_defaults::lab_id_for_mac(&state.pool, &mac).await?
-            {
+            if let Some(lab_id) = crate::site_defaults::lab_id_for_mac(&state.pool, &mac).await? {
                 crate::site_defaults::resolve_preferred_edge_id(&state.pool, &lab_id).await?
             } else {
                 None
@@ -416,11 +414,7 @@ pub async fn sweep_stale_tasks(state: &AppState) -> anyhow::Result<u64> {
     Ok(rows.len() as u64)
 }
 
-async fn fail_active_targets(
-    state: &AppState,
-    task_id: &str,
-    message: &str,
-) -> anyhow::Result<()> {
+async fn fail_active_targets(state: &AppState, task_id: &str, message: &str) -> anyhow::Result<()> {
     let now = Utc::now();
     sqlx::query(
         "UPDATE maintenance_task_targets SET state = 'failed', error_message = ?, updated_at = ? WHERE task_id = ? AND state IN ('pending', 'running')",
@@ -445,9 +439,7 @@ async fn refresh_task_aggregate(state: &AppState, task_id: &str) -> anyhow::Resu
     }
     let all_done = states.iter().all(|(s,)| s == "done");
     let any_failed = states.iter().any(|(s,)| s == "failed");
-    let any_active = states
-        .iter()
-        .any(|(s,)| s == "pending" || s == "running");
+    let any_active = states.iter().any(|(s,)| s == "pending" || s == "running");
     let state_name = if all_done {
         "done"
     } else if any_failed && !any_active {
@@ -462,9 +454,7 @@ async fn refresh_task_aggregate(state: &AppState, task_id: &str) -> anyhow::Resu
         .bind(task_id)
         .fetch_all(&state.pool)
         .await?;
-        msgs.first()
-            .map(|(m,)| m.clone())
-            .unwrap_or_default()
+        msgs.first().map(|(m,)| m.clone()).unwrap_or_default()
     } else {
         String::new()
     };

@@ -1,4 +1,4 @@
-# 在本目录完成学生机初始化（整包应放在 C:\Program Files\YixueIDV\）
+﻿# 在本目录完成学生机初始化（整包应放在 C:\Program Files\YixueIDV\）
 # 默认使用同目录 agent.toml；-CenterUrl 等仅在传入时写回配置。
 #   cd "C:\Program Files\YixueIDV"
 #   .\scripts\install-client.ps1 -RegisterBootTask
@@ -16,7 +16,14 @@ $ErrorActionPreference = "Stop"
 $p = Get-YixuePaths
 
 if (-not (Test-Path $p.Agent)) { throw "找不到 $($p.Agent)。请把整个包放到 C:\Program Files\YixueIDV\" }
-if (-not (Test-Path $p.Config)) { throw "找不到 $($p.Config)" }
+if (-not (Test-Path $p.Config)) {
+  $example = Join-Path $p.Root "agent.toml.example"
+  if (-not (Test-Path $example)) {
+    throw "找不到 $($p.Config)，且包内没有 agent.toml.example"
+  }
+  Copy-Item $example $p.Config
+  Write-Host "已从 agent.toml.example 生成通用配置: $($p.Config)"
+}
 
 New-Item -ItemType Directory -Force -Path $p.StateDir | Out-Null
 

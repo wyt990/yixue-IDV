@@ -1,4 +1,4 @@
-# Download Alpine LTS netboot + build musl pe-agent overlay for cold capture PE.
+﻿# Download Alpine LTS netboot + build musl pe-agent overlay for cold capture PE.
 # Usage: powershell -ExecutionPolicy Bypass -File deploy/scripts/fetch-pe-linux.ps1
 $ErrorActionPreference = "Stop"
 $Root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -42,7 +42,7 @@ if [ -z "$EDGE" ]; then
     esac
   done
 fi
-[ -z "$EDGE" ] && EDGE="http://10.101.0.36:8081"
+[ -z "$EDGE" ] && EDGE="http://10.110.0.1:8081"
 export IDV_EDGE_URL="$EDGE"
 
 MAC=""

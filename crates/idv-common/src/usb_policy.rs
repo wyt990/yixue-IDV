@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn apply_and_read_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("idv-usb-{}", std::process::id()));
+        let dir = crate::test_paths::temp_dir(&format!("idv-usb-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("usb_policy.json");
         let applied = apply_usb_policy(&path, true).unwrap();

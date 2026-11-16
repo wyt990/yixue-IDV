@@ -18,9 +18,9 @@ pub async fn list(
 ) -> Result<Json<Vec<EdgeView>>, (StatusCode, String)> {
     let sql = format!("SELECT {EDGE_COLS} FROM edges ORDER BY name");
     let rows = sqlx::query_as::<_, Edge>(&sql)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(internal)?;
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal)?;
     Ok(Json(
         rows.into_iter()
             .map(|edge| {
@@ -199,12 +199,11 @@ pub async fn sync_image(
     Json(body): Json<SyncImageRequest>,
 ) -> Result<(StatusCode, Json<EdgeCommand>), (StatusCode, String)> {
     let _ = load_edge(&state, &id).await?;
-    let image_exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM images WHERE id = ?")
-            .bind(&body.image_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal)?;
+    let image_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM images WHERE id = ?")
+        .bind(&body.image_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?;
     if image_exists.is_none() {
         return Err((StatusCode::BAD_REQUEST, "image not found".into()));
     }
@@ -321,14 +320,13 @@ pub async fn upsert_replica(
     checksum: &str,
     error: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let existing: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM image_replicas WHERE edge_id = ? AND image_id = ?",
-    )
-    .bind(edge_id)
-    .bind(image_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(internal)?;
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM image_replicas WHERE edge_id = ? AND image_id = ?")
+            .bind(edge_id)
+            .bind(image_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
 
     let now = Utc::now();
     if let Some((id,)) = existing {

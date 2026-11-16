@@ -70,6 +70,8 @@ export type Lab = {
   netmask?: string;
   gateway?: string;
   dns?: string;
+  /** dhcp = Edge DHCP reservation by MAC; static = agent configures static IP. */
+  ip_mode?: string;
   default_image_id?: string | null;
   edge_ids?: string[];
   created_at: string;
@@ -83,6 +85,14 @@ export type Client = {
   last_ip?: string;
   assigned_ip?: string;
   last_seen?: string | null;
+  /** Agent heartbeat (not PXE checkin). */
+  agent_last_seen?: string | null;
+  online?: boolean;
+  frozen?: boolean;
+  armed?: boolean;
+  mode_name?: string;
+  current_hostname?: string;
+  identity_state?: string;
   created_at: string;
 };
 export type EnrollmentSettings = {
@@ -285,6 +295,7 @@ export const api = {
         netmask: string;
         gateway: string;
         dns: string;
+        ip_mode: string;
       }>,
     ) =>
       request<Lab>("/api/v1/labs", {
@@ -305,6 +316,7 @@ export const api = {
         netmask?: string;
         gateway?: string;
         dns?: string;
+        ip_mode?: string;
         default_image_id?: string | null;
         edge_ids?: string[];
       },

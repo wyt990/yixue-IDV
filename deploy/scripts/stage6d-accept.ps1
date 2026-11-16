@@ -1,4 +1,4 @@
-# Stage 6d: windows-lab volumes + boot hook + xinchuang matrix + wifi drivers
+﻿# Stage 6d: windows-lab volumes + boot hook + xinchuang matrix + wifi drivers
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

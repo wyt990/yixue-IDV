@@ -1,4 +1,4 @@
-# 导入 SysRestore 测试签名公钥（管理员）。配合 bcdedit testsigning on。
+﻿# 导入 SysRestore 测试签名公钥（管理员）。配合 bcdedit testsigning on。
 #   cd "C:\Program Files\YixueIDV"
 #   .\scripts\install-testcert.ps1
 $ErrorActionPreference = "Stop"

@@ -1,4 +1,4 @@
-# Stage 4 accept: capture -> ingest -> sync -> >=5 deploy -> disk plan preview -> corrupt fail -> task history
+﻿# Stage 4 accept: capture -> ingest -> sync -> >=5 deploy -> disk plan preview -> corrupt fail -> task history
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

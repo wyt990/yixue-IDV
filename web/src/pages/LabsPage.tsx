@@ -161,6 +161,7 @@ export function LabsPage() {
   const [labNetmask, setLabNetmask] = useState("255.255.255.0");
   const [labGateway, setLabGateway] = useState("");
   const [labDns, setLabDns] = useState("");
+  const [labIpMode, setLabIpMode] = useState("static");
   const [labFormError, setLabFormError] = useState("");
 
   const [settingsLab, setSettingsLab] = useState<Lab | null>(null);
@@ -176,6 +177,7 @@ export function LabsPage() {
   const [editNetmask, setEditNetmask] = useState("");
   const [editGateway, setEditGateway] = useState("");
   const [editDns, setEditDns] = useState("");
+  const [editIpMode, setEditIpMode] = useState("static");
   const [editImageId, setEditImageId] = useState("");
   const [editEdgeIds, setEditEdgeIds] = useState<string[]>([]);
   const [modes, setModes] = useState<ModePolicy[]>([]);
@@ -227,6 +229,7 @@ export function LabsPage() {
     setLabNetmask("255.255.255.0");
     setLabGateway("");
     setLabDns("");
+    setLabIpMode("static");
     setLabFormError("");
   }
 
@@ -243,6 +246,7 @@ export function LabsPage() {
     setEditNetmask(lab.netmask || "255.255.255.0");
     setEditGateway(lab.gateway || "");
     setEditDns(lab.dns || "");
+    setEditIpMode(lab.ip_mode || "static");
     setEditImageId(lab.default_image_id || "");
     setEditEdgeIds([...(lab.edge_ids || [])]);
     setSettingsError("");
@@ -307,6 +311,7 @@ export function LabsPage() {
         netmask: labNetmask,
         gateway: labGateway,
         dns: labDns,
+        ip_mode: labIpMode,
       });
       setLabModalCampus(null);
       msg.success(`已在「${labModalCampus.name}」下创建机房`);
@@ -350,6 +355,7 @@ export function LabsPage() {
         netmask: editNetmask,
         gateway: editGateway,
         dns: editDns,
+        ip_mode: editIpMode,
         default_image_id: editImageId || null,
         edge_ids: editEdgeIds,
       });
@@ -756,6 +762,16 @@ export function LabsPage() {
                 placeholder="192.168.1.254"
               />
             </div>
+            <div className="field">
+              <label>IP 分配方式</label>
+              <select
+                value={labIpMode}
+                onChange={(e) => setLabIpMode(e.target.value)}
+              >
+                <option value="dhcp">DHCP 保留（批量部署推荐）</option>
+                <option value="static">客户端静态 IP</option>
+              </select>
+            </div>
           </div>
           <div className="modal-actions">
             <button
@@ -891,6 +907,16 @@ export function LabsPage() {
                 value={editDns}
                 onChange={(e) => setEditDns(e.target.value)}
               />
+            </div>
+            <div className="field">
+              <label>IP 分配方式</label>
+              <select
+                value={editIpMode}
+                onChange={(e) => setEditIpMode(e.target.value)}
+              >
+                <option value="dhcp">DHCP 保留（批量部署推荐）</option>
+                <option value="static">客户端静态 IP</option>
+              </select>
             </div>
           </div>
           <p className="muted" style={{ fontSize: "0.85rem" }}>

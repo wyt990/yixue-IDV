@@ -99,6 +99,27 @@ export function ClientsPage() {
     refresh().catch((err) => msg.error(err.message));
   }, [filterLabId]);
 
+  // Live status: online/offline + restore state refresh (agent heartbeat ~5s).
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      refresh().catch(() => {});
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [filterLabId]);
+
+  function onlineText(c: Client) {
+    if (!c.agent_last_seen) return "—";
+    return c.online ? "在线" : "离线";
+  }
+
+  function restoreText(c: Client) {
+    if (!c.agent_last_seen) return "—";
+    const mode = c.mode_name ? `（${c.mode_name}）` : "";
+    if (c.frozen) return `已冻结${mode}`;
+    if (c.armed) return `待重启生效${mode}`;
+    return `未冻结${mode}`;
+  }
+
   function openAdd() {
     setMac("");
     setName("");
@@ -497,6 +518,8 @@ export function ClientsPage() {
                 />
               </th>
               <th>MAC</th>
+              <th>在线</th>
+              <th>还原状态</th>
               <th>名称</th>
               <th>机房</th>
               <th>分配 IP</th>
@@ -509,7 +532,7 @@ export function ClientsPage() {
           <tbody>
             {clients.length === 0 ? (
               <tr>
-                <td colSpan={9} className="muted">
+                <td colSpan={11} className="muted">
                   暂无终端。可手动添加，或配置默认机房后由 Agent 自动上报入库。
                 </td>
               </tr>
@@ -525,6 +548,16 @@ export function ClientsPage() {
                     />
                   </td>
                   <td className="mono">{c.mac}</td>
+                  <td>
+                    {c.agent_last_seen ? (
+                      <span className={c.online ? "tag" : "tag muted"}>
+                        {onlineText(c)}
+                      </span>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
+                  <td className="muted">{restoreText(c)}</td>
                   <td>
                     {editingId === c.id ? (
                       <input

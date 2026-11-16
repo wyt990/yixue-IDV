@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthUser;
 use crate::mac::normalize_mac;
-use crate::models::{Client, CreateClient, UpdateClient, new_id};
+use crate::models::{Client, ClientView, ClientViewRow, CreateClient, UpdateClient, new_id};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -56,55 +56,33 @@ pub async fn list(
     State(state): State<AppState>,
     _user: AuthUser,
     Query(filter): Query<ClientFilter>,
-) -> Result<Json<Vec<Client>>, (StatusCode, String)> {
-    let rows = match (filter.lab_id, filter.tag) {
-        (Some(lab_id), Some(tag)) => {
-            sqlx::query_as::<_, Client>(
-                r#"
-                SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_ip, c.assigned_ip, c.last_seen, c.created_at
-                FROM clients c
-                JOIN client_tags t ON t.client_id = c.id
-                WHERE c.lab_id = ? AND t.tag = ?
-                ORDER BY c.mac
-                "#,
-            )
-            .bind(lab_id)
-            .bind(tag)
-            .fetch_all(&state.pool)
-            .await
-        }
-        (None, Some(tag)) => {
-            sqlx::query_as::<_, Client>(
-                r#"
-                SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_ip, c.assigned_ip, c.last_seen, c.created_at
-                FROM clients c
-                JOIN client_tags t ON t.client_id = c.id
-                WHERE t.tag = ?
-                ORDER BY c.mac
-                "#,
-            )
-            .bind(tag)
-            .fetch_all(&state.pool)
-            .await
-        }
-        (Some(lab_id), None) => {
-            sqlx::query_as::<_, Client>(
-                "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients WHERE lab_id = ? ORDER BY mac",
-            )
-            .bind(lab_id)
-            .fetch_all(&state.pool)
-            .await
-        }
-        (None, None) => {
-            sqlx::query_as::<_, Client>(
-                "SELECT id, lab_id, mac, name, notes, last_ip, assigned_ip, last_seen, created_at FROM clients ORDER BY mac",
-            )
-            .fetch_all(&state.pool)
-            .await
-        }
+) -> Result<Json<Vec<ClientView>>, (StatusCode, String)> {
+    let mut sql = String::from(
+        "SELECT c.id, c.lab_id, c.mac, c.name, c.notes, c.last_ip, c.assigned_ip, c.last_seen, c.created_at, \
+         s.last_seen AS agent_last_seen, COALESCE(s.frozen, 0) AS frozen, COALESCE(s.armed, 0) AS armed, \
+         COALESCE(s.mode_name, '') AS mode_name, COALESCE(s.current_hostname, '') AS current_hostname, \
+         COALESCE(s.identity_state, '') AS identity_state \
+         FROM clients c LEFT JOIN agent_sessions s ON s.mac = c.mac WHERE 1 = 1",
+    );
+    if filter.lab_id.is_some() {
+        sql.push_str(" AND c.lab_id = ?");
     }
-    .map_err(internal)?;
-    Ok(Json(rows))
+    if filter.tag.is_some() {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM client_tags t WHERE t.client_id = c.id AND t.tag = ?)",
+        );
+    }
+    sql.push_str(" ORDER BY c.mac");
+
+    let mut query = sqlx::query_as::<_, ClientViewRow>(&sql);
+    if let Some(lab_id) = filter.lab_id {
+        query = query.bind(lab_id);
+    }
+    if let Some(tag) = filter.tag {
+        query = query.bind(tag);
+    }
+    let rows = query.fetch_all(&state.pool).await.map_err(internal)?;
+    Ok(Json(rows.into_iter().map(ClientView::from).collect()))
 }
 
 pub async fn list_tags(
@@ -112,11 +90,12 @@ pub async fn list_tags(
     _user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT tag FROM client_tags WHERE client_id = ? ORDER BY tag")
-        .bind(id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(internal)?;
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT tag FROM client_tags WHERE client_id = ? ORDER BY tag")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(internal)?;
     Ok(Json(rows.into_iter().map(|r| r.0).collect()))
 }
 
@@ -327,8 +306,7 @@ pub async fn bulk_move(
             continue;
         }
         if body.rename {
-            if let Err((_, msg)) =
-                crate::lab_naming::rename_for_lab(&state, &body.lab_id, id).await
+            if let Err((_, msg)) = crate::lab_naming::rename_for_lab(&state, &body.lab_id, id).await
             {
                 errors.push(format!("{id}: {msg}"));
                 continue;

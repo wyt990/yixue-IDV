@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use crate::models::Lab;
 use crate::state::AppState;
 
-pub const LAB_COLS: &str = "id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, netmask, gateway, dns, default_image_id, created_at";
+pub const LAB_COLS: &str = "id, campus_id, name, name_prefix, suffix_width, suffix_start, next_suffix, ip_start, ip_end, netmask, gateway, dns, ip_mode, default_image_id, created_at";
 pub const CAMPUS_COLS: &str = "id, name, default_image_id, created_at";
 
 pub fn format_client_name(prefix: &str, width: i64, n: i64) -> String {
@@ -13,10 +13,7 @@ pub fn format_client_name(prefix: &str, width: i64, n: i64) -> String {
     format!("{prefix}{n:0width$}")
 }
 
-pub async fn load_lab(
-    state: &AppState,
-    lab_id: &str,
-) -> Result<Lab, (StatusCode, String)> {
+pub async fn load_lab(state: &AppState, lab_id: &str) -> Result<Lab, (StatusCode, String)> {
     let sql = format!("SELECT {LAB_COLS} FROM labs WHERE id = ?");
     sqlx::query_as::<_, Lab>(&sql)
         .bind(lab_id)
@@ -119,10 +116,8 @@ pub async fn allocate_next_ip(
             .fetch_all(&state.pool)
             .await
             .map_err(internal)?;
-    let used: std::collections::HashSet<u32> = used
-        .into_iter()
-        .filter_map(|(s,)| parse_ipv4(&s))
-        .collect();
+    let used: std::collections::HashSet<u32> =
+        used.into_iter().filter_map(|(s,)| parse_ipv4(&s)).collect();
     let mut cur = start;
     loop {
         if !used.contains(&cur) {

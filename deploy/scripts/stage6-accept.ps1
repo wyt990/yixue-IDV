@@ -1,4 +1,4 @@
-# Stage 6 P0: modes, agent restore, delta recommend
+﻿# Stage 6 P0: modes, agent restore, delta recommend
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

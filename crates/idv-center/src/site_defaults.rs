@@ -26,9 +26,7 @@ pub async fn resolve_baseline_image_id(
             .fetch_optional(pool)
             .await
             .map_err(internal)?;
-    Ok(campus_img
-        .flatten()
-        .filter(|s| !s.is_empty()))
+    Ok(campus_img.flatten().filter(|s| !s.is_empty()))
 }
 
 /// Lab edge bindings if any; else campus bindings. Ordered by priority ascending.
@@ -68,7 +66,10 @@ pub async fn resolve_preferred_edge_id(
     pool: &SqlitePool,
     lab_id: &str,
 ) -> Result<Option<String>, (StatusCode, String)> {
-    Ok(resolve_preferred_edge_ids(pool, lab_id).await?.into_iter().next())
+    Ok(resolve_preferred_edge_ids(pool, lab_id)
+        .await?
+        .into_iter()
+        .next())
 }
 
 pub async fn lab_id_for_mac(
@@ -126,15 +127,13 @@ pub async fn replace_campus_edges(
         .await
         .map_err(internal)?;
     for (i, edge_id) in edge_ids.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO campus_edges (campus_id, edge_id, priority) VALUES (?, ?, ?)",
-        )
-        .bind(campus_id)
-        .bind(edge_id)
-        .bind(i as i64)
-        .execute(pool)
-        .await
-        .map_err(internal)?;
+        sqlx::query("INSERT INTO campus_edges (campus_id, edge_id, priority) VALUES (?, ?, ?)")
+            .bind(campus_id)
+            .bind(edge_id)
+            .bind(i as i64)
+            .execute(pool)
+            .await
+            .map_err(internal)?;
     }
     Ok(())
 }

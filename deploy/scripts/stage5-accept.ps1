@@ -1,4 +1,4 @@
-# Stage 5: 2 edges online + sync, cache watermark, P2P ratio, scale limits
+﻿# Stage 5: 2 edges online + sync, cache watermark, P2P ratio, scale limits
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root

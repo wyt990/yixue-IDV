@@ -10,6 +10,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::ip_bindings::{IpBindings, ip_in_subnet};
+
 #[derive(Clone)]
 pub struct DhcpConfig {
     pub mode: String, // full | proxy | off
@@ -22,6 +24,8 @@ pub struct DhcpConfig {
     pub offer_end: Ipv4Addr,
     pub lease_secs: u32,
     pub dns: Option<Ipv4Addr>,
+    /// MAC -> reserved IPv4 pulled from Center (batch identity / DHCP mode).
+    pub reservations: IpBindings,
 }
 
 #[derive(Clone)]
@@ -183,17 +187,42 @@ impl DhcpService {
         }
 
         let as_proxy = proxy4011 || self.cfg.mode == "proxy";
+        // Center-assigned IPv4 for this MAC (batch identity). Ignore reservations
+        // outside this DHCP server's subnet so a misconfigured binding can never
+        // hand out a foreign address.
+        let reserved = self
+            .cfg
+            .reservations
+            .get(&chaddr)
+            .await
+            .filter(|ip| ip_in_subnet(*ip, self.cfg.next_server, self.cfg.subnet_mask));
         // 1=Discover 3=Request; some PXE stacks also retry Discover (1) after Offer.
         let (yiaddr, resp_type) = match (as_proxy, msg_type) {
             (true, 1 | 3) => (Ipv4Addr::UNSPECIFIED, if msg_type == 1 { 2 } else { 5 }),
-            (false, 1) => (self.allocate(&chaddr).await?, 2),
+            (false, 1) => {
+                let ip = match reserved {
+                    Some(ip) => {
+                        let mut leases = self.leases.lock().await;
+                        leases.insert(chaddr, ip);
+                        ip
+                    }
+                    None => self.allocate(&chaddr).await?,
+                };
+                (ip, 2)
+            }
             (false, 3) => {
+                let reserved_ips = self.cfg.reservations.reserved_ips().await;
                 let mut leases = self.leases.lock().await;
-                let ip = if let Some(ip) = leases.get(&chaddr).copied() {
+                let ip = if let Some(ip) = reserved {
+                    leases.insert(chaddr, ip);
+                    ip
+                } else if let Some(ip) = leases.get(&chaddr).copied() {
                     ip
                 } else if let Some(ip) = req_ip.filter(|ip| {
                     let n = u32::from(*ip);
-                    n >= u32::from(self.cfg.offer_start) && n <= u32::from(self.cfg.offer_end)
+                    n >= u32::from(self.cfg.offer_start)
+                        && n <= u32::from(self.cfg.offer_end)
+                        && !reserved_ips.contains(&n)
                 }) {
                     leases.insert(chaddr, ip);
                     ip
@@ -275,6 +304,20 @@ impl DhcpService {
     }
 
     async fn allocate(&self, mac: &[u8; 6]) -> anyhow::Result<Ipv4Addr> {
+        // Center reservation wins over the pool.
+        if let Some(ip) = self
+            .cfg
+            .reservations
+            .get(mac)
+            .await
+            .filter(|ip| ip_in_subnet(*ip, self.cfg.next_server, self.cfg.subnet_mask))
+        {
+            self.leases.lock().await.insert(*mac, ip);
+            info!(mac = %format_mac(mac), %ip, "dhcp reserved IP granted");
+            return Ok(ip);
+        }
+
+        let reserved = self.cfg.reservations.reserved_ips().await;
         let mut leases = self.leases.lock().await;
         if let Some(ip) = leases.get(mac) {
             return Ok(*ip);
@@ -288,6 +331,9 @@ impl DhcpService {
                 self.next_ip.store(start + 1, Ordering::Relaxed);
             }
             let ip = Ipv4Addr::from(ip_u32);
+            if reserved.contains(&ip_u32) {
+                continue;
+            }
             if !leases.values().any(|v| *v == ip) {
                 leases.insert(*mac, ip);
                 return Ok(ip);
@@ -491,5 +537,46 @@ mod tests {
         assert_eq!(dhcp_option(&reply, 53), Some(&[2][..]));
         assert!(dhcp_option(&reply, 60).is_none());
         assert_eq!(dhcp_option(&reply, 43), Some(&[6, 1, 0x08, 0xff][..]));
+    }
+
+    #[tokio::test]
+    async fn reserved_mac_wins_over_pool() {
+        use crate::ip_bindings::{Binding, BindingsDoc};
+        let reservations = IpBindings::new();
+        reservations
+            .replace(&BindingsDoc {
+                bindings: vec![Binding {
+                    mac: "02:11:22:33:44:55".into(),
+                    ip: "10.10.0.99".into(),
+                    lab_id: "lab".into(),
+                }],
+            })
+            .await;
+        let svc = DhcpService::new(DhcpConfig {
+            mode: "full".into(),
+            bind: "0.0.0.0:0".into(),
+            next_server: "10.10.0.1".parse().unwrap(),
+            boot_file: "undionly.kpxe".into(),
+            subnet_mask: "255.255.255.0".parse().unwrap(),
+            router: "10.10.0.1".parse().unwrap(),
+            offer_start: "10.10.0.50".parse().unwrap(),
+            offer_end: "10.10.0.60".parse().unwrap(),
+            lease_secs: 3600,
+            dns: None,
+            reservations: reservations.clone(),
+        });
+
+        let reserved_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        assert_eq!(
+            svc.allocate(&reserved_mac).await.unwrap(),
+            Ipv4Addr::new(10, 10, 0, 99)
+        );
+
+        // Other clients must never be handed the reserved address.
+        for i in 0..5u8 {
+            let mac = [0x02, 0, 0, 0, 0, i + 1];
+            let ip = svc.allocate(&mac).await.unwrap();
+            assert_ne!(ip, Ipv4Addr::new(10, 10, 0, 99));
+        }
     }
 }
