@@ -4,6 +4,7 @@ import {
   api,
   type Campus,
   type Client,
+  type CommandPreset,
   type EnrollmentSettings,
   type ImageItem,
   type Lab,
@@ -58,6 +59,17 @@ export function ClientsPage() {
   const [collectDir, setCollectDir] = useState("C:\\Users\\Public\\Documents");
   const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Documents");
   const [batchFile, setBatchFile] = useState<File | null>(null);
+  const [commandMenuOpen, setCommandMenuOpen] = useState(false);
+  const [presetKind, setPresetKind] = useState<null | "command" | "url" | "program">(null);
+  const [presets, setPresets] = useState<CommandPreset[]>([]);
+  const [presetEditing, setPresetEditing] = useState(false);
+  const [presetId, setPresetId] = useState<string | null>(null);
+  const [presetName, setPresetName] = useState("");
+  const [presetCommand, setPresetCommand] = useState("");
+  const [presetUrl, setPresetUrl] = useState("https://");
+  const [presetProgram, setPresetProgram] = useState("");
+  const [presetArgs, setPresetArgs] = useState("");
+  const [commandError, setCommandError] = useState("");
 
   const [addOpen, setAddOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -378,6 +390,132 @@ export function ClientsPage() {
     setStage({ mac: picked[0].mac, mode });
   }
 
+  async function refreshPresets() {
+    setPresets(await api.commandPresets.list());
+  }
+
+  async function openPreset(kind: "command" | "url" | "program") {
+    if (picked.length !== 1) {
+      msg.warning("请只选择一台终端");
+      return;
+    }
+    setCommandError("");
+    setPresetKind(kind);
+    setPresetEditing(false);
+    setPresetId(null);
+    try {
+      await refreshPresets();
+    } catch (e) {
+      setCommandError(String((e as Error).message || e));
+    }
+  }
+
+  function startAddPreset() {
+    setPresetEditing(true);
+    setPresetId(null);
+    setPresetName("");
+    setPresetCommand("");
+    setPresetUrl("https://");
+    setPresetProgram("");
+    setPresetArgs("");
+  }
+
+  function startEditPreset(p: CommandPreset) {
+    setPresetEditing(true);
+    setPresetId(p.id);
+    setPresetName(p.name);
+    setPresetCommand(p.command);
+    setPresetUrl(p.url || "https://");
+    setPresetProgram(p.program_path);
+    setPresetArgs(p.args);
+  }
+
+  async function savePreset() {
+    if (!presetKind) return;
+    if (!presetName.trim()) {
+      setCommandError("请填写名称");
+      return;
+    }
+    if (presetKind === "command" && !presetCommand.trim()) {
+      setCommandError("请填写命令");
+      return;
+    }
+    if (presetKind === "url" && !presetUrl.trim()) {
+      setCommandError("请填写网址");
+      return;
+    }
+    if (presetKind === "program" && !presetProgram.trim()) {
+      setCommandError("请填写程序路径");
+      return;
+    }
+    const payload = {
+      kind: presetKind,
+      name: presetName.trim(),
+      command: presetCommand.trim(),
+      url: presetUrl.trim(),
+      program_path: presetProgram.trim(),
+      args: presetArgs.trim(),
+    };
+    try {
+      if (presetId) {
+        await api.commandPresets.update(presetId, payload);
+      } else {
+        await api.commandPresets.create(payload);
+      }
+      msg.success("已保存");
+      setPresetEditing(false);
+      setPresetId(null);
+      await refreshPresets();
+    } catch (e) {
+      setCommandError(String((e as Error).message || e));
+    }
+  }
+
+  async function deletePreset(p: CommandPreset) {
+    if (!window.confirm(`删除「${p.name}」？`)) return;
+    try {
+      await api.commandPresets.delete(p.id);
+      if (presetId === p.id) {
+        setPresetEditing(false);
+        setPresetId(null);
+      }
+      await refreshPresets();
+      msg.success("已删除");
+    } catch (e) {
+      setCommandError(String((e as Error).message || e));
+    }
+  }
+
+  async function executePreset(p: CommandPreset) {
+    if (p.kind === "command") {
+      await sendClientCommand("run_program", {
+        path: "C:\\Windows\\System32\\cmd.exe",
+        args: ["/c", p.command],
+      });
+    } else if (p.kind === "url") {
+      await sendClientCommand("open_url", { url: p.url });
+    } else {
+      await sendClientCommand("run_program", {
+        path: p.program_path,
+        args: p.args.trim() ? p.args.trim().split(/\s+/) : [],
+      });
+    }
+  }
+
+  async function sendClientCommand(kind: string, payload: unknown) {
+    if (picked.length !== 1) {
+      setCommandError("请只选择一台终端");
+      return;
+    }
+    setCommandError("");
+    try {
+      await api.clients.command(picked[0].mac, kind, payload);
+      msg.success("命令已通过 Agent 即时通道下发");
+    } catch (e) {
+      setCommandError(String((e as Error).message || e));
+    }
+  }
+
   function openFiles(kind: "collect" | "distribute") {
     if (picked.length === 0) {
       msg.warning("请先勾选终端");
@@ -693,6 +831,55 @@ export function ClientsPage() {
               >
                 协助
               </button>
+              <div className="more-menu">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={!!needOne}
+                  title={needOne}
+                  aria-expanded={commandMenuOpen}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCommandMenuOpen((v) => !v);
+                  }}
+                >
+                  命令
+                </button>
+                {commandMenuOpen ? (
+                  <div className="more-pop">
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => {
+                        setCommandMenuOpen(false);
+                        openPreset("command");
+                      }}
+                    >
+                      执行命令
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => {
+                        setCommandMenuOpen(false);
+                        openPreset("url");
+                      }}
+                    >
+                      打开网页
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => {
+                        setCommandMenuOpen(false);
+                        openPreset("program");
+                      }}
+                    >
+                      运行程序
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
             <div className="command-group">
               <button
@@ -1252,6 +1439,171 @@ export function ClientsPage() {
             </button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={presetKind !== null}
+        title={
+          presetKind === "command"
+            ? "执行命令"
+            : presetKind === "url"
+              ? "打开网页"
+              : "运行程序"
+        }
+        onClose={() => {
+          setPresetKind(null);
+          setPresetEditing(false);
+          setPresetId(null);
+        }}
+        wide
+      >
+        <p className="muted">
+          目标：{picked[0]?.name || picked[0]?.mac || "—"}（{picked[0]?.mac}）。
+          可从列表直接执行，也可新增/编辑常用项；执行结果不回传 stdout/退出码。
+        </p>
+        {commandError ? <p className="error">{commandError}</p> : null}
+
+        {presetEditing ? (
+          <div className="preset-editor">
+            <div className="field">
+              <label>名称</label>
+              <input
+                value={presetName}
+                onChange={(e) => setPresetName(e.target.value)}
+                placeholder="例如：查看 IP 配置"
+              />
+            </div>
+            {presetKind === "command" ? (
+              <div className="field">
+                <label>命令（cmd /c）</label>
+                <input
+                  className="mono"
+                  value={presetCommand}
+                  onChange={(e) => setPresetCommand(e.target.value)}
+                  placeholder="ipconfig /all"
+                />
+              </div>
+            ) : null}
+            {presetKind === "url" ? (
+              <div className="field">
+                <label>网址</label>
+                <input
+                  className="mono"
+                  value={presetUrl}
+                  onChange={(e) => setPresetUrl(e.target.value)}
+                  placeholder="https://www.example.com"
+                />
+              </div>
+            ) : null}
+            {presetKind === "program" ? (
+              <>
+                <div className="field">
+                  <label>程序路径</label>
+                  <input
+                    className="mono"
+                    value={presetProgram}
+                    onChange={(e) => setPresetProgram(e.target.value)}
+                    placeholder="C:\Path\app.exe"
+                  />
+                </div>
+                <div className="field">
+                  <label>参数（空格分隔）</label>
+                  <input
+                    className="mono"
+                    value={presetArgs}
+                    onChange={(e) => setPresetArgs(e.target.value)}
+                    placeholder="--flag value"
+                  />
+                </div>
+              </>
+            ) : null}
+            <div className="modal-actions">
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={() => {
+                  setPresetEditing(false);
+                  setPresetId(null);
+                }}
+              >
+                取消
+              </button>
+              <button className="btn" type="button" onClick={() => void savePreset()}>
+                保存
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="page-actions" style={{ marginBottom: "0.75rem" }}>
+            <button className="btn" type="button" onClick={startAddPreset}>
+              新增
+            </button>
+          </div>
+        )}
+
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>内容</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {presets.filter((p) => p.kind === presetKind).length === 0 ? (
+              <tr>
+                <td className="muted" colSpan={3}>
+                  暂无常用项，点「新增」添加。
+                </td>
+              </tr>
+            ) : (
+              presets
+                .filter((p) => p.kind === presetKind)
+                .map((p) => (
+                  <tr key={p.id}>
+                    <td>{p.name}</td>
+                    <td className="mono">
+                      {p.kind === "command"
+                        ? p.command
+                        : p.kind === "url"
+                          ? p.url
+                          : `${p.program_path} ${p.args}`}
+                    </td>
+                    <td>
+                      <div className="page-actions">
+                        <button
+                          className="btn"
+                          type="button"
+                          onClick={() => void executePreset(p)}
+                        >
+                          执行
+                        </button>
+                        <button
+                          className="btn ghost"
+                          type="button"
+                          onClick={() => startEditPreset(p)}
+                        >
+                          编辑
+                        </button>
+                        <button
+                          className="btn danger"
+                          type="button"
+                          onClick={() => void deletePreset(p)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+            )}
+          </tbody>
+        </table>
+
+        <p className="muted">
+          注意：命令通过当前 Agent 即时通道下发；没有交互式 shell，也不回传输出。
+          请只在受控机房使用。
+        </p>
       </Modal>
     </div>
   );

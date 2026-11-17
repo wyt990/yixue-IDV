@@ -65,7 +65,7 @@ crates/
   idv-center/      Center API + Web 静态托管 + 远程控制中继
   idv-edge/        Edge 缓存、DHCP/PXE/TFTP、PE API、IP 保留
   idv-pe-agent/    PE 内采集/部署代理（另编 musl 静态版）
-  idv-agent/       学生机常驻 Agent（0.3.2：还原/身份/命令/远程协助）
+  idv-agent/       学生机常驻 Agent（0.3.3：还原/身份/命令/远程协助）
 web/               管理端（React + Vite）
 deploy/
   config/*.toml.example   配置模板（复制后改本地，勿提交密钥）
@@ -229,7 +229,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-wol.ps1
 | 6 | 还原驱动、模式策略、多盘还原 | 软件已完成（测试签名试点） |
 | 7 | 批量身份、常驻 Agent、即时命令、远程控制、Agent 更新 | 软件已完成 |
 
-当前客户端 Agent：**0.3.2**（GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
+当前客户端 Agent：**0.3.3**（GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
 
 后续增强：更细分区角色向导、远程控制 WebRTC/音频、Agent 设备令牌与命令签名、跨 VLAN WOL 等。
 

@@ -1990,28 +1990,52 @@ async fn execute_agent_command(
         if url.is_empty() {
             return Err(Error::Other(anyhow::anyhow!("open_url missing url")));
         }
+        let mut via = "user_session";
         #[cfg(windows)]
         {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .spawn()
-                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            let args = vec![
+                "/c".to_string(),
+                "start".to_string(),
+                String::new(),
+                url.clone(),
+            ];
+            if let Err(err) =
+                launch_program_as_user("C:\\Windows\\System32\\cmd.exe", &args)
+            {
+                eprintln!("idv-agent: launch open_url in user session failed: {err}");
+                via = "service_session";
+                std::process::Command::new("cmd")
+                    .args(["/C", "start", "", &url])
+                    .spawn()
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            }
         }
-        report_command(cfg, &cmd.id, true, &format!("open_url={url}")).await?;
+        report_command(cfg, &cmd.id, true, &format!("open_url={url} via={via}")).await?;
         return Ok(());
     }
 
     if kind == "run_program" {
         let payload: RunProgramPayload = serde_json::from_str(&cmd.payload)
             .map_err(|e| Error::Other(anyhow::anyhow!("invalid run_program payload: {e}")))?;
+        let mut via = "user_session";
         #[cfg(windows)]
         {
-            std::process::Command::new(&payload.path)
-                .args(&payload.args)
-                .spawn()
-                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            if let Err(err) = launch_program_as_user(&payload.path, &payload.args) {
+                eprintln!("idv-agent: launch program in user session failed: {err}");
+                via = "service_session";
+                std::process::Command::new(&payload.path)
+                    .args(&payload.args)
+                    .spawn()
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            }
         }
-        report_command(cfg, &cmd.id, true, &format!("run_program={}", payload.path)).await?;
+        report_command(
+            cfg,
+            &cmd.id,
+            true,
+            &format!("run_program={} via={via}", payload.path),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2299,13 +2323,7 @@ fn assist_input(value: &serde_json::Value) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn launch_assist_helper(
-    session_id: &str,
-    center_url: &str,
-    mac: &str,
-    kind: &str,
-    frame_ms: u64,
-) -> anyhow::Result<u32> {
+fn launch_as_user(cmd: &str) -> anyhow::Result<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary,
@@ -2353,16 +2371,6 @@ fn launch_assist_helper(
     }
     let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
     let env_ok = unsafe { CreateEnvironmentBlock(&mut env, primary, 0) };
-    let exe = std::env::current_exe()?;
-    let cmd = format!(
-        "\"{}\" assist-helper --session-id {} --center-url {} --mac {} --kind {} --frame-ms {}",
-        exe.display(),
-        session_id,
-        center_url,
-        mac,
-        kind,
-        frame_ms
-    );
     let mut cmdline: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -2405,6 +2413,46 @@ fn launch_assist_helper(
         CloseHandle(pi.hProcess);
     }
     Ok(pi.dwProcessId)
+}
+
+#[cfg(windows)]
+fn quote_cmd_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.contains([' ', '\t', '"']) {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn launch_program_as_user(exe: &str, args: &[String]) -> anyhow::Result<u32> {
+    let mut cmd = quote_cmd_arg(exe);
+    for arg in args {
+        cmd.push(' ');
+        cmd.push_str(&quote_cmd_arg(arg));
+    }
+    launch_as_user(&cmd)
+}
+
+#[cfg(windows)]
+fn launch_assist_helper(
+    session_id: &str,
+    center_url: &str,
+    mac: &str,
+    kind: &str,
+    frame_ms: u64,
+) -> anyhow::Result<u32> {
+    let exe = std::env::current_exe()?;
+    let cmd = format!(
+        "{} assist-helper --session-id {} --center-url {} --mac {} --kind {} --frame-ms {}",
+        quote_cmd_arg(&exe.to_string_lossy()),
+        session_id,
+        center_url,
+        mac,
+        kind,
+        frame_ms
+    );
+    launch_as_user(&cmd)
 }
 
 static ASSIST_HELPER_SESSION: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);

@@ -151,6 +151,18 @@ export type TaskTarget = {
   edge_bytes?: number;
   updated_at: string;
 };
+export type CommandPreset = {
+  id: string;
+  kind: "command" | "url" | "program";
+  name: string;
+  command: string;
+  url: string;
+  program_path: string;
+  args: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type TaskView = {
   id: string;
   kind: string;
@@ -392,6 +404,18 @@ export const api = {
         "/api/v1/clients/bulk-move",
         { method: "POST", body: JSON.stringify({ ids, lab_id, rename }) },
       ),
+    command: (mac: string, kind: string, payload: unknown) =>
+      request<{ id: string }>(
+        `/api/v1/clients/${encodeURIComponent(mac)}/commands`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            kind,
+            payload:
+              typeof payload === "string" ? payload : JSON.stringify(payload),
+          }),
+        },
+      ),
   },
   enrollment: {
     get: () => request<EnrollmentSettings>("/api/v1/ops/enrollment"),
@@ -400,6 +424,24 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload),
       }),
+  },
+  commandPresets: {
+    list: () => request<CommandPreset[]>("/api/v1/command-presets"),
+    create: (payload: Omit<CommandPreset, "id" | "created_at" | "updated_at">) =>
+      request<CommandPreset>("/api/v1/command-presets", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    update: (
+      id: string,
+      payload: Omit<CommandPreset, "id" | "created_at" | "updated_at">,
+    ) =>
+      request<CommandPreset>(`/api/v1/command-presets/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+    delete: (id: string) =>
+      request<void>(`/api/v1/command-presets/${id}`, { method: "DELETE" }),
   },
   taskLifecycle: {
     get: () => request<TaskLifecycleSettings>("/api/v1/ops/task-lifecycle"),

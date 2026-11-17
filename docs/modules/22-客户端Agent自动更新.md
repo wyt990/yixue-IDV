@@ -134,7 +134,7 @@ Center 上传 exe 时自动扫描该标记得到版本号，并以此命名包�
 3. 客户端心跳的 `agent_version` 与包内标记一致，Center 才能正确判断更新完成；
 4. 如果上传的 exe 找不到标记（例如 0.1.0 旧包），Center 会拒绝并提示。
 
-当前版本：`0.3.2`（旧客户端 `0.1.0` / `0.2.0` / `0.3.0` / `0.3.1`）。
+当前版本：`0.3.3`（旧客户端 `0.1.0` / `0.2.0` / `0.3.0` / `0.3.1`）。
 
 ### 4.1 首次启用（必须手动一次）
 
@@ -172,7 +172,7 @@ Start-Service idv-agent
 ```powershell
 # 客户端管理员 PowerShell
 $dst = "C:\Program Files\YixueIDV\idv-agent.exe"
-Invoke-WebRequest "http://10.110.0.1:8080/api/v1/agent/packages/0.3.2/download" `
+Invoke-WebRequest "http://10.110.0.1:8080/api/v1/agent/packages/0.3.3/download" `
   -OutFile "$env:ProgramData\YixueIDV\idv-agent-0.3.0.exe"
 Stop-Service idv-agent -Force -ErrorAction SilentlyContinue
 Copy-Item "$env:ProgramData\YixueIDV\idv-agent-0.3.0.exe" $dst -Force

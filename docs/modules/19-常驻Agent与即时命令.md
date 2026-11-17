@@ -79,6 +79,15 @@ service/daemon
 - `reboot`/`shutdown`：先回执，再 `shutdown.exe /r|/s /t 5`；
 - `open_url`：`cmd /c start "" "<url>"`；
 - `run_program`：`{ "path": "...", "args": [...] }` → 启动进程；
+- 两者优先通过 `CreateProcessAsUser` 在登录用户桌面启动，程序/网页会显示在当前用户会话；无登录会话时回退服务会话；
+- 执行结果不回传 stdout/退出码，仅回执已下发。
+
+### 3.1 常用命令预置
+
+管理端终端页勾选一台终端 →「命令」下拉，分别进入 **执行命令 / 打开网页 / 运行程序** 模态框；
+每个模态框可列出、新增、编辑、删除常用项，点「执行」即可下发，无需重复输入。
+
+预置项存 Center（迁移 `022_command_presets.sql`，`/api/v1/command-presets`），多管理员共享。
 - 执行失败会回执 `ok=false + detail`，网页/日志可查。
 
 ---

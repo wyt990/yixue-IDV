@@ -1,4 +1,5 @@
 import { ReactNode, useEffect } from "react";
+import { createPortal } from "react-dom";
 
 export function Drawer({
   open,
@@ -22,7 +23,7 @@ export function Drawer({
 
   if (!open) return null;
 
-  return (
+  return createPortal(
     <div className="drawer-backdrop" onClick={onClose} role="presentation">
       <aside
         className="drawer"
@@ -39,6 +40,7 @@ export function Drawer({
         </div>
         <div className="drawer-body">{children}</div>
       </aside>
-    </div>
+    </div>,
+    document.body,
   );
 }

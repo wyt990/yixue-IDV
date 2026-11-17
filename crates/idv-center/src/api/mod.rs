@@ -7,6 +7,7 @@ pub(crate) mod audit;
 mod auth;
 mod campuses;
 mod clients;
+mod command_presets;
 mod dashboard;
 mod delta_images;
 mod edge_agent;
@@ -192,6 +193,14 @@ pub fn router() -> Router<AppState> {
             get(remote::fs_data_get)
                 .put(remote::fs_data_put)
                 .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/command-presets",
+            get(command_presets::list).post(command_presets::create),
+        )
+        .route(
+            "/api/v1/command-presets/{id}",
+            put(command_presets::update).delete(command_presets::delete),
         )
         .route(
             "/api/v1/tasks/file-collect",
