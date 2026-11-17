@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { PageHeader } from "../components/PageHeader";
 
 type Row = {
   id: string;
@@ -28,15 +29,10 @@ export function PeSessionsPage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div>
-        <h1>PE 会话</h1>
-        <p className="muted">
-          客户端经 PXE/iPXE 或 pe-agent 进入维护环境后的报到记录。
-        </p>
-      </div>
+      <PageHeader title="PE 会话" meta={`${rows.length} 条报到`} />
       {error ? <p className="error">{error}</p> : null}
       <div className="card">
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>MAC</th>

@@ -1,4 +1,5 @@
 import { useTheme, type ThemeId } from "../theme";
+import { PageHeader } from "../components/PageHeader";
 
 const themes: { id: ThemeId; name: string; desc: string }[] = [
   { id: "ink-lab", name: "墨蓝教研", desc: "日间网管默认，深墨蓝 + 亮青信息色" },
@@ -12,13 +13,7 @@ export function AppearancePage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div>
-        <h1>外观主题</h1>
-        <p className="muted">
-          基于 Design Tokens 切换；偏好保存在本机。信创浏览器抽检见文档「模块
-          13 — 信创浏览器兼容矩阵」。
-        </p>
-      </div>
+      <PageHeader title="外观主题" meta="偏好保存在本机" />
       <div className="form-row">
         {themes.map((t) => (
           <button

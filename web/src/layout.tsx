@@ -1,22 +1,30 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { useAuth } from "./auth";
+import { UserMenu } from "./components/UserMenu";
 import { useTheme, type ThemeId } from "./theme";
 
-const links = [
-  { to: "/", label: "工作台", end: true },
-  { to: "/labs", label: "校区 / 机房" },
-  { to: "/clients", label: "终端" },
-  { to: "/remote", label: "远程控制" },
-  { to: "/images", label: "镜像库" },
-  { to: "/edges", label: "边缘节点" },
-  { to: "/pe-sessions", label: "PE 会话" },
-  { to: "/tasks", label: "维护任务" },
-  { to: "/admins", label: "管理员" },
-  { to: "/appearance", label: "外观主题" },
+const groups = [
+  {
+    label: "运维",
+    links: [
+      { to: "/", label: "工作台", end: true },
+      { to: "/clients", label: "终端" },
+      { to: "/images", label: "镜像库" },
+      { to: "/edges", label: "边缘节点" },
+      { to: "/tasks", label: "维护任务" },
+    ],
+  },
+  {
+    label: "配置",
+    links: [
+      { to: "/labs", label: "校区 / 机房" },
+      { to: "/pe-sessions", label: "PE 会话" },
+      { to: "/admins", label: "管理员" },
+      { to: "/appearance", label: "外观主题" },
+    ],
+  },
 ];
 
 export function AppLayout() {
-  const { user, logout } = useAuth();
   const { theme, setTheme } = useTheme();
 
   return (
@@ -30,15 +38,20 @@ export function AppLayout() {
           <div className="brand-sub">机房管理系统</div>
         </div>
         <nav className="nav">
-          {links.map((link) => (
-            <NavLink
-              key={link.to}
-              to={link.to}
-              end={link.end}
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              {link.label}
-            </NavLink>
+          {groups.map((group) => (
+            <div key={group.label} className="nav-group">
+              <div className="nav-label">{group.label}</div>
+              {group.links.map((link) => (
+                <NavLink
+                  key={link.to}
+                  to={link.to}
+                  end={link.end}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  {link.label}
+                </NavLink>
+              ))}
+            </div>
           ))}
         </nav>
       </aside>
@@ -56,13 +69,7 @@ export function AppLayout() {
               <option value="slate-ops">暖石运维</option>
               <option value="night-duty">暗夜值班</option>
             </select>
-            <span className="muted">
-              {user?.display_name}
-              {user?.role ? ` · ${user.role}` : ""}
-            </span>
-            <button className="btn ghost" type="button" onClick={logout}>
-              退出
-            </button>
+            <UserMenu />
           </div>
         </header>
         <main className="content">

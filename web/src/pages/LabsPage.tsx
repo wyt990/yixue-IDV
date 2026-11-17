@@ -8,6 +8,7 @@ import {
   type ModePolicy,
 } from "../api";
 import { Modal } from "../components/Modal";
+import { PageHeader } from "../components/PageHeader";
 import { useMessage } from "../message";
 
 type ModeBinding = {
@@ -388,26 +389,21 @@ export function LabsPage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div className="panel-head">
-        <div>
-          <h1>校区 / 机房</h1>
-          <p className="muted">
-            可配置命名/IP 网段、工作模式、默认镜像与边缘绑定；机房未配时回落校区。
-          </p>
-        </div>
-        <div className="page-actions">
-          <button type="button" className="btn" onClick={openCampusModal}>
+      <PageHeader
+        title="校区 / 机房"
+        meta={`${campuses.length} 个校区 · ${labs.length} 个机房`}
+      >
+          <button type="button" className="btn sm" onClick={openCampusModal}>
             添加校区
           </button>
-        </div>
-      </div>
+      </PageHeader>
 
       <div className="card">
         <div className="panel-head">
           <h2>校区列表</h2>
           <span className="muted">{campuses.length} 个</span>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>名称</th>
@@ -476,7 +472,7 @@ export function LabsPage() {
           <h2>机房列表</h2>
           <span className="muted">{labs.length} 个</span>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>机房</th>

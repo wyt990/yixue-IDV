@@ -1,4 +1,5 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   api,
   type AgentPackage,
@@ -11,6 +12,8 @@ import {
   type TaskView,
 } from "../api";
 import { Modal } from "../components/Modal";
+import { PageHeader } from "../components/PageHeader";
+import { readLabId, writeLabId } from "../labScope";
 import { useMessage } from "../message";
 import {
   diskPlanLabel,
@@ -40,6 +43,9 @@ type ModalKind = "capture" | "deploy" | "agent" | "lifecycle" | null;
 
 export function TasksPage() {
   const msg = useMessage();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const handed = useRef(false);
   const [tasks, setTasks] = useState<TaskView[]>([]);
   const [images, setImages] = useState<ImageItem[]>([]);
   const [edges, setEdges] = useState<EdgeNode[]>([]);
@@ -59,7 +65,11 @@ export function TasksPage() {
   const [agentUploading, setAgentUploading] = useState(false);
   const [selectedMacs, setSelectedMacs] = useState<Set<string>>(new Set());
   const [filterCampusId, setFilterCampusId] = useState("");
-  const [filterLabId, setFilterLabId] = useState("");
+  const [filterLabId, setFilterLabIdState] = useState(readLabId);
+  function setFilterLabId(id: string) {
+    setFilterLabIdState(id);
+    writeLabId(id);
+  }
   const [diskPlan, setDiskPlan] = useState("wipe_whole_disk");
   const [edgeId, setEdgeId] = useState("");
   const [lifecycle, setLifecycle] = useState<TaskLifecycleSettings>({
@@ -175,6 +185,20 @@ export function TasksPage() {
     }
     setModal(kind);
   }
+
+  useEffect(() => {
+    if (handed.current) return;
+    const state = location.state as { open?: ModalKind; macs?: string[] } | null;
+    if (!state?.open && !state?.macs?.length) return;
+    handed.current = true;
+    if (state.macs?.length) {
+      setSelectedMacs(new Set(state.macs));
+      setFilterLabIdState("");
+      setFilterCampusId("");
+    }
+    if (state.open) openModal(state.open);
+    navigate(".", { replace: true, state: null });
+  }, []);
 
   useEffect(() => {
     refresh().catch((err) => msg.error(err.message));
@@ -334,44 +358,39 @@ export function TasksPage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div className="panel-head">
-        <div>
-          <h1>维护任务</h1>
-          <p className="muted">
-            采集入库与批量部署；区分「同步到边缘」与「部署到终端」。
-          </p>
-        </div>
-        <div className="page-actions">
+      <PageHeader
+        title="维护任务"
+        meta={`${tasks.filter((t) => t.state === "running" || t.state === "pending").length} 个进行中 · 共 ${tasks.length} 个`}
+      >
           <button
             type="button"
-            className="btn"
+            className="btn sm"
             onClick={() => openModal("capture")}
           >
             采集任务
           </button>
           <button
             type="button"
-            className="btn accent"
+            className="btn accent sm"
             onClick={() => openModal("deploy")}
           >
             部署任务
           </button>
           <button
             type="button"
-            className="btn"
+            className="btn sm"
             onClick={() => openModal("agent")}
           >
             更新 Agent
           </button>
           <button
             type="button"
-            className="btn ghost"
+            className="btn ghost sm"
             onClick={() => openModal("lifecycle")}
           >
             超时设置
           </button>
-        </div>
-      </div>
+      </PageHeader>
 
       <div className="card">
         <div className="panel-head">
@@ -394,7 +413,7 @@ export function TasksPage() {
             导出 CSV
           </button>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>名称</th>
@@ -642,7 +661,7 @@ export function TasksPage() {
               </button>
             </div>
             <div style={{ maxHeight: "16rem", overflow: "auto" }}>
-              <table>
+              <table className="data-table">
                 <thead>
                   <tr>
                     <th>

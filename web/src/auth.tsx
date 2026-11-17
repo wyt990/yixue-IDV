@@ -13,6 +13,7 @@ type AuthContextValue = {
   loading: boolean;
   login: (username: string, password: string) => Promise<void>;
   logout: () => void;
+  setUser: (user: Admin) => void;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -48,6 +49,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setToken(null);
         setUser(null);
       },
+      setUser,
     }),
     [user, loading],
   );

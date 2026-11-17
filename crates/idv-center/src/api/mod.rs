@@ -31,7 +31,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/auth/login", post(auth::login))
-        .route("/api/v1/auth/me", get(auth::me))
+        .route("/api/v1/auth/me", get(auth::me).put(auth::update_me))
         .route("/api/v1/dashboard", get(dashboard::stats))
         .route(
             "/api/v1/campuses",
@@ -73,6 +73,10 @@ pub fn router() -> Router<AppState> {
             get(images::get).delete(images::delete),
         )
         .route("/api/v1/admins", get(admins::list).post(admins::create))
+        .route(
+            "/api/v1/admins/{id}",
+            put(admins::update).delete(admins::delete),
+        )
         .route("/api/v1/edges", get(edges::list).post(edges::create))
         .route(
             "/api/v1/edges/{id}",

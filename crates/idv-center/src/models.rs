@@ -670,6 +670,28 @@ pub struct CreateAdmin {
     pub role: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateAdmin {
+    pub username: String,
+    #[serde(default)]
+    pub display_name: String,
+    pub role: String,
+    /// Empty keeps the current password.
+    #[serde(default)]
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMe {
+    pub username: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub current_password: String,
+    #[serde(default)]
+    pub new_password: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DashboardStats {
     pub campuses: i64,

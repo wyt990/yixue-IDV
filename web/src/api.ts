@@ -261,6 +261,16 @@ export const api = {
       { method: "POST", body: JSON.stringify({ username, password }) },
     ),
   me: () => request<Admin>("/api/v1/auth/me"),
+  updateMe: (payload: {
+    username: string;
+    display_name: string;
+    current_password?: string;
+    new_password?: string;
+  }) =>
+    request<Admin>("/api/v1/auth/me", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
   dashboard: () => request<DashboardOverview>("/api/v1/dashboard"),
   campuses: {
     list: () => request<Campus[]>("/api/v1/campuses"),
@@ -467,6 +477,31 @@ export const api = {
   },
   admins: {
     list: () => request<Admin[]>("/api/v1/admins"),
+    create: (payload: {
+      username: string;
+      password: string;
+      display_name: string;
+      role: string;
+    }) =>
+      request<Admin>("/api/v1/admins", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    update: (
+      id: string,
+      payload: {
+        username: string;
+        display_name: string;
+        role: string;
+        password?: string;
+      },
+    ) =>
+      request<Admin>(`/api/v1/admins/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+    delete: (id: string) =>
+      request<void>(`/api/v1/admins/${id}`, { method: "DELETE" }),
   },
   edges: {
     list: () => request<EdgeNode[]>("/api/v1/edges"),

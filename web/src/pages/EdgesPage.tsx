@@ -6,6 +6,7 @@ import {
   type ImageReplica,
 } from "../api";
 import { Modal } from "../components/Modal";
+import { PageHeader } from "../components/PageHeader";
 import { useMessage } from "../message";
 
 function formatBytes(n: number) {
@@ -234,25 +235,17 @@ export function EdgesPage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div className="panel-head">
-        <div>
-          <h1>边缘节点</h1>
-          <p className="muted">
-            注册 Edge、查看在线状态，并将中心镜像同步到边缘缓存。
-          </p>
-        </div>
-        <div className="page-actions">
-          <button type="button" className="btn" onClick={openCreate}>
+      <PageHeader title="边缘节点" meta={`${edges.filter((e) => e.online).length}/${edges.length} 在线`}>
+          <button type="button" className="btn sm" onClick={openCreate}>
             登记 Edge
           </button>
-        </div>
-      </div>
+      </PageHeader>
       <div className="card">
         <div className="panel-head">
           <h2>节点列表</h2>
           <span className="muted">{edges.length} 个 · 约 2.5 秒自动刷新</span>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>名称</th>
@@ -412,7 +405,7 @@ export function EdgesPage() {
           <h2>副本状态</h2>
           <span className="muted">{replicas.length} 条</span>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>镜像</th>

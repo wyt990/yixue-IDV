@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   api,
   type Campus,
@@ -7,7 +8,11 @@ import {
   type ImageItem,
   type Lab,
 } from "../api";
+import { AssistStage } from "../components/AssistStage";
+import { Drawer } from "../components/Drawer";
 import { Modal } from "../components/Modal";
+import { PageHeader } from "../components/PageHeader";
+import { readLabId, writeLabId } from "../labScope";
 import { useMessage } from "../message";
 
 function resolveDefaultImageId(
@@ -30,12 +35,29 @@ const DISK_PLANS = [
 
 export function ClientsPage() {
   const msg = useMessage();
+  const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
   const [labs, setLabs] = useState<Lab[]>([]);
   const [campuses, setCampuses] = useState<Campus[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [images, setImages] = useState<ImageItem[]>([]);
-  const [filterLabId, setFilterLabId] = useState("");
+  const [filterLabId, setFilterLabId] = useState(() => {
+    const id = params.get("lab") || readLabId();
+    writeLabId(id);
+    return id;
+  });
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [detail, setDetail] = useState<Client | null>(null);
+  const [stage, setStage] = useState<{ mac: string; mode: "view" | "control" } | null>(
+    null,
+  );
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [fileKind, setFileKind] = useState<null | "collect" | "distribute">(null);
+  const [collectDir, setCollectDir] = useState("C:\\Users\\Public\\Documents");
+  const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Documents");
+  const [batchFile, setBatchFile] = useState<File | null>(null);
 
   const [addOpen, setAddOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -64,7 +86,6 @@ export function ClientsPage() {
   const [diskPlan, setDiskPlan] = useState("wipe_whole_disk");
   const [deployTargets, setDeployTargets] = useState<Client[]>([]);
 
-  const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [editLabId, setEditLabId] = useState("");
   const [editNotes, setEditNotes] = useState("");
@@ -73,6 +94,24 @@ export function ClientsPage() {
   const labMap = useMemo(
     () => new Map(labs.map((l) => [l.id, l])),
     [labs],
+  );
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return clients.filter((c) => {
+      if (status === "online" && !c.online) return false;
+      if (status === "offline" && (!c.agent_last_seen || c.online)) return false;
+      if (status === "unfrozen" && (!c.agent_last_seen || c.frozen)) return false;
+      if (!q) return true;
+      return [c.name, c.mac, c.last_ip, c.assigned_ip, c.notes]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(q);
+    });
+  }, [clients, query, status]);
+  const picked = useMemo(
+    () => clients.filter((c) => selected.has(c.id)),
+    [clients, selected],
   );
 
   async function refresh() {
@@ -99,6 +138,33 @@ export function ClientsPage() {
     refresh().catch((err) => msg.error(err.message));
   }, [filterLabId]);
 
+  useEffect(() => {
+    if (!moreOpen) return;
+    function close() {
+      setMoreOpen(false);
+    }
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [moreOpen]);
+
+  useEffect(() => {
+    const mac = params.get("assist");
+    if (!mac) return;
+    const mode = params.get("mode") === "control" ? "control" : "view";
+    setStage({ mac, mode });
+    const next = new URLSearchParams(params);
+    next.delete("assist");
+    next.delete("mode");
+    setParams(next, { replace: true });
+  }, []);
+
+  useEffect(() => {
+    setDetail((cur) => {
+      if (!cur) return cur;
+      return clients.find((c) => c.id === cur.id) ?? null;
+    });
+  }, [clients]);
+
   // Live status: online/offline + restore state refresh (agent heartbeat ~5s).
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -108,8 +174,18 @@ export function ClientsPage() {
   }, [filterLabId]);
 
   function onlineText(c: Client) {
-    if (!c.agent_last_seen) return "—";
+    if (!c.agent_last_seen) return "未见";
     return c.online ? "在线" : "离线";
+  }
+
+  function statusKind(c: Client) {
+    if (!c.agent_last_seen) return "";
+    return c.online ? "on" : "off";
+  }
+
+  function seenText(iso?: string | null) {
+    if (!iso) return "—";
+    return new Date(iso).toLocaleString();
   }
 
   function restoreText(c: Client) {
@@ -170,7 +246,7 @@ export function ClientsPage() {
 
   function openDeploy() {
     if (selected.size === 0) {
-      msg.warning("请先选择要清除缓存的终端");
+      msg.warning("请先选择要部署的终端");
       return;
     }
     const targets = clients.filter((c) => selected.has(c.id));
@@ -258,7 +334,6 @@ export function ClientsPage() {
         notes: editNotes,
         assigned_ip: editAssignedIp,
       });
-      setEditingId(null);
       await refresh();
       msg.success("已更新终端");
     } catch (err) {
@@ -270,7 +345,7 @@ export function ClientsPage() {
     if (!window.confirm(`删除终端 ${c.mac}？`)) return;
     try {
       await api.clients.delete(c.id);
-      if (editingId === c.id) setEditingId(null);
+      if (detail?.id === c.id) setDetail(null);
       await refresh();
       msg.success("已删除终端");
     } catch (err) {
@@ -279,7 +354,63 @@ export function ClientsPage() {
   }
 
   function toggleAll(checked: boolean) {
-    setSelected(checked ? new Set(clients.map((c) => c.id)) : new Set());
+    setSelected(checked ? new Set(visible.map((c) => c.id)) : new Set());
+  }
+
+  function changeLab(id: string) {
+    setFilterLabId(id);
+    writeLabId(id);
+  }
+
+  function openDetail(c: Client) {
+    setDetail(c);
+    setEditName(c.name || "");
+    setEditLabId(c.lab_id);
+    setEditNotes(c.notes || "");
+    setEditAssignedIp(c.assigned_ip || "");
+  }
+
+  function openStage(mode: "view" | "control") {
+    if (picked.length !== 1) {
+      msg.warning("请只选择一台终端");
+      return;
+    }
+    setStage({ mac: picked[0].mac, mode });
+  }
+
+  function openFiles(kind: "collect" | "distribute") {
+    if (picked.length === 0) {
+      msg.warning("请先勾选终端");
+      return;
+    }
+    setFormError("");
+    setBatchFile(null);
+    setFileKind(kind);
+  }
+
+  async function submitFiles(e: FormEvent) {
+    e.preventDefault();
+    const macs = picked.map((c) => c.mac);
+    if (macs.length === 0) {
+      setFormError("请先勾选终端");
+      return;
+    }
+    try {
+      if (fileKind === "collect") {
+        const r = await api.remote.fileCollect({ macs, source_dir: collectDir });
+        msg.success(`已下发收集任务（${r.targets} 台），到维护任务查看`);
+      } else {
+        if (!batchFile) {
+          setFormError("请选择要下发的 zip 文件");
+          return;
+        }
+        const r = await api.remote.fileDistribute(targetDir, macs, batchFile);
+        msg.success(`已下发文件（${r.targets} 台），到维护任务查看`);
+      }
+      setFileKind(null);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "下发失败");
+    }
   }
 
   function toggleOne(id: string, checked: boolean) {
@@ -399,50 +530,54 @@ export function ClientsPage() {
   }
 
   const allChecked =
-    clients.length > 0 && clients.every((c) => selected.has(c.id));
+    visible.length > 0 && visible.every((c) => selected.has(c.id));
+  const onlineCount = clients.filter((c) => c.online).length;
+  const needOne = picked.length === 1 ? undefined : "请只选一台";
+  const needSome = picked.length > 0 ? undefined : "请先勾选终端";
+  const stagePeers = stage
+    ? visible.some((c) => c.mac === stage.mac)
+      ? visible
+      : [
+          ...clients.filter((c) => c.mac === stage.mac),
+          ...visible.filter((c) => c.mac !== stage.mac),
+        ]
+    : [];
 
   return (
-    <div className="grid" style={{ gap: "1.25rem" }}>
-      <div className="panel-head">
-        <div>
-          <h1>终端</h1>
-          <p className="muted">
-            Agent 心跳可自动登记到默认机房；支持按机房筛选与批量操作。
-          </p>
-        </div>
-        <div className="page-actions">
-          <button type="button" className="btn ghost" onClick={openEnroll}>
-            自动登记设置
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={openAdd}
-            disabled={labs.length === 0}
-          >
-            添加终端
-          </button>
-          <button
-            type="button"
-            className="btn accent"
-            onClick={openBulk}
-            disabled={labs.length === 0}
-          >
-            批量导入
-          </button>
-        </div>
-      </div>
+    <div className="grid" style={{ gap: "0.75rem" }}>
+      <PageHeader
+        title="终端"
+        meta={
+          query || status
+            ? `${visible.length} / ${clients.length} 台 · 在线 ${onlineCount}`
+            : `${clients.length} 台 · 在线 ${onlineCount}`
+        }
+      />
       {labs.length === 0 ? (
         <p className="muted">请先在「校区 / 机房」中创建机房，再登记终端。</p>
       ) : null}
 
-      <div className="card">
-        <div className="panel-head">
-          <div className="page-actions">
-            <label className="muted">机房筛选</label>
+      {stage ? (
+        <AssistStage
+          key={`${stage.mac}-${stage.mode}`}
+          mac={stage.mac}
+          mode={stage.mode}
+          peers={stagePeers.map((c) => ({
+            mac: c.mac,
+            name: c.name,
+            online: c.online,
+            last_ip: c.last_ip,
+          }))}
+          onClose={() => setStage(null)}
+          onSwitch={(mac) => setStage({ mac, mode: stage.mode })}
+        />
+      ) : (
+        <div className="card">
+          <div className="context-bar">
             <select
+              aria-label="机房"
               value={filterLabId}
-              onChange={(e) => setFilterLabId(e.target.value)}
+              onChange={(e) => changeLab(e.target.value)}
             >
               <option value="">全部机房</option>
               {labs.map((lab) => (
@@ -451,226 +586,379 @@ export function ClientsPage() {
                 </option>
               ))}
             </select>
-            <span className="muted">{clients.length} 台</span>
+            <input
+              aria-label="搜索终端"
+              value={query}
+              placeholder="名称 / IP / MAC"
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            <select
+              aria-label="状态"
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+            >
+              <option value="">全部状态</option>
+              <option value="online">在线</option>
+              <option value="offline">离线</option>
+              <option value="unfrozen">未冻结</option>
+            </select>
           </div>
-          <div className="page-actions">
-            <button type="button" className="btn" onClick={openCapture}>
-              采集系统
-            </button>
-            <button type="button" className="btn accent" onClick={openDeploy}>
-              清除缓存
-            </button>
+          <div className="command-bar">
+            <div className="command-group">
+              <button
+                type="button"
+                className="btn sm"
+                onClick={openAdd}
+                disabled={labs.length === 0}
+              >
+                添加
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={openBulk}
+                disabled={labs.length === 0}
+              >
+                导入
+              </button>
+              <button type="button" className="btn ghost sm" onClick={openEnroll}>
+                自动登记
+              </button>
+            </div>
+            <div className="command-group">
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={() => bulkPower("wol")}
+              >
+                开机
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={() => bulkPower("shutdown")}
+              >
+                关机
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={() => bulkPower("reboot")}
+              >
+                重启
+              </button>
+            </div>
+            <div className="command-group">
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needOne}
+                title={needOne}
+                onClick={openCapture}
+              >
+                采集
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={openDeploy}
+              >
+                部署
+              </button>
+            </div>
+            <div className="command-group">
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needOne}
+                title={needOne}
+                onClick={() => openStage("view")}
+              >
+                观察
+              </button>
+              <button
+                type="button"
+                className={`btn sm${picked.length === 1 && picked[0].online ? " accent" : ""}`}
+                disabled={!!needOne}
+                title={needOne}
+                onClick={() => openStage("control")}
+              >
+                协助
+              </button>
+            </div>
+            <div className="command-group">
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={() => openFiles("collect")}
+              >
+                收集
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={() => openFiles("distribute")}
+              >
+                下发
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needSome}
+                title={needSome}
+                onClick={() => {
+                  setMoveLabId(filterLabId || labs[0]?.id || "");
+                  setFormError("");
+                  setMoveOpen(true);
+                }}
+              >
+                移动
+              </button>
+              <div className="more-menu">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  aria-expanded={moreOpen}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setMoreOpen((v) => !v);
+                  }}
+                >
+                  更多
+                </button>
+                {moreOpen ? (
+                  <div className="more-pop">
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      disabled={!!needSome}
+                      title={needSome}
+                      onClick={() => {
+                        setMoreOpen(false);
+                        navigate("/tasks", {
+                          state: {
+                            open: "agent",
+                            macs: picked.map((c) => c.mac),
+                          },
+                        });
+                      }}
+                    >
+                      更新 Agent
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <span className="command-spacer" />
             <button
               type="button"
-              className="btn"
-              disabled={selected.size === 0}
-              onClick={() => bulkPower("reboot")}
-            >
-              重启
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={selected.size === 0}
-              onClick={() => bulkPower("shutdown")}
-            >
-              关机
-            </button>
-            <button
-              type="button"
-              className="btn accent"
-              disabled={selected.size === 0}
-              onClick={() => bulkPower("wol")}
-            >
-              开机
-            </button>
-            <button
-              type="button"
-              className="btn ghost"
-              disabled={selected.size === 0}
-              onClick={() => {
-                setMoveLabId(filterLabId || labs[0]?.id || "");
-                setFormError("");
-                setMoveOpen(true);
-              }}
-            >
-              批量移动 ({selected.size})
-            </button>
-            <button
-              type="button"
-              className="btn danger"
-              disabled={selected.size === 0}
+              className="btn danger sm"
+              disabled={!!needSome}
+              title={needSome}
               onClick={bulkDelete}
             >
-              批量删除
+              删除{picked.length ? ` (${picked.length})` : ""}
             </button>
           </div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>
-                <input
-                  type="checkbox"
-                  checked={allChecked}
-                  onChange={(e) => toggleAll(e.target.checked)}
-                  aria-label="全选"
-                />
-              </th>
-              <th>MAC</th>
-              <th>在线</th>
-              <th>还原状态</th>
-              <th>Agent 版本</th>
-              <th>名称</th>
-              <th>机房</th>
-              <th>分配 IP</th>
-              <th>上报 IP</th>
-              <th>最近上报</th>
-              <th>备注</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {clients.length === 0 ? (
+          <table className="data-table clickable">
+            <thead>
               <tr>
-                <td colSpan={12} className="muted">
-                  暂无终端。可手动添加，或配置默认机房后由 Agent 自动上报入库。
-                </td>
+                <th>
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    onChange={(e) => toggleAll(e.target.checked)}
+                    aria-label="全选当前列表"
+                  />
+                </th>
+                <th>状态</th>
+                <th>名称</th>
+                <th>IP</th>
+                <th>MAC</th>
+                <th>机房</th>
+                <th>还原</th>
+                <th>Agent</th>
+                <th>最近心跳</th>
               </tr>
-            ) : (
-              clients.map((c) => (
-                <tr key={c.id}>
-                  <td>
-                    <input
-                      type="checkbox"
-                      checked={selected.has(c.id)}
-                      onChange={(e) => toggleOne(c.id, e.target.checked)}
-                      aria-label={`选择 ${c.mac}`}
-                    />
-                  </td>
-                  <td className="mono">{c.mac}</td>
-                  <td>
-                    {c.agent_last_seen ? (
-                      <span className={c.online ? "tag" : "tag muted"}>
-                        {onlineText(c)}
-                      </span>
-                    ) : (
-                      <span className="muted">—</span>
-                    )}
-                  </td>
-                  <td className="muted">{restoreText(c)}</td>
-                  <td className="mono">
-                    {c.agent_version ? (
-                      c.agent_version
-                    ) : (
-                      <span className="muted">—</span>
-                    )}
-                  </td>
-                  <td>
-                    {editingId === c.id ? (
-                      <input
-                        value={editName}
-                        onChange={(e) => setEditName(e.target.value)}
-                      />
-                    ) : (
-                      c.name || "—"
-                    )}
-                  </td>
-                  <td>
-                    {editingId === c.id ? (
-                      <select
-                        value={editLabId}
-                        onChange={(e) => setEditLabId(e.target.value)}
-                      >
-                        {labs.map((lab) => (
-                          <option key={lab.id} value={lab.id}>
-                            {lab.name}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      labMap.get(c.lab_id)?.name || c.lab_id
-                    )}
-                  </td>
-                  <td>
-                    {editingId === c.id ? (
-                      <input
-                        className="mono"
-                        value={editAssignedIp}
-                        onChange={(e) => setEditAssignedIp(e.target.value)}
-                        placeholder="静态 IP"
-                      />
-                    ) : (
-                      <span className="mono muted">{c.assigned_ip || "—"}</span>
-                    )}
-                  </td>
-                  <td className="mono muted">{c.last_ip || "—"}</td>
-                  <td className="muted">
-                    {c.last_seen
-                      ? new Date(c.last_seen).toLocaleString()
-                      : "—"}
-                  </td>
-                  <td>
-                    {editingId === c.id ? (
-                      <input
-                        value={editNotes}
-                        onChange={(e) => setEditNotes(e.target.value)}
-                      />
-                    ) : (
-                      c.notes || "—"
-                    )}
-                  </td>
-                  <td>
-                    <div className="row-actions">
-                      {editingId === c.id ? (
-                        <>
-                          <button
-                            type="button"
-                            className="btn"
-                            onClick={() => saveClient(c.id)}
-                          >
-                            保存
-                          </button>
-                          <button
-                            type="button"
-                            className="btn ghost"
-                            onClick={() => setEditingId(null)}
-                          >
-                            取消
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <button
-                            type="button"
-                            className="btn ghost"
-                            onClick={() => {
-                              setEditingId(c.id);
-                              setEditName(c.name || "");
-                              setEditLabId(c.lab_id);
-                              setEditNotes(c.notes || "");
-                              setEditAssignedIp(c.assigned_ip || "");
-                            }}
-                          >
-                            编辑
-                          </button>
-                          <button
-                            type="button"
-                            className="btn danger"
-                            onClick={() => removeClient(c)}
-                          >
-                            删除
-                          </button>
-                        </>
-                      )}
-                    </div>
+            </thead>
+            <tbody>
+              {visible.length === 0 ? (
+                <tr>
+                  <td colSpan={9} className="muted">
+                    没有符合条件的终端。
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+              ) : (
+                visible.map((c) => (
+                  <tr
+                    key={c.id}
+                    className={selected.has(c.id) ? "picked" : undefined}
+                    onClick={() => openDetail(c)}
+                  >
+                    <td onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={selected.has(c.id)}
+                        onChange={(e) => toggleOne(c.id, e.target.checked)}
+                        aria-label={`选择 ${c.mac}`}
+                      />
+                    </td>
+                    <td>
+                      <span className="status">
+                        <span className={`status-dot ${statusKind(c)}`} />
+                        {onlineText(c)}
+                      </span>
+                    </td>
+                    <td>{c.name || "—"}</td>
+                    <td className="mono">
+                      {c.last_ip || "—"}
+                      {c.assigned_ip && c.assigned_ip !== c.last_ip ? (
+                        <span className="ip-mark muted" title={`分配 ${c.assigned_ip}`}>
+                          分配
+                        </span>
+                      ) : null}
+                    </td>
+                    <td className="mono">{c.mac}</td>
+                    <td>{labMap.get(c.lab_id)?.name || c.lab_id}</td>
+                    <td className="muted">{restoreText(c)}</td>
+                    <td className="mono">{c.agent_version || "—"}</td>
+                    <td className="muted">{seenText(c.agent_last_seen)}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Drawer
+        open={detail !== null && !stage}
+        title={detail?.name || detail?.mac || "终端"}
+        onClose={() => setDetail(null)}
+      >
+        {detail ? (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveClient(detail.id);
+            }}
+          >
+            <p className="muted mono">{detail.mac}</p>
+            <div className="field">
+              <label>名称</label>
+              <input value={editName} onChange={(e) => setEditName(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>机房</label>
+              <select value={editLabId} onChange={(e) => setEditLabId(e.target.value)}>
+                {labs.map((lab) => (
+                  <option key={lab.id} value={lab.id}>
+                    {lab.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>分配 IP</label>
+              <input
+                className="mono"
+                value={editAssignedIp}
+                onChange={(e) => setEditAssignedIp(e.target.value)}
+                placeholder="静态 IP"
+              />
+            </div>
+            <div className="field">
+              <label>上报 IP</label>
+              <input className="mono" value={detail.last_ip || ""} readOnly />
+            </div>
+            <div className="field">
+              <label>备注</label>
+              <input value={editNotes} onChange={(e) => setEditNotes(e.target.value)} />
+            </div>
+            <p className="muted">
+              {onlineText(detail)} · {restoreText(detail)} · Agent {detail.agent_version || "—"}
+              <br />
+              心跳 {seenText(detail.agent_last_seen)}
+            </p>
+            <div className="modal-actions">
+              <button className="btn sm" type="submit">
+                保存
+              </button>
+              <button
+                className="btn danger sm"
+                type="button"
+                onClick={() => removeClient(detail)}
+              >
+                删除
+              </button>
+            </div>
+          </form>
+        ) : null}
+      </Drawer>
+
+      <Modal
+        open={fileKind !== null}
+        title={fileKind === "collect" ? "收集文件" : "下发文件"}
+        onClose={() => setFileKind(null)}
+      >
+        <form onSubmit={submitFiles}>
+          {formError ? <p className="error">{formError}</p> : null}
+          <p className="muted">目标为当前勾选的 {picked.length} 台，进度在维护任务中查看。</p>
+          {fileKind === "collect" ? (
+            <div className="field">
+              <label>收集目录</label>
+              <input
+                className="mono"
+                value={collectDir}
+                onChange={(e) => setCollectDir(e.target.value)}
+                placeholder="C:\Users\Public\Documents"
+                required
+              />
+            </div>
+          ) : (
+            <>
+              <div className="field">
+                <label>下发目标目录</label>
+                <input
+                  className="mono"
+                  value={targetDir}
+                  onChange={(e) => setTargetDir(e.target.value)}
+                  placeholder="C:\Users\Public\Documents"
+                  required
+                />
+              </div>
+              <div className="field">
+                <label>zip 文件</label>
+                <input
+                  type="file"
+                  accept=".zip"
+                  onChange={(e) => setBatchFile(e.target.files?.[0] ?? null)}
+                />
+              </div>
+            </>
+          )}
+          <div className="modal-actions">
+            <button type="button" className="btn ghost" onClick={() => setFileKind(null)}>
+              取消
+            </button>
+            <button className="btn" type="submit">
+              {fileKind === "collect" ? "收集到服务器" : "下发到客户端"}
+            </button>
+          </div>
+        </form>
+      </Modal>
 
       <Modal open={addOpen} title="添加终端" onClose={() => setAddOpen(false)}>
         <form onSubmit={createOne}>
@@ -901,7 +1189,7 @@ export function ClientsPage() {
 
       <Modal
         open={deployOpen}
-        title="清除缓存"
+        title="部署"
         onClose={() => setDeployOpen(false)}
       >
         <form onSubmit={onDeployConfirm}>
@@ -960,7 +1248,7 @@ export function ClientsPage() {
               type="submit"
               disabled={!deployImage || deployTargets.length === 0}
             >
-              确认清除并部署
+              确认部署
             </button>
           </div>
         </form>

@@ -4,32 +4,9 @@ import {
   api,
   type DashboardOverview,
 } from "../api";
+import { PageHeader } from "../components/PageHeader";
 import { useMessage } from "../message";
 import { taskKindLabel, taskStateLabel } from "../taskLabels";
-
-function formatBytes(n: number) {
-  if (!Number.isFinite(n) || n <= 0) return "0 B";
-  if (n < 1024) return `${Math.round(n)} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-function formatRate(bps: number) {
-  if (!Number.isFinite(bps) || bps <= 0) return "0 B/s";
-  if (bps < 1024) return `${Math.round(bps)} B/s`;
-  if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
-  return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
-}
-
-function formatHostLoad(online: boolean, cpu: number, memUsed: number, memTotal: number, rx: number, tx: number) {
-  if (!online) return "—";
-  const mem =
-    memTotal > 0
-      ? `${formatBytes(memUsed)}/${formatBytes(memTotal)}`
-      : formatBytes(memUsed);
-  return `CPU ${cpu.toFixed(0)}% · 内存 ${mem} · ↓${formatRate(rx)} / ↑${formatRate(tx)}`;
-}
 
 export function DashboardPage() {
   const msg = useMessage();
@@ -51,23 +28,14 @@ export function DashboardPage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div className="panel-head">
-        <div>
-          <h1>工作台</h1>
-          <p className="muted">资产规模、边缘负载与任务动态（约 3 秒自动刷新）。</p>
-        </div>
-        <div className="page-actions">
-          <Link className="btn" to="/tasks">
-            采集 / 部署
-          </Link>
-          <Link className="btn ghost" to="/clients">
-            终端
-          </Link>
-          <Link className="btn ghost" to="/edges">
-            边缘
-          </Link>
-        </div>
-      </div>
+      <PageHeader
+        title="工作台"
+        meta={
+          stats
+            ? `边缘在线 ${stats.edges_online}/${stats.edges_total} · 进行中任务 ${stats.tasks_running}`
+            : "正在汇总"
+        }
+      />
 
       <div className="grid stats stats-6">
         {[
@@ -92,45 +60,45 @@ export function DashboardPage() {
 
       <div className="card">
         <div className="panel-head">
-          <h2>边缘节点</h2>
-          <Link className="btn ghost" to="/edges">
+          <h2>离线边缘</h2>
+          <Link className="btn ghost sm" to="/edges">
             查看全部
           </Link>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>名称</th>
               <th>状态</th>
-              <th>节点负载</th>
             </tr>
           </thead>
           <tbody>
             {!data || data.edges.length === 0 ? (
               <tr>
-                <td colSpan={3} className="muted">
+                <td colSpan={2} className="muted">
                   暂无边缘节点
                 </td>
               </tr>
+            ) : data.edges.every((e) => e.online) ? (
+              <tr>
+                <td colSpan={2} className="muted">
+                  边缘节点都在线
+                </td>
+              </tr>
             ) : (
-              data.edges.map((e) => (
-                <tr key={e.id}>
-                  <td>{e.name}</td>
-                  <td>
-                    <span className="tag">{e.online ? "在线" : "离线"}</span>
-                  </td>
-                  <td className="mono muted">
-                    {formatHostLoad(
-                      e.online,
-                      e.cpu_pct,
-                      e.mem_used_bytes,
-                      e.mem_total_bytes,
-                      e.net_rx_bps,
-                      e.net_tx_bps,
-                    )}
-                  </td>
-                </tr>
-              ))
+              data.edges
+                .filter((e) => !e.online)
+                .map((e) => (
+                  <tr key={e.id}>
+                    <td>{e.name}</td>
+                    <td>
+                      <span className="status">
+                        <span className="status-dot off" />
+                        离线
+                      </span>
+                    </td>
+                  </tr>
+                ))
             )}
           </tbody>
         </table>
@@ -140,11 +108,11 @@ export function DashboardPage() {
         <div className="card" style={{ flex: 1 }}>
           <div className="panel-head">
             <h2>进行中任务</h2>
-            <Link className="btn ghost" to="/tasks">
+            <Link className="btn ghost sm" to="/tasks">
               维护任务
             </Link>
           </div>
-          <table>
+          <table className="data-table">
             <thead>
               <tr>
                 <th>名称</th>
@@ -182,7 +150,7 @@ export function DashboardPage() {
           <div className="panel-head">
             <h2>最近失败</h2>
           </div>
-          <table>
+          <table className="data-table">
             <thead>
               <tr>
                 <th>名称</th>
@@ -220,11 +188,11 @@ export function DashboardPage() {
       <div className="card">
         <div className="panel-head">
           <h2>机房摘要</h2>
-          <Link className="btn ghost" to="/labs">
+          <Link className="btn ghost sm" to="/labs">
             校区 / 机房
           </Link>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>机房</th>
@@ -243,7 +211,9 @@ export function DashboardPage() {
             ) : (
               data.labs.map((lab) => (
                 <tr key={lab.id}>
-                  <td>{lab.name}</td>
+                  <td>
+                    <Link to={`/clients?lab=${encodeURIComponent(lab.id)}`}>{lab.name}</Link>
+                  </td>
                   <td>{lab.campus_name}</td>
                   <td className="mono">{lab.client_count}</td>
                   <td className="muted">{lab.default_image_name}</td>

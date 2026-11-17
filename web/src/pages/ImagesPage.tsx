@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { api, type ImageFileEntry, type ImageItem } from "../api";
 import { Modal } from "../components/Modal";
+import { PageHeader } from "../components/PageHeader";
 import { useMessage } from "../message";
 
 function formatBytes(n: number) {
@@ -172,14 +173,7 @@ export function ImagesPage() {
 
   return (
     <div className="grid" style={{ gap: "1.25rem" }}>
-      <div className="panel-head">
-        <div>
-          <h1>镜像库</h1>
-          <p className="muted">
-            从中心镜像目录选择或上传文件后登记；校验和由服务端自动计算。
-          </p>
-        </div>
-        <div className="page-actions">
+      <PageHeader title="镜像库" meta={`${images.length} 个镜像`}>
           <button
             type="button"
             className="btn ghost"
@@ -215,18 +209,17 @@ export function ImagesPage() {
           >
             应用差量
           </button>
-          <button type="button" className="btn" onClick={openModal}>
+          <button type="button" className="btn sm" onClick={openModal}>
             登记镜像
           </button>
-        </div>
-      </div>
+      </PageHeader>
 
       <div className="card">
         <div className="panel-head">
           <h2>已登记镜像</h2>
           <span className="muted">{images.length} 个</span>
         </div>
-        <table>
+        <table className="data-table">
           <thead>
             <tr>
               <th>名称</th>
