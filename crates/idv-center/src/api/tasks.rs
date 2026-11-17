@@ -156,6 +156,7 @@ pub async fn create_capture(
         detail,
         p2p_bytes: 0,
         edge_bytes: 0,
+        edge_id: None,
         updated_at: now,
     };
     insert_target(&state, &target).await?;
@@ -257,28 +258,26 @@ pub async fn create_deploy(
     for raw in &body.macs {
         normalized_macs.push(normalize_mac(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?);
     }
-    let edge_id = match body.edge_id.filter(|s| !s.trim().is_empty()) {
-        Some(id) => Some(id),
-        None => {
-            if let Some(mac0) = normalized_macs.first() {
-                if let Some(lab_id) =
-                    crate::site_defaults::lab_id_for_mac(&state.pool, mac0).await?
-                {
-                    crate::site_defaults::resolve_preferred_edge_id(&state.pool, &lab_id).await?
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+
+    let explicit_edge = body.edge_id.filter(|s| !s.trim().is_empty());
+    if let Some(edge_id) = &explicit_edge {
+        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM edges WHERE id = ?")
+            .bind(edge_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+        if exists.is_none() {
+            return Err((StatusCode::BAD_REQUEST, "edge not found".into()));
         }
-    };
+    }
+
+    let image_id = body.image_id.clone();
     let task = MaintenanceTask {
         id: new_id(),
         kind: "deploy".into(),
         state: "pending".into(),
-        image_id: Some(body.image_id),
-        edge_id,
+        image_id: Some(image_id.clone()),
+        edge_id: explicit_edge.clone(),
         disk_plan: body.disk_plan,
         name: if body.name.trim().is_empty() {
             format!("deploy-{}", now.timestamp())
@@ -291,8 +290,49 @@ pub async fn create_deploy(
         updated_at: now,
     };
     insert_task(&state, &task).await?;
+
+    // Multi-Edge scheduling: distribute targets across online Edges that
+    // already have a ready replica of this image. If an Edge is explicitly
+    // selected, all targets stay pinned to it.
+    let mut assigned_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut targets = Vec::new();
     for mac in normalized_macs {
+        let assigned_edge = if let Some(edge_id) = &explicit_edge {
+            Some(edge_id.clone())
+        } else if let Some(lab_id) =
+            crate::site_defaults::lab_id_for_mac(&state.pool, &mac).await?
+        {
+            let candidates = crate::site_defaults::ready_deploy_edges(
+                &state.pool,
+                &lab_id,
+                &image_id,
+            )
+            .await?;
+            let mut chosen: Option<String> = None;
+            let mut best_load = usize::MAX;
+            for cand in candidates {
+                let load = cand.active_targets.max(0) as usize
+                    + assigned_counts.get(&cand.id).copied().unwrap_or(0);
+                if load < best_load {
+                    best_load = load;
+                    chosen = Some(cand.id);
+                }
+            }
+            if chosen.is_none() {
+                chosen = crate::site_defaults::resolve_preferred_edge_id(
+                    &state.pool,
+                    &lab_id,
+                )
+                .await?;
+            }
+            chosen
+        } else {
+            None
+        };
+        if let Some(edge_id) = &assigned_edge {
+            *assigned_counts.entry(edge_id.clone()).or_insert(0) += 1;
+        }
         let target = MaintenanceTaskTarget {
             id: new_id(),
             task_id: task.id.clone(),
@@ -303,6 +343,7 @@ pub async fn create_deploy(
             detail: String::new(),
             p2p_bytes: 0,
             edge_bytes: 0,
+            edge_id: assigned_edge,
             updated_at: now,
         };
         insert_target(&state, &target).await?;
@@ -376,6 +417,7 @@ pub async fn create_agent_update(
             detail: format!("waiting for client {version}"),
             p2p_bytes: 0,
             edge_bytes: 0,
+            edge_id: None,
             updated_at: now,
         };
         insert_target(&state, &target).await?;
@@ -734,7 +776,7 @@ async fn load_targets(
     task_id: &str,
 ) -> Result<Vec<MaintenanceTaskTarget>, (StatusCode, String)> {
     sqlx::query_as::<_, MaintenanceTaskTarget>(
-        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, updated_at FROM maintenance_task_targets WHERE task_id = ? ORDER BY mac",
+        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, edge_id, updated_at FROM maintenance_task_targets WHERE task_id = ? ORDER BY mac",
     )
     .bind(task_id)
     .fetch_all(&state.pool)
@@ -768,7 +810,7 @@ async fn insert_target(
     target: &MaintenanceTaskTarget,
 ) -> Result<(), (StatusCode, String)> {
     sqlx::query(
-        "INSERT INTO maintenance_task_targets (id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO maintenance_task_targets (id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, edge_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&target.id)
     .bind(&target.task_id)
@@ -779,6 +821,7 @@ async fn insert_target(
     .bind(&target.detail)
     .bind(target.p2p_bytes)
     .bind(target.edge_bytes)
+    .bind(&target.edge_id)
     .bind(target.updated_at)
     .execute(&state.pool)
     .await

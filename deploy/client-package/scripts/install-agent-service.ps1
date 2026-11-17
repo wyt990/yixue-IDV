@@ -107,10 +107,10 @@ if ($FallbackTaskOnly) {
 $binPath = "`"$($p.Agent)`" service --config `"$($p.Config)`""
 try {
   New-Service -Name $serviceName -BinaryPathName $binPath `
-    -DisplayName "Yixue IDV Agent" -StartupType Automatic -ErrorAction Stop | Out-Null
+    -DisplayName "易学 IDV 客户端代理" -StartupType Automatic -ErrorAction Stop | Out-Null
   # Optional metadata / failure actions must not block a working service.
   try {
-    & sc.exe description $serviceName "Yixue IDV client agent (heartbeat + instant command channel)" | Out-Null
+    & sc.exe description $serviceName "易学 IDV 客户端代理：心跳、即时命令、还原策略、远程协助与文件传输。" | Out-Null
   } catch { Write-Host "WARNING: 设置服务描述失败（不影响使用）" }
   try {
     & sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null

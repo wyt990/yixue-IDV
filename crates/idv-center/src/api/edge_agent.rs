@@ -40,12 +40,10 @@ pub struct ClaimedTask {
     pub mac: String,
     pub os_family: String,
     pub task_name: String,
-    #[serde(default = "default_exclude_true")]
     pub exclude_temp: bool,
-}
-
-fn default_exclude_true() -> bool {
-    true
+    /// Client-reachable URL of the Edge that should serve this target.
+    #[serde(default)]
+    pub edge_url: String,
 }
 
 fn parse_capture_detail(detail: &str) -> (String, bool) {
@@ -412,13 +410,16 @@ pub async fn claim_task(
 
     let target = sqlx::query_as::<_, MaintenanceTaskTarget>(
         r#"
-        SELECT tg.id, tg.task_id, tg.mac, tg.state, tg.progress, tg.error_message, tg.detail, tg.p2p_bytes, tg.edge_bytes, tg.updated_at
+        SELECT tg.id, tg.task_id, tg.mac, tg.state, tg.progress, tg.error_message, tg.detail, tg.p2p_bytes, tg.edge_bytes, tg.edge_id, tg.updated_at
         FROM maintenance_task_targets tg
         JOIN maintenance_tasks mt ON mt.id = tg.task_id
         WHERE tg.mac = ?
           AND tg.state IN ('pending', 'running')
           AND mt.state IN ('pending', 'running')
-          AND (mt.edge_id IS NULL OR mt.edge_id = '' OR mt.edge_id = ?)
+          AND (
+            mt.kind = 'deploy'
+            OR (mt.edge_id IS NULL OR mt.edge_id = '' OR mt.edge_id = ?)
+          )
         ORDER BY mt.created_at ASC
         LIMIT 1
         "#,
@@ -441,6 +442,20 @@ pub async fn claim_task(
     .await
     .map_err(internal)?;
 
+    let assigned_edge_id = target
+        .edge_id
+        .clone()
+        .or_else(|| task.edge_id.clone())
+        .unwrap_or_else(|| edge.id.clone());
+    let assigned_edge_url: String =
+        sqlx::query_scalar::<_, String>("SELECT listen_url FROM edges WHERE id = ?")
+            .bind(&assigned_edge_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| edge.listen_url.clone());
+
     sqlx::query(
         "UPDATE maintenance_task_targets SET state = 'running', updated_at = ? WHERE id = ?",
     )
@@ -449,18 +464,29 @@ pub async fn claim_task(
     .execute(&state.pool)
     .await
     .map_err(internal)?;
-    sqlx::query(
-        "UPDATE maintenance_tasks SET state = 'running', edge_id = COALESCE(NULLIF(edge_id, ''), ?), updated_at = ? WHERE id = ?",
-    )
-    .bind(&edge.id)
-    .bind(now)
-    .bind(&task.id)
-    .execute(&state.pool)
-    .await
-    .map_err(internal)?;
+    if task.kind != "deploy" {
+        sqlx::query(
+            "UPDATE maintenance_tasks SET state = 'running', edge_id = COALESCE(NULLIF(edge_id, ''), ?), updated_at = ? WHERE id = ?",
+        )
+        .bind(&edge.id)
+        .bind(now)
+        .bind(&task.id)
+        .execute(&state.pool)
+        .await
+        .map_err(internal)?;
+    } else {
+        sqlx::query("UPDATE maintenance_tasks SET state = 'running', updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(&task.id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal)?;
+    }
 
     let (os_family, exclude_temp) = if task.kind == "capture" {
         parse_capture_detail(&target.detail)
+    } else if task.kind == "deploy" {
+        ("windows".into(), true)
     } else {
         (
             if target.detail.trim().is_empty() {
@@ -490,6 +516,7 @@ pub async fn claim_task(
         os_family,
         task_name: task.name,
         exclude_temp,
+        edge_url: assigned_edge_url,
     })))
 }
 
@@ -507,7 +534,7 @@ pub async fn report_target(
     }
     let now = Utc::now();
     let existing = sqlx::query_as::<_, MaintenanceTaskTarget>(
-        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, updated_at FROM maintenance_task_targets WHERE id = ?",
+        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, edge_id, updated_at FROM maintenance_task_targets WHERE id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -549,7 +576,7 @@ pub async fn report_target(
     refresh_task_aggregate(&state, &existing.task_id).await?;
 
     let updated = sqlx::query_as::<_, MaintenanceTaskTarget>(
-        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, updated_at FROM maintenance_task_targets WHERE id = ?",
+        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, edge_id, updated_at FROM maintenance_task_targets WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.pool)
@@ -565,7 +592,7 @@ pub async fn ingest_image(
     request: Request,
 ) -> Result<(StatusCode, Json<Image>), (StatusCode, String)> {
     let target = sqlx::query_as::<_, MaintenanceTaskTarget>(
-        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, updated_at FROM maintenance_task_targets WHERE id = ?",
+        "SELECT id, task_id, mac, state, progress, error_message, detail, p2p_bytes, edge_bytes, edge_id, updated_at FROM maintenance_task_targets WHERE id = ?",
     )
     .bind(&q.target_id)
     .fetch_optional(&state.pool)

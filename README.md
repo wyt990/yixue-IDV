@@ -12,7 +12,7 @@
 - **镜像库**：`yixue-image-v1` 入库（NTFS 跳空闲 `ntfs_used_v1`、流式校验）
 - **边缘同步**：镜像缓存到 Edge，配额、水位、P2P
 - **冷采集**：金样机 PXE → Alpine PE → 流式打包上传 → Center 入库
-- **批量部署**：按校区/机房勾选客户端 → 预览磁盘策略 → PE 流式写盘，支持 500 台规模
+- **批量部署**：按校区/机房勾选客户端 → 预览磁盘策略 → PE 流式写盘，支持 500 台规模；多 Edge 可按目标分流
 
 ### 还原与课堂模式
 
@@ -66,7 +66,7 @@ crates/
   idv-center/      Center API + Web 静态托管 + 远程控制中继
   idv-edge/        Edge 缓存、DHCP/PXE/TFTP、PE API、IP 保留
   idv-pe-agent/    PE 内采集/部署代理（另编 musl 静态版）
-  idv-agent/       学生机常驻 Agent（0.3.6：还原/身份/命令/远程协助）
+  idv-agent/       学生机常驻 Agent（0.4.2：还原/身份/命令/远程协助）
 web/               管理端（React + Vite）
 deploy/
   config/*.toml.example   配置模板（复制后改本地，勿提交密钥）
@@ -134,6 +134,74 @@ cargo run -p idv-center --release -- serve --config deploy/config/center.toml
 - 默认账号：`admin` / `admin123`（生产环境务必修改）
 - 健康检查：`GET /health`
 - 数据库迁移启动时自动执行
+
+### 注册为 Windows 服务（开机自启）
+
+Center 和 Edge 都支持作为 Windows 服务运行。发布目录示例：
+
+```text
+Center 安装目录/
+  idv-center.exe
+  center.toml
+  web\dist\...
+  scripts\install-center-service.ps1
+
+Edge 安装目录/
+  idv-edge.exe
+  edge.toml
+  pe\...
+  scripts\install-edge-service.ps1
+```
+
+管理员 PowerShell：
+
+```powershell
+# Center
+.\scripts\install-center-service.ps1 -InstallDir "C:\Program Files\YixueIDV\Center"
+
+# Edge
+.\scripts\install-edge-service.ps1 -InstallDir "C:\Program Files\YixueIDV\Edge"
+```
+
+- 服务名：`idv-center` / `idv-edge`
+- 启动类型：**自动（开机启动）**
+- 已配置失败自动重启
+- 卸载：加 `-Uninstall`
+- 服务工作目录为安装目录，`web/dist`、`data`、`pe` 等相对路径正常解析
+
+控制台调试仍可使用 `serve` 子命令。
+
+### 数据、缓存与日志目录
+
+程序安装目录可以自定义；**大容量目录建议放到数据盘**，避免占满系统盘。
+
+Center `center.toml`：
+
+```toml
+database_url = "sqlite://D:/YixueIDV/data/idv-center.db?mode=rwc"
+images_dir = "D:/YixueIDV/data/images"
+log_dir = "D:/YixueIDV/logs/center"
+```
+
+- `images_dir` 的父目录同时用于 `software`、`agent-packages`、`assist-fs`；
+- `log_dir` 为空时只输出控制台；配置后按天滚动，保留 14 个日志文件；
+- `web_dir` 只是静态页面，可以留在安装目录。
+
+Edge `edge.toml`：
+
+```toml
+cache_dir = "D:/YixueIDV/edge-cache"
+capture_tmp_dir = "D:/YixueIDV/edge-cache/capture-tmp"
+log_dir = "D:/YixueIDV/logs/edge"
+
+[pxe]
+tftp_root = "D:/YixueIDV/edge/pe"
+```
+
+- `cache_dir` 是 Edge 镜像缓存，建议单独数据盘并设置 `cache_quota_bytes`；
+- `tftp_root` 是 PE 资源目录（约 216MB），也可以放到数据盘；
+- `capture_tmp_dir` 留空时自动使用 `{cache_dir}/capture-tmp`。
+
 
 开发期前后端分离：
 
@@ -230,7 +298,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-wol.ps1
 | 6 | 还原驱动、模式策略、多盘还原 | 软件已完成（测试签名试点） |
 | 7 | 批量身份、常驻 Agent、即时命令、远程控制、Agent 更新 | 软件已完成 |
 
-当前客户端 Agent：**0.3.6**（GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
+当前客户端 Agent：**0.4.2**（GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
 
 后续增强：更细分区角色向导、远程控制 WebRTC/音频、Agent 设备令牌与命令签名、跨 VLAN WOL 等。
 
@@ -242,6 +310,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-wol.ps1
 - `run_program`、远程键鼠、文件传输具备高权限能力，建议配合网络隔离与审计
 - DHCP 地址池/保留需与现网规划，避免与校园 DHCP 冲突
 - 内网环境不依赖任何外部 CDN；管理端字体使用本机系统字体
+
+
+
+## 程序图标
+
+- 网站 favicon：`web/public/favicon.ico`（构建后复制到 `web/dist/`）
+- Center：`assets/icons/idv-center.ico`
+- Edge：`assets/icons/idv-edge.ico`
+- Agent：`assets/icons/idv-agent.ico`
+
+Center / Edge / Agent 的 `build.rs` 会在 Windows 上调用 `windres` 把对应 ICO 嵌入 exe；因此重新编译 release 后，资源管理器和快捷方式会显示图标。若构建机没有 `windres`，构建会给出警告并跳过图标（exe 仍可正常使用）。
 
 ## 许可证与说明
 

@@ -344,6 +344,7 @@ export function ClientsPage() {
     }
   }
 
+
   async function saveClient(id: string) {
     try {
       await api.clients.update(id, {
@@ -1095,7 +1096,9 @@ export function ClientsPage() {
       <Drawer
         open={detail !== null && !stage}
         title={detail?.name || detail?.mac || "终端"}
-        onClose={() => setDetail(null)}
+        onClose={() => {
+          setDetail(null);
+        }}
       >
         {detail ? (
           <form

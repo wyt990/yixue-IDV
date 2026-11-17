@@ -266,6 +266,7 @@ export function LabsPage() {
     }
   }
 
+
   async function createCampus(e: FormEvent) {
     e.preventDefault();
     setCampusFormError("");

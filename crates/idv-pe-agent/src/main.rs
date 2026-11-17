@@ -1,4 +1,4 @@
-﻿use std::io::Write;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -177,6 +177,9 @@ struct ClaimedTask {
     /// Clear pagefile/temp before capture (from Center).
     #[serde(default = "default_exclude_temp")]
     exclude_temp: bool,
+    /// Client-reachable URL of the assigned Edge (multi-Edge deploy).
+    #[serde(default)]
+    edge_url: String,
 }
 
 fn default_exclude_temp() -> bool {
@@ -217,7 +220,15 @@ async fn main() -> anyhow::Result<()> {
             boot_mode,
         } => {
             let (_cfg, task) = require_task(&config, &mac, "capture").await?;
-            capture_with_task(&config, &task, &disk_file, &os_family, &boot_mode).await?;
+            capture_with_task(
+                &config,
+                &task,
+                &disk_file,
+                &os_family,
+                &boot_mode,
+                &task.edge_url,
+            )
+            .await?;
         }
         Commands::Deploy {
             config,
@@ -226,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
             p2p,
         } => {
             let (_cfg, task) = require_task(&config, &mac, "deploy").await?;
-            deploy_with_task(&config, &task, &disk_file, p2p).await?;
+            deploy_with_task(&config, &task, &disk_file, p2p, &task.edge_url).await?;
         }
         Commands::Run {
             config,
@@ -542,8 +553,18 @@ async fn run_auto(
         )));
     };
     match task.kind.as_str() {
-        "capture" => capture_with_task(&config_path, &task, &disk_file, &os_family, &boot_mode).await,
-        "deploy" => deploy_with_task(&config_path, &task, &disk_file, p2p).await,
+        "capture" => {
+            capture_with_task(
+                &config_path,
+                &task,
+                &disk_file,
+                &os_family,
+                &boot_mode,
+                &task.edge_url,
+            )
+            .await
+        }
+        "deploy" => deploy_with_task(&config_path, &task, &disk_file, p2p, &task.edge_url).await,
         other => Err(Error::Other(anyhow::anyhow!("unknown task kind: {other}"))),
     }
 }
@@ -570,10 +591,14 @@ async fn capture_with_task(
     disk_file: &PathBuf,
     os_family: &str,
     boot_mode: &str,
+    edge_url: &str,
 ) -> Result<()> {
     use std::sync::mpsc::sync_channel;
 
-    let cfg = load_cfg(config_path).await?;
+    let mut cfg = load_cfg(config_path).await?;
+    if !edge_url.trim().is_empty() {
+        cfg.edge_url = edge_url.trim().to_string();
+    }
     init_tracing(&cfg.log);
     let disk = resolve_disk(disk_file);
     eprintln!(
@@ -930,11 +955,15 @@ async fn deploy_with_task(
     task: &ClaimedTask,
     disk_file: &PathBuf,
     use_p2p: bool,
+    edge_url: &str,
 ) -> Result<()> {
     use std::io::{Read, Write as _};
     use std::sync::mpsc::sync_channel;
 
-    let cfg = load_cfg(config_path).await?;
+    let mut cfg = load_cfg(config_path).await?;
+    if !edge_url.trim().is_empty() {
+        cfg.edge_url = edge_url.trim().to_string();
+    }
     init_tracing(&cfg.log);
     let image_id = task.image_id.clone().ok_or_else(|| {
         Error::Other(anyhow::anyhow!("deploy task missing image_id"))

@@ -1,0 +1,78 @@
+易学 IDV — 学生机客户端
+======================
+把本目录【整份复制】到学生机：
+
+  C:\Program Files\YixueIDV\
+
+复制后目录应类似：
+
+  C:\Program Files\YixueIDV\
+    idv-agent.exe
+    agent.toml
+    driver\SysRestoreDriver.sys / .inf
+    scripts\*.ps1
+    docs\
+    使用说明.txt
+
+脚本一律相对本目录定位，在 J 盘调试或在 C:\Program Files\YixueIDV 正式使用均可。
+
+一、学生机一次性安装（管理员 PowerShell）
+----------------------------------------
+  cd "C:\Program Files\YixueIDV"
+
+  0) Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+
+  1) 改中心地址（也可手工编辑 agent.toml）
+       notepad .\agent.toml
+
+  2) 开测试签名 → 重启
+       powershell -ExecutionPolicy Bypass -File .\scripts\enable-testsigning.ps1
+
+  3) 重启后装驱动 → 再重启
+       powershell -ExecutionPolicy Bypass -File .\scripts\install-driver.ps1
+
+  4) 初始化 Agent + 开机拉策略
+       powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -RegisterBootTask
+
+二、真还原冒烟
+--------------
+  .\scripts\restore-driver.ps1 protect-on
+  # 重启后保护生效；改系统文件再重启应还原
+
+  .\scripts\restore-driver.ps1 protect-off
+  # 再重启后解冻
+
+  .\scripts\restore-driver.ps1 status
+  .\scripts\sync-policy.ps1
+  .\scripts\sync-policy.ps1 -Apply
+
+三、路径约定
+------------
+  程序/配置   C:\Program Files\YixueIDV\
+  状态/日志   C:\ProgramData\YixueIDV\
+  驱动加载后  C:\Windows\System32\drivers\SysRestoreDriver.sys
+  开机任务    YixueIdvAgentBoot（跑 sync-policy --apply）
+
+四、注意
+--------
+  - 务必在虚拟机或可重装机试点；未签名驱动需测试签名
+  - 关保护必须再重启才真正结束重定向
+  - 不要手动删除系统盘根目录 _qh_protect_state.data
+  - 防火墙放行 Center（默认 8080）
+
+五、编码问题：
+# 修复所有脚本文件的编码
+Get-ChildItem "C:\Program Files\YixueIDV\scripts\*.ps1" | ForEach-Object {
+    $content = Get-Content $_.FullName -Raw -Encoding UTF8
+    $encoder = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($_.FullName, $content, $encoder)
+    Write-Host "已修复: $($_.Name)"
+}
+
+
+
+# 跳过启动时的完整性检查
+ bcdedit /set nointegritychecks off
+
+# 允许加载未签名的驱动程序
+ bcdedit /set testsigning on

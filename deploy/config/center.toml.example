@@ -3,6 +3,9 @@
 # 机房部署用 0.0.0.0:8080；仅本机调试可用 127.0.0.1:8080
 listen = "0.0.0.0:8080"
 log = "info,idv_center=debug"
+# 日志目录（按天滚动，保留14天）；留空则只输出控制台。建议放数据盘。
+# log_dir = "D:/YixueIDV/logs/center"
+# 数据库、镜像、软件包、远程文件都建议放数据盘，避免占满系统盘。
 database_url = "sqlite://data/idv-center.db?mode=rwc"
 web_dir = "web/dist"
 images_dir = "data/images"

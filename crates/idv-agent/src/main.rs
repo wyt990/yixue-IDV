@@ -1866,7 +1866,6 @@ async fn report_command(cfg: &AgentConfig, id: &str, ok: bool, detail: &str) -> 
 }
 
 const RESTORE_NOW_MARKER: &str = "restore-now-armed";
-
 #[cfg(windows)]
 fn current_boot_ms() -> u64 {
     unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
@@ -3395,4 +3394,5 @@ mod tests {
         ));
         assert_eq!(action, IdentityAction::None);
     }
+
 }

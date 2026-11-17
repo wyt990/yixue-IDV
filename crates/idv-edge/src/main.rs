@@ -18,7 +18,7 @@ use axum::routing::{get, post, put};
 use clap::{Parser, Subcommand};
 use dhcp::{DhcpConfig, DhcpService};
 use idv_common::chunking::DEFAULT_CHUNK_SIZE;
-use idv_common::{Error, Result, init_tracing, load_toml_file};
+use idv_common::{Error, Result, init_tracing_with_log_dir, load_toml_file};
 use p2p::P2pState;
 use pe_api::PeState;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,14 @@ enum Commands {
     Serve {
         #[arg(short, long, default_value = "deploy/config/edge.toml")]
         config: PathBuf,
+    },
+    /// Run under the Windows Service Control Manager (used by the install script)
+    Service {
+        #[arg(short, long, default_value = "deploy/config/edge.toml")]
+        config: PathBuf,
+        /// Working directory for relative paths (data, cache, pe, ...)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
     },
     /// Send a DHCP Discover and print Offer summary (stage 3 lab/probe)
     DhcpProbe {
@@ -66,6 +74,9 @@ struct EdgeConfig {
     capture_tmp_dir: String,
     #[serde(default = "default_log")]
     log: String,
+    /// Optional daily-rotated log directory; empty => stdout (console mode).
+    #[serde(default)]
+    log_dir: String,
     #[serde(default = "default_heartbeat_secs")]
     heartbeat_secs: u64,
     #[serde(default = "default_poll_secs")]
@@ -223,9 +234,34 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { config } => serve(config).await?,
+        Commands::Service { config, workdir } => run_service_mode(config, workdir)?,
         Commands::DhcpProbe { server, mac } => dhcp_probe(&server, &mac).await?,
     }
     Ok(())
+}
+
+fn run_service_mode(config: PathBuf, workdir: Option<PathBuf>) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(dir) = workdir {
+            std::env::set_current_dir(&dir).map_err(|e| {
+                anyhow::anyhow!("set working directory {}: {e}", dir.display())
+            })?;
+        }
+        idv_common::win_service::run_service("idv-edge", move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(serve(config)).map_err(anyhow::Error::from)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (config, workdir);
+        Err(anyhow::anyhow!(
+            "Windows service mode is only supported on Windows"
+        ))
+    }
 }
 
 async fn dhcp_probe(server: &str, mac: &str) -> Result<()> {
@@ -305,7 +341,7 @@ async fn dhcp_probe(server: &str, mac: &str) -> Result<()> {
 
 async fn serve(config_path: PathBuf) -> Result<()> {
     let cfg: EdgeConfig = load_toml_file(&config_path)?;
-    init_tracing(&cfg.log);
+    init_tracing_with_log_dir(&cfg.log, Some(&cfg.log_dir));
 
     if cfg.node_token.trim().is_empty() || cfg.node_token.contains("REPLACE_WITH_CENTER_EDGE_TOKEN")
     {
@@ -346,7 +382,17 @@ async fn serve(config_path: PathBuf) -> Result<()> {
         .parse()
         .map_err(|err| Error::Config(format!("invalid listen address '{}': {err}", cfg.listen)))?;
 
-    let listen_url = format!("http://{addr}");
+    let advertised_host = if addr.ip().is_unspecified() {
+        let next = cfg.pxe.next_server.trim();
+        if next.is_empty() {
+            addr.ip().to_string()
+        } else {
+            next.to_string()
+        }
+    } else {
+        addr.ip().to_string()
+    };
+    let listen_url = format!("http://{advertised_host}:{}", addr.port());
     let center_reachable = Arc::new(AtomicBool::new(false));
     let runtime = EdgeRuntime {
         center_url: cfg.center_url.trim_end_matches('/').to_string(),
@@ -393,6 +439,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(refresh_secs)).await;
                 match bindings_runtime.refresh_ip_bindings().await {
+                    Ok(0) => {}
                     Ok(n) => {
                         info!(count = n, "refreshed DHCP reservations from center");
                     }

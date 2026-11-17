@@ -610,6 +610,9 @@ pub struct MaintenanceTaskTarget {
     pub detail: String,
     pub p2p_bytes: i64,
     pub edge_bytes: i64,
+    /// Assigned Edge for this target (multi-Edge deploy scheduling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 

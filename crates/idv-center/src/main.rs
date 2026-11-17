@@ -15,7 +15,7 @@ use axum::Json;
 use axum::Router;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
-use idv_common::{Error, Result, init_tracing, load_toml_file};
+use idv_common::{Error, Result, init_tracing_with_log_dir, load_toml_file};
 use serde::{Deserialize, Serialize};
 use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
@@ -38,6 +38,15 @@ enum Commands {
         #[arg(short, long, default_value = "deploy/config/center.toml")]
         config: PathBuf,
     },
+    /// Run under the Windows Service Control Manager (used by the install script)
+    Service {
+        /// Path to center.toml
+        #[arg(short, long, default_value = "deploy/config/center.toml")]
+        config: PathBuf,
+        /// Working directory for relative paths (web/dist, data, ...)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +54,9 @@ struct CenterConfig {
     listen: String,
     #[serde(default = "default_log")]
     log: String,
+    /// Optional daily-rotated log directory; empty => stdout (console mode).
+    #[serde(default)]
+    log_dir: String,
     #[serde(default = "default_database_url")]
     database_url: String,
     #[serde(default = "default_web_dir")]
@@ -99,13 +111,38 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { config } => serve(config).await?,
+        Commands::Service { config, workdir } => run_service_mode(config, workdir)?,
     }
     Ok(())
 }
 
+fn run_service_mode(config: PathBuf, workdir: Option<PathBuf>) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(dir) = workdir {
+            std::env::set_current_dir(&dir).map_err(|e| {
+                anyhow::anyhow!("set working directory {}: {e}", dir.display())
+            })?;
+        }
+        idv_common::win_service::run_service("idv-center", move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(serve(config)).map_err(anyhow::Error::from)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (config, workdir);
+        Err(anyhow::anyhow!(
+            "Windows service mode is only supported on Windows"
+        ))
+    }
+}
+
 async fn serve(config_path: PathBuf) -> Result<()> {
     let cfg: CenterConfig = load_toml_file(&config_path)?;
-    init_tracing(&cfg.log);
+    init_tracing_with_log_dir(&cfg.log, Some(&cfg.log_dir));
 
     let pool = db::connect(&cfg.database_url).await.map_err(Error::Other)?;
     tokio::fs::create_dir_all(&cfg.images_dir)

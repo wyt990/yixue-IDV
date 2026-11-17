@@ -14,10 +14,12 @@ pub mod restore;
 pub mod usb_policy;
 pub mod volume;
 pub mod wol;
+#[cfg(windows)]
+pub mod win_service;
 
 pub use config::load_toml_file;
 pub use error::{Error, Result};
-pub use logging::init_tracing;
+pub use logging::{init_tracing, init_tracing_with_log_dir};
 
 /// Test-only writable scratch directory.
 ///

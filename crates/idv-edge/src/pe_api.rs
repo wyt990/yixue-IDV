@@ -100,6 +100,9 @@ pub struct ClaimedTask {
     pub task_name: String,
     #[serde(default = "default_exclude_temp")]
     pub exclude_temp: bool,
+    /// Client-reachable URL of the assigned Edge (multi-Edge deploy).
+    #[serde(default)]
+    pub edge_url: String,
 }
 
 fn default_exclude_temp() -> bool {

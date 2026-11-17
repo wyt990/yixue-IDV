@@ -8,6 +8,8 @@ name = "楼栋A-缓存"
 node_token = "REPLACE_WITH_EDGE_NODE_TOKEN"
 cache_dir = "data/edge-cache"
 capture_tmp_dir = "data/edge-cache/capture-tmp"
+# 日志目录（按天滚动，保留14天）；留空则只输出控制台。
+# log_dir = "D:/YixueIDV/logs/edge"
 cache_quota_bytes = 107374182400
 cache_warn_pct = 85
 sync_bandwidth_bps = 0

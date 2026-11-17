@@ -3,6 +3,73 @@
 use axum::http::StatusCode;
 use sqlx::SqlitePool;
 
+use crate::models::edge_online;
+
+/// An online Edge that has a ready replica of the deploy image.
+#[derive(Debug, Clone)]
+pub struct DeployEdgeCandidate {
+    pub id: String,
+    pub name: String,
+    pub listen_url: String,
+    pub active_targets: i64,
+}
+
+/// Edges attached to the lab (or campus fallback) with a ready image replica.
+/// Ordered by current deploy load ascending; only online Edges are returned.
+pub async fn ready_deploy_edges(
+    pool: &SqlitePool,
+    lab_id: &str,
+    image_id: &str,
+) -> Result<Vec<DeployEdgeCandidate>, (StatusCode, String)> {
+    let mut edge_ids = resolve_preferred_edge_ids(pool, lab_id).await?;
+    if edge_ids.is_empty() {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM edges")
+            .fetch_all(pool)
+            .await
+            .map_err(internal)?;
+        edge_ids = rows.into_iter().map(|(id,)| id).collect();
+    }
+    if edge_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; edge_ids.len()].join(",");
+    let sql = format!(
+        "SELECT e.id, e.name, e.listen_url, e.last_seen, \
+         (SELECT COUNT(*) FROM maintenance_task_targets t \
+          WHERE t.edge_id = e.id AND t.state IN ('pending','running')) AS active \
+         FROM image_replicas r JOIN edges e ON e.id = r.edge_id \
+         WHERE r.image_id = ? AND r.state = 'ready' \
+           AND e.id IN ({placeholders})"
+    );
+    let mut q = sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<chrono::Utc>>, i64)>(&sql);
+    q = q.bind(image_id);
+    for id in &edge_ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await.map_err(internal)?;
+    let mut out: Vec<DeployEdgeCandidate> = rows
+        .into_iter()
+        .filter(|(_, _, _, seen, _)| edge_online(*seen))
+        .map(|(id, name, listen_url, _, active_targets)| DeployEdgeCandidate {
+            id,
+            name,
+            listen_url,
+            active_targets,
+        })
+        .filter(|c| {
+            let url = c.listen_url.trim();
+            !url.is_empty() && !url.contains("0.0.0.0")
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.active_targets
+            .cmp(&b.active_targets)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
+}
+
+
 /// Lab default image → campus default → none.
 pub async fn resolve_baseline_image_id(
     pool: &SqlitePool,
