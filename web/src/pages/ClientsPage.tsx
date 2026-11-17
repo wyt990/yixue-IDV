@@ -56,6 +56,8 @@ export function ClientsPage() {
   );
   const [moreOpen, setMoreOpen] = useState(false);
   const [powerOpen, setPowerOpen] = useState(false);
+  const [restoreOpen, setRestoreOpen] = useState(false);
+  const [restoreScope, setRestoreScope] = useState<"system" | "all_fixed">("system");
   const [powerRows, setPowerRows] = useState<
     { id: string; mac: string; kind: string; state: string; detail: string }[]
   >([]);
@@ -615,6 +617,34 @@ export function ClientsPage() {
     }
   }
 
+  function openManualRestore() {
+    if (picked.length !== 1) {
+      msg.warning("请只选择一台终端");
+      return;
+    }
+    setRestoreScope("system");
+    setRestoreOpen(true);
+  }
+
+  async function submitManualRestore() {
+    if (picked.length !== 1) {
+      msg.warning("请只选择一台终端");
+      return;
+    }
+    const target = picked[0];
+    try {
+      await api.clients.command(target.mac, "restore_now", {
+        scope: restoreScope,
+      });
+      setRestoreOpen(false);
+      msg.success(
+        `手动还原已下发（${restoreScope === "all_fixed" ? "所有固定盘" : "系统盘"}），客户端将重启`,
+      );
+    } catch (err) {
+      msg.error(err instanceof Error ? err.message : "手动还原下发失败");
+    }
+  }
+
   async function doBulkMove(e: FormEvent) {
     e.preventDefault();
     const ids = [...selected];
@@ -803,6 +833,15 @@ export function ClientsPage() {
                 onClick={() => bulkPower("reboot")}
               >
                 重启
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={!!needOne}
+                title={needOne || "开启保护并重启，重启后恢复基线"}
+                onClick={openManualRestore}
+              >
+                手动还原
               </button>
             </div>
             <div className="command-group">
@@ -1462,6 +1501,54 @@ export function ClientsPage() {
             </button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={restoreOpen}
+        title="手动还原"
+        onClose={() => setRestoreOpen(false)}
+      >
+        <p className="muted">
+          目标：{picked[0]?.name || picked[0]?.mac || "—"}（{picked[0]?.mac}）。
+          客户端会立即开启保护并重启，重启时恢复到基线；重启完成后自动解冻。
+        </p>
+        <div className="field">
+          <label>还原范围</label>
+          <label className="muted" style={{ display: "block", marginTop: "0.35rem" }}>
+            <input
+              type="radio"
+              name="restore-scope"
+              checked={restoreScope === "system"}
+              onChange={() => setRestoreScope("system")}
+            />{" "}
+            仅系统盘（推荐，默认）
+          </label>
+          <label className="muted" style={{ display: "block", marginTop: "0.35rem" }}>
+            <input
+              type="radio"
+              name="restore-scope"
+              checked={restoreScope === "all_fixed"}
+              onChange={() => setRestoreScope("all_fixed")}
+            />{" "}
+            所有固定盘（C/D/E…，数据盘也会被还原）
+          </label>
+        </div>
+        <div className="modal-actions">
+          <button
+            className="btn ghost"
+            type="button"
+            onClick={() => setRestoreOpen(false)}
+          >
+            取消
+          </button>
+          <button
+            className="btn danger"
+            type="button"
+            onClick={() => void submitManualRestore()}
+          >
+            还原并重启
+          </button>
+        </div>
       </Modal>
 
       <Modal

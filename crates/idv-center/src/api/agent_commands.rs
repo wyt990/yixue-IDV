@@ -175,6 +175,7 @@ const ALLOWED_KINDS: &[&str] = &[
     "run_program",
     "assist_ack",
     "update_agent",
+    "restore_now",
 ];
 
 /// Admin/API: queue a command for a MAC (used by UI/automation).

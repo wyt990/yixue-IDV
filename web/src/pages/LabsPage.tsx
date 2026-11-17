@@ -21,7 +21,8 @@ type ModeBinding = {
 function modeLabel(m: ModePolicy) {
   const r = (m.restore || "").toLowerCase();
   if (r === "reboot") return `${m.name}（开机还原）`;
-  if (r === "off" || r === "manual") return `${m.name}（不还原）`;
+  if (r === "manual") return `${m.name}（手动还原）`;
+  if (r === "off") return `${m.name}（不还原）`;
   return m.name;
 }
 
@@ -172,7 +173,6 @@ export function LabsPage() {
   const [editPrefix, setEditPrefix] = useState("");
   const [editWidth, setEditWidth] = useState(3);
   const [editStart, setEditStart] = useState(1);
-  const [editNext, setEditNext] = useState(1);
   const [editIpStart, setEditIpStart] = useState("");
   const [editIpEnd, setEditIpEnd] = useState("");
   const [editNetmask, setEditNetmask] = useState("");
@@ -241,7 +241,6 @@ export function LabsPage() {
     setEditPrefix(lab.name_prefix || "");
     setEditWidth(lab.suffix_width ?? 3);
     setEditStart(lab.suffix_start ?? 1);
-    setEditNext(lab.next_suffix ?? lab.suffix_start ?? 1);
     setEditIpStart(lab.ip_start || "");
     setEditIpEnd(lab.ip_end || "");
     setEditNetmask(lab.netmask || "255.255.255.0");
@@ -350,7 +349,6 @@ export function LabsPage() {
         name_prefix: editPrefix,
         suffix_width: editWidth,
         suffix_start: editStart,
-        next_suffix: editNext,
         ip_start: editIpStart,
         ip_end: editIpEnd,
         netmask: editNetmask,
@@ -478,7 +476,7 @@ export function LabsPage() {
               <th>机房</th>
               <th>校区</th>
               <th>工作模式</th>
-              <th>命名预览</th>
+              <th>命名起点</th>
               <th>默认镜像</th>
               <th>边缘</th>
               <th>操作</th>
@@ -522,7 +520,7 @@ export function LabsPage() {
                       {previewName(
                         lab.name_prefix || "",
                         lab.suffix_width ?? 3,
-                        lab.next_suffix ?? lab.suffix_start ?? 1,
+                        lab.suffix_start ?? 1,
                       )}
                     </td>
                     <td className="muted">
@@ -849,21 +847,12 @@ export function LabsPage() {
                 onChange={(e) => setEditStart(Number(e.target.value) || 1)}
               />
             </div>
-            <div className="field">
-              <label>下一个序号</label>
-              <input
-                type="number"
-                min={1}
-                value={editNext}
-                onChange={(e) => setEditNext(Number(e.target.value) || 1)}
-              />
-            </div>
           </div>
           <p className="muted">
-            下一台自动命名预览：
+            下一台自动命名：从起始序号开始取第一个空闲编号，例如：
             <span className="mono">
               {" "}
-              {previewName(editPrefix, editWidth, editNext)}
+              {previewName(editPrefix, editWidth, editStart)}
             </span>
           </p>
           <div className="form-row">

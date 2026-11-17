@@ -13,7 +13,7 @@
 | 常驻 | `idv-agent service` 注册为 Windows 服务（`idv-agent`），失败自动回退 SYSTEM 计划任务守护 |
 | 心跳 | 常驻循环每 5 秒 `POST /api/v1/agent/heartbeat`（可在 `agent.toml` 配 `heartbeat_secs`） |
 | 即时命令 | `GET /api/v1/agent/commands/next?mac=..&wait=20` 长轮询；命令入队即唤醒，实测 <1 秒 |
-| 命令类型 | `apply_policy` / `sync_policy` / `reboot` / `shutdown` / `open_url` / `run_program` / `assist_ack` |
+| 命令类型 | `apply_policy` / `sync_policy` / `reboot` / `shutdown` / `open_url` / `run_program` / `restore_now` / `assist_ack` |
 | 在线状态 | 终端页「在线/离线」列：`agent_sessions.last_seen ≤ 15s` |
 | 还原状态 | 终端页「还原状态」列：已冻结 / 未冻结 / 待重启生效 + 当前工作模式 |
 | 状态刷新 | 终端页每 5 秒自动刷新 |
@@ -123,3 +123,13 @@ service/daemon
 - 旧客户端（计划任务轮询）仍可用：服务端命令表只对长轮询客户端即时生效，旧客户端继续走心跳 `pending_*`；
 - 不想用服务时：`install-agent-service.ps1 -FallbackTaskOnly`；
 - 卸载服务：`sc.exe stop idv-agent; sc.exe delete idv-agent`（或删除对应计划任务）。
+
+## 3.2 网络超时与容错
+
+Agent 的普通 HTTP 请求（心跳、回执、普通上报）统一：
+
+- 连接超时：5 秒；
+- 总超时：30 秒；
+- 长轮询/文件传输/更新下载在请求级单独设置更长超时，不受 30 秒限制。
+
+Center 宕机或网络黑洞时，心跳任务会快速失败并重试，不会无限挂起，也不会触发重启或蓝屏。

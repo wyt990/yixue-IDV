@@ -690,6 +690,7 @@ async fn sync_and_maybe_apply(
     apply: bool,
     trigger: &str,
 ) -> Result<String> {
+    consume_restore_now_marker(state_dir);
     let mut store = LocalPolicyStore::load(state_dir);
     let status = store.applied_status();
     let policy = heartbeat(cfg, trigger, &status).await?;
@@ -1748,6 +1749,11 @@ async fn report(cfg: &AgentConfig, ok: bool, detail: &str) -> Result<()> {
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        // A dead Center / network black hole must not stall a heartbeat task
+        // indefinitely. Per-request timeouts (long-poll/file transfer) still
+        // override these defaults.
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("reqwest client")
 }
@@ -1859,6 +1865,118 @@ async fn report_command(cfg: &AgentConfig, id: &str, ok: bool, detail: &str) -> 
     Ok(())
 }
 
+const RESTORE_NOW_MARKER: &str = "restore-now-armed";
+
+#[cfg(windows)]
+fn current_boot_ms() -> u64 {
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+#[cfg(not(windows))]
+fn current_boot_ms() -> u64 {
+    0
+}
+
+/// One-shot manual restore: after the reboot, the driver has already restored
+/// the protected volumes; now disarm so later edits persist again.
+fn consume_restore_now_marker(state_dir: &std::path::Path) {
+    let path = state_dir.join(RESTORE_NOW_MARKER);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let (armed, restore) = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        (
+            v.get("armed_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+            v.get("restore")
+                .and_then(|x| x.as_str())
+                .unwrap_or("manual")
+                .to_string(),
+        )
+    } else {
+        (text.trim().parse::<u64>().unwrap_or(0), "manual".into())
+    };
+    let now = current_boot_ms();
+    // Same boot: do not change protection before the reboot has happened.
+    if armed == 0 || now >= armed.saturating_sub(2_000) {
+        return;
+    }
+    if restore != "manual" && restore != "off" {
+        // Teaching/exam mode wants protection on; keep it frozen after restore.
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    match default_driver().protect_off() {
+        Ok(st) => {
+            let _ = std::fs::remove_file(&path);
+            eprintln!(
+                "idv-agent: manual restore finished; protection disarmed frozen={} detail={}",
+                st.frozen, st.detail
+            );
+        }
+        Err(err) => eprintln!("idv-agent: manual restore disarm failed: {err}; will retry"),
+    }
+}
+
+async fn execute_restore_now(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    sync_lock: &tokio::sync::Mutex<()>,
+    cmd: &AgentCommand,
+) -> Result<()> {
+    let _guard = sync_lock.lock().await;
+    let status = LocalPolicyStore::load(state_dir).applied_status();
+    let policy = heartbeat(cfg, "manual", &status).await?;
+    if policy.mode.is_none() {
+        report_command(cfg, &cmd.id, false, "restore_now: no mode policy").await?;
+        return Ok(());
+    }
+    let volumes = match serde_json::from_str::<serde_json::Value>(&cmd.payload)
+        .ok()
+        .and_then(|v| {
+            v.get("scope")
+                .and_then(|s| s.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+        })
+        .as_deref()
+    {
+        Some("all_fixed") => vec!["all_fixed".to_string()],
+        Some("system") => vec!["system".to_string()],
+        _ => policy
+            .desired_state
+            .as_ref()
+            .map(|d| d.restore.protect_volumes.clone())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["system".into()]),
+    };
+    let driver = default_driver();
+    let st = driver
+        .protect_on(&volumes)
+        .map_err(|e| Error::Other(anyhow::anyhow!("arm restore: {e}")))?;
+    let marker = state_dir.join(RESTORE_NOW_MARKER);
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    }
+    let restore_mode = policy
+        .mode
+        .as_ref()
+        .map(|m| m.restore.clone())
+        .unwrap_or_else(|| "manual".into());
+    let marker_body = serde_json::json!({
+        "armed_ms": current_boot_ms(),
+        "restore": restore_mode,
+    });
+    std::fs::write(&marker, marker_body.to_string())
+        .map_err(|e| Error::Other(anyhow::anyhow!("write restore marker: {e}")))?;
+    let detail = format!(
+        "restore_armed volumes={:?} frozen={} detail={}; rebooting",
+        volumes, st.frozen, st.detail
+    );
+    report_command(cfg, &cmd.id, true, &detail).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    issue_windows_power("reboot")?;
+    Ok(())
+}
+
 async fn execute_agent_command(
     cfg: &AgentConfig,
     state_dir: &std::path::Path,
@@ -1867,6 +1985,9 @@ async fn execute_agent_command(
     mac: &str,
 ) -> Result<()> {
     let kind = cmd.kind.as_str();
+    if kind == "restore_now" {
+        return execute_restore_now(cfg, state_dir, sync_lock, cmd).await;
+    }
     if matches!(kind, "apply_policy" | "sync_policy") {
         let _guard = sync_lock.lock().await;
         let summary = sync_and_maybe_apply(cfg, state_dir, true, "command").await?;

@@ -23,7 +23,12 @@ pub async fn load_lab(state: &AppState, lab_id: &str) -> Result<Lab, (StatusCode
         .ok_or((StatusCode::NOT_FOUND, "lab not found".into()))
 }
 
-/// Atomically allocate the next name for a lab (updates `next_suffix`).
+/// Atomically allocate the first free name for a lab.
+///
+/// Always starts at `suffix_start` and scans for the first unused name, so
+/// deleting a client (or all clients) reuses the lowest free number instead of
+/// continuing from a monotonic counter. `next_suffix` is kept only as a
+/// display hint (next candidate after the allocated one).
 pub async fn allocate_next_name(
     state: &AppState,
     lab_id: &str,
@@ -38,7 +43,7 @@ pub async fn allocate_next_name(
         .ok_or((StatusCode::NOT_FOUND, "lab not found".into()))?;
 
     let width = lab.suffix_width.clamp(1, 8);
-    let mut n = lab.next_suffix.max(lab.suffix_start).max(1);
+    let mut n = lab.suffix_start.max(1);
     let prefix = lab.name_prefix.trim();
 
     let name = loop {
