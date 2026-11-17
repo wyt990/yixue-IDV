@@ -773,6 +773,11 @@ export function LabsPage() {
               </select>
             </div>
           </div>
+          <p className="muted">
+            机房 IP 段用于 Center 地址分配和 DHCP 保留。Edge 的 DHCP
+            池默认留空时会自动使用这里的范围；只有在 edge.toml
+            显式填写时才覆盖。
+          </p>
           <div className="modal-actions">
             <button
               type="button"
@@ -920,8 +925,9 @@ export function LabsPage() {
             </div>
           </div>
           <p className="muted" style={{ fontSize: "0.85rem" }}>
-            登记终端时按 IP 区间顺延分配；Agent 按 MAC 将计算机名与静态 IP
-            落到学生机。工作模式请在列表下拉中切换。
+            机房 IP 段用于 Center 地址分配、DHCP 保留和 Edge 默认 DHCP
+            池；登记终端时按 IP 区间顺延分配，Agent 按 MAC 将计算机名与 IP
+            落到学生机。Edge 的 edge.toml 留空时自动使用这里。工作模式请在列表下拉中切换。
           </p>
           <div className="field">
             <label>默认基线镜像</label>

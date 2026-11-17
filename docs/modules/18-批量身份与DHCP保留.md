@@ -16,6 +16,10 @@
 | 还原开启仍保持 | 首启身份状态机：先关保护 → 改名/配网 → 再开保护；冻结基线里就是本机身份 |
 | 批量安装 | 金样机预装 Agent + 开机/轮询任务；客户端配置全通用（只写 `center_url`） |
 | 可观测 | 心跳上报 `current_hostname / identity_state / last_error`，落到 `agent_sessions.detail` |
+| DHCP 池来源 | **推荐 edge.toml 留空**：Edge 自动读取机房 IP 段作为池；显式填写才覆盖 |
+
+> 机房 `ip_start..ip_end` 首先是“分配范围”，可能只包含少量地址；当它不足 4 个地址时，
+> Edge 自动改用**同子网全地址池**（避开 DHCP server 与网关），避免 DHCP 池为空。
 
 ---
 

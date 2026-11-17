@@ -16,6 +16,26 @@ use tokio::sync::RwLock;
 pub struct BindingsDoc {
     #[serde(default)]
     pub bindings: Vec<Binding>,
+    /// Lab network scopes attached to this Edge (used to derive DHCP pool).
+    #[serde(default)]
+    pub labs: Vec<LabScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabScope {
+    pub lab_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub ip_start: String,
+    #[serde(default)]
+    pub ip_end: String,
+    #[serde(default)]
+    pub netmask: String,
+    #[serde(default)]
+    pub gateway: String,
+    #[serde(default)]
+    pub dns: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,12 +50,15 @@ pub struct Binding {
 struct Inner {
     by_mac: HashMap<[u8; 6], Ipv4Addr>,
     by_ip: HashSet<u32>,
+    labs: Vec<LabScope>,
 }
 
 /// Shared, cheaply-clonable MAC -> reserved IPv4 map.
 #[derive(Debug, Default, Clone)]
 pub struct IpBindings {
     inner: Arc<RwLock<Inner>>,
+    /// Serialize cache writes; the startup refresh and background loop can overlap.
+    save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl IpBindings {
@@ -58,6 +81,7 @@ impl IpBindings {
         let mut inner = self.inner.write().await;
         inner.by_mac.clear();
         inner.by_ip.clear();
+        inner.labs = doc.labs.clone();
         for b in &doc.bindings {
             let Some(mac) = parse_mac(&b.mac) else {
                 continue;
@@ -69,6 +93,24 @@ impl IpBindings {
             inner.by_ip.insert(u32::from(ip));
         }
         inner.by_mac.len()
+    }
+
+    /// Lab scope for deriving DHCP subnet/pool when edge.toml leaves them blank.
+    pub async fn lab_scope(&self) -> Option<LabScope> {
+        let inner = self.inner.read().await;
+        inner
+            .labs
+            .iter()
+            .find(|l| {
+                !l.ip_start.trim().is_empty()
+                    && !l.ip_end.trim().is_empty()
+                    && !l.netmask.trim().is_empty()
+            })
+            .cloned()
+    }
+
+    pub async fn labs(&self) -> Vec<LabScope> {
+        self.inner.read().await.labs.clone()
     }
 
     pub async fn get(&self, mac: &[u8; 6]) -> Option<Ipv4Addr> {
@@ -96,20 +138,35 @@ impl IpBindings {
             })
             .collect();
         bindings.sort_by(|a, b| a.mac.cmp(&b.mac));
-        BindingsDoc { bindings }
+        BindingsDoc {
+            bindings,
+            labs: inner.labs.clone(),
+        }
     }
 
     /// Persist atomically (tmp + rename); errors are returned for logging.
     pub async fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
+        let _guard = self.save_lock.lock().await;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             tokio::fs::create_dir_all(parent).await?;
         }
         let doc = self.to_doc().await;
         let bytes =
             serde_json::to_vec_pretty(&doc).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let tmp = path.with_extension("json.tmp");
+        // Unique temp name avoids a concurrent save renaming the same tmp file.
+        let stem = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ip-bindings.json".into());
+        let tmp = path.with_file_name(format!(".{stem}.{}.tmp", std::process::id()));
         tokio::fs::write(&tmp, bytes).await?;
-        tokio::fs::rename(&tmp, path).await
+        let res = tokio::fs::rename(&tmp, path).await;
+        if res.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        res
     }
 }
 
@@ -180,6 +237,7 @@ mod tests {
                 ip: "10.110.0.31".into(),
                 lab_id: "lab".into(),
             }],
+            labs: Vec::new(),
         };
         assert_eq!(bindings.replace(&doc).await, 1);
         let mac = parse_mac("aa:bb:cc:dd:ee:01").unwrap();

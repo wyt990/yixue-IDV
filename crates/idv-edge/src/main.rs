@@ -384,11 +384,14 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     });
 
     // Refresh DHCP reservations from Center periodically; cache on disk.
+    // Sleep first: the PXE startup path performs one immediate refresh so the
+    // lab-derived pool is ready before DHCP starts.
     {
         let bindings_runtime = runtime.clone();
         let refresh_secs = cfg.ip_bindings_refresh_secs.max(5);
         tokio::spawn(async move {
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(refresh_secs)).await;
                 match bindings_runtime.refresh_ip_bindings().await {
                     Ok(n) => {
                         info!(count = n, "refreshed DHCP reservations from center");
@@ -397,28 +400,70 @@ async fn serve(config_path: PathBuf) -> Result<()> {
                         warn!(error = %err, "refresh DHCP reservations failed; keeping cached bindings");
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(refresh_secs)).await;
             }
         });
     }
 
     if cfg.pxe.enabled {
+        // Pull once before starting DHCP so lab-derived pool/netmask is current.
+        if let Err(err) = runtime.refresh_ip_bindings().await {
+            warn!(error = %err, "initial DHCP lab scope fetch failed; using cached lab config");
+        }
+        let scope = ip_bindings.lab_scope().await;
+        let labs = ip_bindings.labs().await;
+        if labs.len() > 1 {
+            warn!(
+                count = labs.len(),
+                "multiple labs attached to this edge; using first complete lab scope for DHCP"
+            );
+        }
+        if let Some(scope) = &scope {
+            info!(
+                lab = %scope.name,
+                ip_start = %scope.ip_start,
+                ip_end = %scope.ip_end,
+                netmask = %scope.netmask,
+                "using lab IP scope for DHCP pool (edge.toml empty fields fall back to this)"
+            );
+        }
         let mode = if cfg.pxe.mode == "off" {
             "full".to_string()
         } else {
             cfg.pxe.mode.clone()
         };
+        let subnet_mask = resolve_pxe_ip(
+            &cfg.pxe.subnet_mask,
+            scope.as_ref().map(|s| s.netmask.as_str()),
+            "subnet_mask",
+        )?;
+        let router = resolve_pxe_ip(
+            &cfg.pxe.router,
+            scope.as_ref().map(|s| s.gateway.as_str()),
+            "router",
+        )?;
+        let dns = scope
+            .as_ref()
+            .and_then(|s| s.dns.trim().parse::<Ipv4Addr>().ok());
+        let next_server = parse_v4(&cfg.pxe.next_server)?;
+        let (offer_start, offer_end) = resolve_offer_range(
+            &cfg.pxe.offer_start,
+            &cfg.pxe.offer_end,
+            scope.as_ref(),
+            next_server,
+            subnet_mask,
+            router,
+        )?;
         let dhcp_cfg = DhcpConfig {
             mode,
             bind: cfg.pxe.dhcp_bind.clone(),
-            next_server: parse_v4(&cfg.pxe.next_server)?,
+            next_server,
             boot_file: cfg.pxe.boot_file.clone(),
-            subnet_mask: parse_v4(&cfg.pxe.subnet_mask)?,
-            router: parse_v4(&cfg.pxe.router)?,
-            offer_start: parse_v4(&cfg.pxe.offer_start)?,
-            offer_end: parse_v4(&cfg.pxe.offer_end)?,
+            subnet_mask,
+            router,
+            offer_start,
+            offer_end,
             lease_secs: cfg.pxe.lease_secs,
-            dns: None,
+            dns,
             reservations: ip_bindings.clone(),
         };
         let dhcp = DhcpService::new(dhcp_cfg);
@@ -531,4 +576,155 @@ async fn serve(config_path: PathBuf) -> Result<()> {
 fn parse_v4(s: &str) -> Result<Ipv4Addr> {
     s.parse()
         .map_err(|err| Error::Config(format!("invalid IPv4 '{s}': {err}")))
+}
+
+/// `raw` from edge.toml wins when non-empty; otherwise use the lab scope string.
+fn resolve_pxe_ip(raw: &str, lab_value: Option<&str>, field: &str) -> Result<Ipv4Addr> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() {
+        return parse_v4(trimmed);
+    }
+    let fallback = lab_value.unwrap_or("").trim();
+    if fallback.is_empty() {
+        return Err(Error::Config(format!(
+            "{field} is empty in edge.toml and Center returned no lab IP scope; \
+             fill the lab IP range in Center, or set {field} explicitly"
+        )));
+    }
+    parse_v4(fallback)
+}
+
+/// Explicit edge.toml range wins. Otherwise use the lab assignment range when
+/// it is large enough; a single-IP assignment range (common for small labs) is
+/// not a usable DHCP pool, so fall back to the whole subnet.
+fn resolve_offer_range(
+    raw_start: &str,
+    raw_end: &str,
+    scope: Option<&crate::ip_bindings::LabScope>,
+    next_server: Ipv4Addr,
+    subnet_mask: Ipv4Addr,
+    router: Ipv4Addr,
+) -> Result<(Ipv4Addr, Ipv4Addr)> {
+    let start = raw_start.trim();
+    let end = raw_end.trim();
+    if !start.is_empty() && !end.is_empty() {
+        return Ok((parse_v4(start)?, parse_v4(end)?));
+    }
+    if !start.is_empty() || !end.is_empty() {
+        return Err(Error::Config(
+            "offer_start/offer_end must both be empty or both be set in edge.toml".into(),
+        ));
+    }
+    if let Some(scope) = scope
+        && let (Ok(s), Ok(e)) = (
+            scope.ip_start.trim().parse::<Ipv4Addr>(),
+            scope.ip_end.trim().parse::<Ipv4Addr>(),
+        )
+        && u32::from(e) > u32::from(s).saturating_add(3)
+    {
+        return Ok((s, e));
+    }
+    let pool = derive_subnet_pool(next_server, subnet_mask, router)?;
+    warn!(
+        start = %pool.0,
+        end = %pool.1,
+        "lab IP range is too small for a DHCP pool; using full subnet range"
+    );
+    Ok(pool)
+}
+
+fn derive_subnet_pool(
+    server: Ipv4Addr,
+    mask: Ipv4Addr,
+    router: Ipv4Addr,
+) -> Result<(Ipv4Addr, Ipv4Addr)> {
+    let mask_u32 = u32::from(mask);
+    if mask_u32 == 0 {
+        return Err(Error::Config("subnet_mask is 0.0.0.0".into()));
+    }
+    let network = u32::from(server) & mask_u32;
+    let broadcast = network | !mask_u32;
+    let mut start = network.saturating_add(2);
+    let mut end = broadcast.saturating_sub(1);
+    if start == u32::from(server) || start == u32::from(router) {
+        start = start.saturating_add(1);
+    }
+    if end == u32::from(server) || end == u32::from(router) {
+        end = end.saturating_sub(1);
+    }
+    if start > end {
+        return Err(Error::Config(
+            "cannot derive a DHCP pool from next_server/subnet_mask".into(),
+        ));
+    }
+    Ok((Ipv4Addr::from(start), Ipv4Addr::from(end)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn derive_pool_avoids_server_and_router() {
+        let (start, end) = derive_subnet_pool(
+            v4("10.110.0.1"),
+            v4("255.255.255.0"),
+            v4("10.110.0.254"),
+        )
+        .unwrap();
+        assert_eq!(start, v4("10.110.0.2"));
+        assert_eq!(end, v4("10.110.0.253"));
+    }
+
+    #[test]
+    fn small_lab_range_falls_back_to_subnet_pool() {
+        let scope = crate::ip_bindings::LabScope {
+            lab_id: "lab".into(),
+            name: "lab".into(),
+            ip_start: "10.110.0.2".into(),
+            ip_end: "10.110.0.2".into(),
+            netmask: "255.255.255.0".into(),
+            gateway: "10.110.0.254".into(),
+            dns: "".into(),
+        };
+        let (start, end) = resolve_offer_range(
+            "",
+            "",
+            Some(&scope),
+            v4("10.110.0.1"),
+            v4("255.255.255.0"),
+            v4("10.110.0.254"),
+        )
+        .unwrap();
+        assert_eq!(start, v4("10.110.0.2"));
+        assert_eq!(end, v4("10.110.0.253"));
+    }
+
+    #[test]
+    fn large_lab_range_is_used_directly() {
+        let scope = crate::ip_bindings::LabScope {
+            lab_id: "lab".into(),
+            name: "lab".into(),
+            ip_start: "10.110.0.10".into(),
+            ip_end: "10.110.0.200".into(),
+            netmask: "255.255.255.0".into(),
+            gateway: "10.110.0.254".into(),
+            dns: "".into(),
+        };
+        let (start, end) = resolve_offer_range(
+            "",
+            "",
+            Some(&scope),
+            v4("10.110.0.1"),
+            v4("255.255.255.0"),
+            v4("10.110.0.254"),
+        )
+        .unwrap();
+        assert_eq!(start, v4("10.110.0.10"));
+        assert_eq!(end, v4("10.110.0.200"));
+    }
 }

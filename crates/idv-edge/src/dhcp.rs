@@ -550,6 +550,7 @@ mod tests {
                     ip: "10.10.0.99".into(),
                     lab_id: "lab".into(),
                 }],
+                labs: Vec::new(),
             })
             .await;
         let svc = DhcpService::new(DhcpConfig {

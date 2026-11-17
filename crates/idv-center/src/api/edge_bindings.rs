@@ -19,9 +19,23 @@ pub struct IpBinding {
     pub lab_id: String,
 }
 
+/// Lab network scope attached to this Edge; Edge can derive its DHCP pool and
+/// gateway from the lab settings instead of duplicating them in edge.toml.
+#[derive(Debug, Serialize)]
+pub struct LabScope {
+    pub lab_id: String,
+    pub name: String,
+    pub ip_start: String,
+    pub ip_end: String,
+    pub netmask: String,
+    pub gateway: String,
+    pub dns: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IpBindingsResponse {
     pub bindings: Vec<IpBinding>,
+    pub labs: Vec<LabScope>,
 }
 
 pub async fn list(
@@ -56,11 +70,39 @@ pub async fn list(
     if lab_ids.is_empty() {
         return Ok(Json(IpBindingsResponse {
             bindings: Vec::new(),
+            labs: Vec::new(),
         }));
     }
 
-    // Dynamic IN list; all values are bound, no user input is interpolated.
     let placeholders = vec!["?"; lab_ids.len()].join(",");
+    let lab_sql = format!(
+        "SELECT id, name, ip_start, ip_end, netmask, gateway, dns \
+         FROM labs WHERE id IN ({placeholders}) ORDER BY name"
+    );
+    let mut lab_query =
+        sqlx::query_as::<_, (String, String, String, String, String, String, String)>(&lab_sql);
+    for id in &lab_ids {
+        lab_query = lab_query.bind(id);
+    }
+    let labs = lab_query
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(
+            |(lab_id, name, ip_start, ip_end, netmask, gateway, dns)| LabScope {
+                lab_id,
+                name,
+                ip_start,
+                ip_end,
+                netmask,
+                gateway,
+                dns,
+            },
+        )
+        .collect();
+
+    // Dynamic IN list; all values are bound, no user input is interpolated.
     let sql = format!(
         "SELECT c.mac, c.assigned_ip, c.lab_id \
          FROM clients c JOIN labs l ON l.id = c.lab_id \
@@ -77,7 +119,7 @@ pub async fn list(
         .into_iter()
         .map(|(mac, ip, lab_id)| IpBinding { mac, ip, lab_id })
         .collect();
-    Ok(Json(IpBindingsResponse { bindings }))
+    Ok(Json(IpBindingsResponse { bindings, labs }))
 }
 
 fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {

@@ -25,8 +25,10 @@ tftp_bind = "0.0.0.0:69"
 tftp_root = "pe"
 boot_file = "ipxe.efi"
 next_server = "10.110.0.1"
-subnet_mask = "255.255.255.0"
-router = "10.110.0.254"
-offer_start = "10.110.0.2"
-offer_end = "10.110.0.250"
+# 推荐留空：Edge 启动时会从 Center 读取本 Edge 绑定的机房 IP 段，
+# 自动使用机房的子网掩码/网关/IP 池；只有需要覆盖时才填写。
+subnet_mask = ""
+router = ""
+offer_start = ""
+offer_end = ""
 lease_secs = 3600

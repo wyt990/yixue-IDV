@@ -10,7 +10,6 @@ import { ImagesPage } from "./pages/ImagesPage";
 import { LabsPage } from "./pages/LabsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { PeSessionsPage } from "./pages/PeSessionsPage";
-import { Phase3Page } from "./pages/Phase3Page";
 import { RemotePage } from "./pages/RemotePage";
 import { TasksPage } from "./pages/TasksPage";
 
@@ -42,7 +41,7 @@ export default function App() {
         <Route path="tasks" element={<TasksPage />} />
         <Route path="remote" element={<RemotePage />} />
         <Route path="modes" element={<Navigate to="/labs" replace />} />
-        <Route path="phase3" element={<Phase3Page />} />
+        <Route path="phase3" element={<Navigate to="/remote" replace />} />
         <Route path="admins" element={<AdminsPage />} />
         <Route path="appearance" element={<AppearancePage />} />
       </Route>
