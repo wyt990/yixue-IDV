@@ -288,6 +288,7 @@ async fn enqueue_command(
         state: "pending".into(),
         progress: 0.0,
         error_message: String::new(),
+        payload: "{}".into(),
         created_at: now,
         updated_at: now,
     };

@@ -55,6 +55,10 @@ export function ClientsPage() {
     null,
   );
   const [moreOpen, setMoreOpen] = useState(false);
+  const [powerOpen, setPowerOpen] = useState(false);
+  const [powerRows, setPowerRows] = useState<
+    { id: string; mac: string; kind: string; state: string; detail: string }[]
+  >([]);
   const [fileKind, setFileKind] = useState<null | "collect" | "distribute">(null);
   const [collectDir, setCollectDir] = useState("C:\\Users\\Public\\Documents");
   const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Documents");
@@ -516,6 +520,15 @@ export function ClientsPage() {
     }
   }
 
+  async function openPower() {
+    try {
+      setPowerRows(await api.power.list());
+      setPowerOpen(true);
+    } catch (e) {
+      msg.error(String((e as Error).message || e));
+    }
+  }
+
   function openFiles(kind: "collect" | "distribute") {
     if (picked.length === 0) {
       msg.warning("请先勾选终端");
@@ -943,6 +956,16 @@ export function ClientsPage() {
                       }}
                     >
                       更新 Agent
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => {
+                        setMoreOpen(false);
+                        void openPower();
+                      }}
+                    >
+                      电源记录
                     </button>
                   </div>
                 ) : null}
@@ -1439,6 +1462,48 @@ export function ClientsPage() {
             </button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={powerOpen}
+        title="电源记录"
+        onClose={() => setPowerOpen(false)}
+        wide
+      >
+        <table>
+          <thead>
+            <tr>
+              <th>MAC</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>详情</th>
+            </tr>
+          </thead>
+          <tbody>
+            {powerRows.length === 0 ? (
+              <tr>
+                <td className="muted" colSpan={4}>
+                  暂无电源记录。
+                </td>
+              </tr>
+            ) : (
+              powerRows.map((p) => (
+                <tr key={p.id}>
+                  <td className="mono">{p.mac}</td>
+                  <td>
+                    {p.kind === "wol"
+                      ? "开机"
+                      : p.kind === "reboot"
+                        ? "重启"
+                        : "关机"}
+                  </td>
+                  <td>{p.state}</td>
+                  <td className="muted">{p.detail}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
       </Modal>
 
       <Modal

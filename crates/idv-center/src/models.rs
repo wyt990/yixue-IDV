@@ -795,6 +795,8 @@ pub struct EdgeCommand {
     pub state: String,
     pub progress: f64,
     pub error_message: String,
+    #[serde(default)]
+    pub payload: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

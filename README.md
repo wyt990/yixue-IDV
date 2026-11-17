@@ -26,7 +26,7 @@
 - 500 台镜像无需逐台配置主机名/IP/MAC；Agent 自动探测网卡 MAC
 - 首启身份收敛：自动改名、配 IP、再开启还原，支持自动重启
 - `ip_mode=dhcp` 时由 Edge DHCP 按 MAC 保留 IP，还原状态下身份不丢
-- **WOL 远程开机**：机房子网定向广播 + UDP 9/7 + 重发；含客户端设置脚本
+- **WOL 远程开机**：机房子网定向广播 + UDP 9/7 + 重发；跨 VLAN 由机房 Edge 转发，无 Edge 时 Center 本地兜底
 
 ### 常驻 Agent 与运维
 

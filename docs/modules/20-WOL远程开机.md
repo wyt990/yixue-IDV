@@ -5,21 +5,28 @@
 
 ---
 
-## 1. 服务端实现（2026-11-16 修复）
+## 1. 服务端实现（2026-11-17：Edge 转发）
 
-原实现只向 `255.255.255.255:9` 发 1 个包，依赖默认路由，容易：
-- 从错误网卡（VPN/虚拟网卡）发出；
-- 广播包丢失（UDP 无重传）；
-- 部分网卡/交换机只认定向广播。
+WOL 现在优先由**客户端所属机房的 Edge** 转发，Center 不再直接向跨 VLAN 广播：
 
-现改为（`idv-common/src/wol.rs` + `api/power.rs`）：
+```text
+Center 选 Edge（lab_edges → campus_edges，在线优先）
+  → edge_commands(kind=wol, payload={items:[{power_id,mac,broadcast}]})
+  → Edge 校验 broadcast 属于本机房网段
+  → Edge 在本机发 UDP 9/7 magic packet（定向广播 + 255.255.255.255）
+  → Edge report → Center 更新 power_commands.detail
+```
 
-- 按客户端所属机房的 `ip_start + netmask` 计算 **定向广播地址**（如 `10.110.0.255`）；
-- 同时发 `255.255.255.255` 与定向广播，端口 **UDP 9 和 7**，重复 **3 次**；
-- 电源命令 `detail` 记录实际发送情况（目标、包数），可在 `power_commands` 表/接口查看。
+- 同一 Edge 的批量开机合并为一条命令，payload 可含多台 MAC；
+- 无在线 Edge 时回退 Center 本地发送，detail 标记 `wol local_fallback`；
+- Center 仍按机房 `ip_start + netmask` 计算定向广播；
+- Edge 没有机房网段缓存时，只接受私有地址广播，避免成为广播反射器；
+- 迁移：`023_edge_command_payload.sql`。
 
-> 如果 Center 不在机房 VLAN（Center 与 Edge 分离部署），定向广播无法跨路由；
-> 此时应由该机房的 Edge 发 WOL（后续增强项，当前先保证 Center/Edge 同网段场景）。
+> 前提：Edge 必须有接口在目标机房的二层广播域（物理口接机房 VLAN，或 trunk 子接口）。
+> 如果 Edge 只在服务器 VLAN，仍然无法跨 VLAN 唤醒，需要把 Edge/轻量转发器放到机房侧。
+
+旧实现（Center 直接发）仍作为兜底保留。
 
 ---
 
@@ -56,7 +63,8 @@ cd "C:\Program Files\YixueIDV"
      -Headers @{Authorization="Bearer $t"} -ContentType application/json `
      -Body '{"mac":"40:FE:95:B9:FF:A8","kind":"wol","detail":"manual test"}'
    ```
-3. 查询命令 detail 应包含 `magic_packet_sent ... targets=...`；客户端应在数秒内上电。
+3. 查询命令 detail 应包含 `wol via edge:<name>` + `magic_packet_sent ...`；无 Edge 时包含 `wol local_fallback`；客户端应在数秒内上电。
+4. 跨 VLAN 测试：Center 在服务器 VLAN、客户端在机房 VLAN，在 Edge 机房网卡抓包应能看到 magic packet。
 4. 若 detail 显示发送成功但仍不亮：按第 2 节逐项排查（BIOS → 网卡电源管理 → 快速启动 → 有线/供电）。
 
 ---

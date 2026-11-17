@@ -39,6 +39,58 @@ pub fn directed_broadcast(ip: &str, netmask: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(u32::from(ip) | !mask_u32))
 }
 
+/// Send magic packets for a batch of MACs (one socket, all targets, 3 rounds).
+///
+/// Used by an Edge WOL relay so 500 clients do not take 500 × 600 ms.
+pub fn send_magic_packets_to(items: &[(String, Option<Ipv4Addr>)]) -> Result<String> {
+    if items.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!("no WOL targets")));
+    }
+    let mut packets = Vec::with_capacity(items.len());
+    let mut targets: Vec<Vec<(Ipv4Addr, u16)>> = Vec::with_capacity(items.len());
+    for (mac, directed) in items {
+        let packet = build_magic_packet(mac)?;
+        let mut t = vec![(Ipv4Addr::BROADCAST, 9), (Ipv4Addr::BROADCAST, 7)];
+        if let Some(bcast) = directed {
+            t.push((*bcast, 9));
+            t.push((*bcast, 7));
+        }
+        t.sort_by_key(|(ip, port)| (u32::from(*ip), *port));
+        t.dedup();
+        packets.push(packet);
+        targets.push(t);
+    }
+
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    sock.set_broadcast(true)
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    let mut sent = 0usize;
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..3 {
+        for (packet, targets_for_item) in packets.iter().zip(targets.iter()) {
+            for (ip, port) in targets_for_item {
+                match sock.send_to(packet, (*ip, *port)) {
+                    Ok(_) => sent += 1,
+                    Err(err) => last_err = Some(err),
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if sent == 0 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "wol batch send failed: {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".into())
+        )));
+    }
+    Ok(format!(
+        "magic_packet_sent targets={} packets={sent}",
+        items.len()
+    ))
+}
+
 /// Send a magic packet to both limited and directed broadcast addresses,
 /// on UDP/9 and UDP/7, a few times (UDP is lossy).
 pub fn send_magic_packet_to(mac: &str, directed: Option<Ipv4Addr>) -> Result<String> {

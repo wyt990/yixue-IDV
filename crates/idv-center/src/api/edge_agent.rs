@@ -211,7 +211,7 @@ pub async fn next_command(
         .map_err(internal)?;
 
     let cmd = sqlx::query_as::<_, EdgeCommand>(
-        "SELECT id, edge_id, kind, image_id, state, progress, error_message, created_at, updated_at FROM edge_commands WHERE edge_id = ? AND state = 'pending' ORDER BY created_at ASC LIMIT 1",
+        "SELECT id, edge_id, kind, image_id, state, progress, error_message, payload, created_at, updated_at FROM edge_commands WHERE edge_id = ? AND state = 'pending' ORDER BY created_at ASC LIMIT 1",
     )
     .bind(&edge.id)
     .fetch_optional(&state.pool)
@@ -250,7 +250,7 @@ pub async fn report_command(
     Json(body): Json<EdgeCommandReport>,
 ) -> Result<Json<EdgeCommand>, (StatusCode, String)> {
     let mut cmd = sqlx::query_as::<_, EdgeCommand>(
-        "SELECT id, edge_id, kind, image_id, state, progress, error_message, created_at, updated_at FROM edge_commands WHERE id = ? AND edge_id = ?",
+        "SELECT id, edge_id, kind, image_id, state, progress, error_message, payload, created_at, updated_at FROM edge_commands WHERE id = ? AND edge_id = ?",
     )
     .bind(&id)
     .bind(&edge.id)
@@ -280,6 +280,32 @@ pub async fn report_command(
     .await
     .map_err(internal)?;
 
+    if cmd.kind == "wol" {
+        let power_state = match state_name {
+            "done" => "done",
+            "failed" => "failed",
+            _ => "running",
+        };
+        let detail = format!("wol via edge:{}; {}", edge.name, body.error_message.trim());
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&cmd.payload)
+            && let Some(items) = payload.get("items").and_then(|v| v.as_array())
+        {
+            for item in items {
+                if let Some(power_id) = item.get("power_id").and_then(|v| v.as_str()) {
+                    sqlx::query(
+                        "UPDATE power_commands SET state = ?, detail = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(power_state)
+                    .bind(detail.trim())
+                    .bind(now)
+                    .bind(power_id)
+                    .execute(&state.pool)
+                    .await
+                    .map_err(internal)?;
+                }
+            }
+        }
+    }
     if let Some(image_id) = &cmd.image_id {
         let replica_state = match (cmd.kind.as_str(), state_name) {
             ("purge", "done") => "absent",

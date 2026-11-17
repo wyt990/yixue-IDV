@@ -63,6 +63,8 @@ struct EdgeCommand {
     id: String,
     kind: String,
     image_id: Option<String>,
+    #[serde(default)]
+    payload: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +420,91 @@ impl EdgeRuntime {
         }
     }
 
+    async fn handle_wol(&self, cmd: &EdgeCommand) -> anyhow::Result<()> {
+        let payload: serde_json::Value =
+            serde_json::from_str(&cmd.payload).unwrap_or_default();
+        let items = payload
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("wol payload missing items"))?;
+
+        let labs = self.ip_bindings.labs().await;
+        let allowed: Vec<std::net::Ipv4Addr> = labs
+            .iter()
+            .filter_map(|l| {
+                idv_common::wol::directed_broadcast(&l.ip_start, &l.netmask)
+            })
+            .collect();
+
+        let mut targets: Vec<(String, Option<std::net::Ipv4Addr>)> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
+        for item in items {
+            let mac = item.get("mac").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if mac.is_empty() {
+                rejected.push("empty_mac".into());
+                continue;
+            }
+            let broadcast = item
+                .get("broadcast")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let directed = if broadcast.is_empty() {
+                None
+            } else {
+                let Ok(ip) = broadcast.parse::<std::net::Ipv4Addr>() else {
+                    rejected.push(format!("{mac}:bad_broadcast"));
+                    continue;
+                };
+                let allowed_target = if allowed.is_empty() {
+                    // Edge has no lab scope yet; still never relay public/multicast.
+                    ip.is_private()
+                } else {
+                    allowed.contains(&ip)
+                };
+                if !allowed_target {
+                    rejected.push(format!("{mac}:broadcast_not_in_lab"));
+                    continue;
+                }
+                Some(ip)
+            };
+            targets.push((mac.to_string(), directed));
+        }
+
+        if targets.is_empty() {
+            let msg = format!("wol rejected: {}", rejected.join(","));
+            self.report(&cmd.id, "failed", 0.0, &msg, "", "").await?;
+            return Ok(());
+        }
+        let count = targets.len();
+        let sent = tokio::task::spawn_blocking(move || {
+            idv_common::wol::send_magic_packets_to(&targets)
+        })
+        .await;
+        let detail = match sent {
+            Ok(Ok(msg)) => {
+                if rejected.is_empty() {
+                    msg
+                } else {
+                    format!("{msg} rejected={}", rejected.join(","))
+                }
+            }
+            Ok(Err(err)) => {
+                self.report(&cmd.id, "failed", 0.0, &err.to_string(), "", "")
+                    .await?;
+                return Ok(());
+            }
+            Err(err) => {
+                self.report(&cmd.id, "failed", 0.0, &err.to_string(), "", "")
+                    .await?;
+                return Ok(());
+            }
+        };
+        self.report(&cmd.id, "done", 1.0, &detail, "", "").await?;
+        info!(count, detail = %detail, "wol relay sent");
+        Ok(())
+    }
+
     async fn handle_command(&self, cmd: EdgeCommand) -> anyhow::Result<()> {
         info!(id = %cmd.id, kind = %cmd.kind, "received command");
         match cmd.kind.as_str() {
@@ -432,6 +519,9 @@ impl EdgeRuntime {
             "purge_all" => {
                 self.purge_all().await?;
                 self.report(&cmd.id, "done", 1.0, "", "", "").await?;
+            }
+            "wol" => {
+                self.handle_wol(&cmd).await?;
             }
             "sync" => {
                 let image_id = cmd
