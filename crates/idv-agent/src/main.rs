@@ -1996,7 +1996,24 @@ async fn execute_script_command(
     }
     let extension = if shell == "cmd" { "cmd" } else { "ps1" };
     let script_path = exec_dir.join(format!("{}.{}", cmd.id, extension));
-    if let Err(err) = std::fs::write(&script_path, payload.script.as_bytes()) {
+    let content = if shell == "cmd" {
+        // Force UTF-8 for the redirected output of native commands.
+        format!("@chcp 65001 >nul\r\n{}\r\n", payload.script)
+    } else {
+        // Windows PowerShell 5.1 otherwise emits GBK bytes and the browser
+        // displays them as mojibake. Set both the console and pipeline encoding.
+        format!(
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n$OutputEncoding = [System.Text.Encoding]::UTF8\r\n{}\r\n",
+            payload.script
+        )
+    };
+    let mut bytes = Vec::new();
+    if extension == "ps1" {
+        // PowerShell 5.1 treats BOM-less UTF-8 as ANSI for non-ASCII literals.
+        bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    bytes.append(&mut content.as_bytes().to_vec());
+    if let Err(err) = std::fs::write(&script_path, &bytes) {
         report_command(cfg, &cmd.id, false, &format!("exec_write_script: {err}")).await?;
         return Ok(());
     }
@@ -2022,9 +2039,34 @@ fn run_script_blocking(
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    let out_path = script_path.with_extension("hexout");
+    let wrapper_path = script_path.with_extension(if shell == "cmd" {
+        "wrapper.cmd"
+    } else {
+        "wrapper.ps1"
+    });
+    let ps_quote = |p: &std::path::Path| p.to_string_lossy().replace('\'', "''");
+    let wrapper = if shell == "cmd" {
+        format!(
+            "@echo off\r\nchcp 65001 >nul\r\ncall \"{}\" > \"{}\" 2>&1\r\nexit /b %errorlevel%\r\n",
+            ps_quote(script_path),
+            ps_quote(&out_path)
+        )
+    } else {
+        // Capture the script's object output as a string, UTF-8 encode it,
+        // then write hex ASCII. This bypasses the redirected-console encoding
+        // completely so Chinese text survives unchanged.
+        format!(
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n$OutputEncoding = [System.Text.Encoding]::UTF8\r\n$__text = & '{}' *>&1 | Out-String\r\n$__hex = [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($__text)).Replace('-','')\r\n[IO.File]::WriteAllText('{}', $__hex, [Text.Encoding]::ASCII)\r\n$__rc = $LASTEXITCODE\r\nif ($null -eq $__rc) {{ $__rc = 0 }}\r\nexit $__rc\r\n",
+            ps_quote(script_path),
+            ps_quote(&out_path)
+        )
+    };
+    std::fs::write(&wrapper_path, wrapper.as_bytes())?;
+
     let mut command = if shell == "cmd" {
         let mut c = Command::new("cmd.exe");
-        c.args(["/D", "/S", "/C"]).arg(script_path);
+        c.args(["/D", "/S", "/C"]).arg(&wrapper_path);
         c
     } else {
         let mut c = Command::new("powershell.exe");
@@ -2036,7 +2078,7 @@ fn run_script_blocking(
             "Bypass",
             "-File",
         ])
-        .arg(script_path);
+        .arg(&wrapper_path);
         c
     };
     let mut child = command
@@ -2086,6 +2128,21 @@ fn run_script_blocking(
             }
         }
     }
+    // PowerShell wrapper writes UTF-8 text as hex ASCII; cmd writes plain text.
+    if let Ok(text) = std::fs::read_to_string(&out_path) {
+        let text = text.trim_start_matches('\u{feff}').trim().to_string();
+        if !text.is_empty() {
+            if shell != "cmd" {
+                if let Ok(bytes) = hex::decode(&text) {
+                    stdout_text = String::from_utf8_lossy(&bytes).to_string();
+                }
+            } else {
+                stdout_text = text;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&wrapper_path);
+    let _ = std::fs::remove_file(&out_path);
     let code = status.and_then(|s| s.code()).unwrap_or(-1);
     let ok = !timed_out && code == 0;
     let detail = serde_json::json!({
