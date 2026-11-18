@@ -3603,9 +3603,14 @@ async fn run_assist_helper(
     assist_helper_ack(center_url, session_id, "active", "helper_active").await;
     #[cfg(windows)]
     {
-        let ws_stop = std::sync::Arc::new(AtomicBool::new(false));
-        if assist_ws_loop(center_url, session_id, mac, ws_stop).await.is_ok() {
-            return Ok(());
+        // Reconnect briefly after a Center restart instead of immediately
+        // falling back to the old HTTP path (which shows a black viewer).
+        for _attempt in 0..3 {
+            let ws_stop = std::sync::Arc::new(AtomicBool::new(false));
+            if assist_ws_loop(center_url, session_id, mac, ws_stop).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         eprintln!("idv-agent: assist websocket unavailable, falling back to HTTP helper");
     }

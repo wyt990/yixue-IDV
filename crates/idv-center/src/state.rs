@@ -15,6 +15,8 @@ pub enum AssistWire {
 struct AssistChannel {
     agent: Option<mpsc::Sender<AssistWire>>,
     viewers: broadcast::Sender<AssistWire>,
+    /// Latest full/keyframe, so a late viewer gets a first image immediately.
+    last_keyframe: Option<AssistWire>,
 }
 
 /// In-memory broker for one Assist session: one Agent socket and N browser sockets.
@@ -29,15 +31,20 @@ impl AssistHub {
         map.entry(id.to_string()).or_insert_with(|| AssistChannel {
             agent: None,
             viewers: broadcast::channel(32).0,
+            last_keyframe: None,
         });
     }
 
-    pub async fn subscribe(&self, id: &str) -> broadcast::Receiver<AssistWire> {
+    pub async fn subscribe(
+        &self,
+        id: &str,
+    ) -> (broadcast::Receiver<AssistWire>, Option<AssistWire>) {
         self.ensure(id).await;
         let map = self.inner.lock().await;
-        map.get(id)
-            .map(|c| c.viewers.subscribe())
-            .unwrap_or_else(|| broadcast::channel(32).0.subscribe())
+        match map.get(id) {
+            Some(c) => (c.viewers.subscribe(), c.last_keyframe.clone()),
+            None => (broadcast::channel(32).0.subscribe(), None),
+        }
     }
 
     pub async fn set_agent(&self, id: &str, tx: mpsc::Sender<AssistWire>) {
@@ -68,13 +75,45 @@ impl AssistHub {
 
     pub async fn broadcast(&self, id: &str, msg: AssistWire) {
         let tx = {
-            let map = self.inner.lock().await;
-            map.get(id).map(|c| c.viewers.clone())
+            let mut map = self.inner.lock().await;
+            match map.get_mut(id) {
+                Some(c) => {
+                    if let AssistWire::Binary(bytes) = &msg
+                        && is_full_frame(bytes)
+                    {
+                        c.last_keyframe = Some(msg.clone());
+                    }
+                    Some(c.viewers.clone())
+                }
+                None => None,
+            }
         };
         if let Some(tx) = tx {
             let _ = tx.send(msg);
         }
     }
+}
+
+/// A v1 frame is full; a v2 frame is full when its rect covers the screen.
+fn is_full_frame(bytes: &[u8]) -> bool {
+    if bytes.len() < 20 || &bytes[0..4] != b"IDVF" {
+        return false;
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version < 2 || bytes.len() < 32 {
+        return true;
+    }
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if flags & 1 != 0 {
+        return true;
+    }
+    let sw = u16::from_le_bytes([bytes[20], bytes[21]]);
+    let sh = u16::from_le_bytes([bytes[22], bytes[23]]);
+    let x = u16::from_le_bytes([bytes[24], bytes[25]]);
+    let y = u16::from_le_bytes([bytes[26], bytes[27]]);
+    let w = u16::from_le_bytes([bytes[28], bytes[29]]);
+    let h = u16::from_le_bytes([bytes[30], bytes[31]]);
+    x == 0 && y == 0 && w == sw && h == sh
 }
 
 #[derive(Clone)]

@@ -1027,7 +1027,16 @@ async fn handle_agent_ws(socket: WebSocket, hub: std::sync::Arc<crate::state::As
 
 async fn handle_viewer_ws(socket: WebSocket, hub: std::sync::Arc<crate::state::AssistHub>, id: String) {
     let (mut sink, mut stream) = socket.split();
-    let mut rx = hub.subscribe(&id).await;
+    let (mut rx, cached) = hub.subscribe(&id).await;
+    if let Some(cached) = cached {
+        let sent = match cached {
+            AssistWire::Text(s) => sink.send(Message::Text(s.into())).await,
+            AssistWire::Binary(b) => sink.send(Message::Binary(b.into())).await,
+        };
+        if sent.is_err() {
+            return;
+        }
+    }
     loop {
         tokio::select! {
             out = rx.recv() => {
