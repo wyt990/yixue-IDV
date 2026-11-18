@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2026 Xuhui Jiang
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,10 @@
 
 NTSTATUS QHIrpDispatchDefault(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 
+// 设备移除/关机阶段的安全下发：
+// 读继续下发；受保护时的普通写不再直落原盘（丢弃），仅放行 boot sector 写。
+NTSTATUS QHDispatchDuringRemoval(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+
 NTSTATUS QHIrpDispatchCreateCloseCleanup(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 
 NTSTATUS QHIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
@@ -36,6 +40,8 @@ VOID QHBootReinitializationRoutine(
 	_In_ PVOID Context,
 	_In_ ULONG Count);
 
+VOID QHDrainFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject);
+VOID QHDetachAndDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject);
 VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject);
 
 

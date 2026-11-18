@@ -212,6 +212,13 @@ struct AgentConfig {
     heartbeat_secs: u64,
     #[serde(default = "default_log")]
     log: String,
+    /// Restore backend: auto | uwf | state_file.
+    #[serde(default = "default_restore_backend")]
+    restore_backend: String,
+}
+
+fn default_restore_backend() -> String {
+    "auto".into()
 }
 
 fn default_center() -> String {
@@ -382,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let cfg = load_cfg(&config).await?;
             init_tracing(&cfg.log);
+            restore_driver::set_backend(&cfg.restore_backend);
             // Prefer freeze DesiredState apply on boot; keep legacy image restore as fallback.
             let state_dir = default_state_dir();
             let _ = sync_and_maybe_apply(&cfg, &state_dir, true, "boot").await?;
@@ -793,6 +801,18 @@ async fn sync_and_maybe_apply(
     // Identity convergence may need a reboot (rename / arm / disarm). Do it
     // before pending-store application to avoid fighting the protection state.
     if need_rename_reboot {
+        // Identity arm/disarm/rename already applied. Clear the queued
+        // DesiredState so the next boot does not apply it again and reboot a
+        // second time.
+        let applied_rev = policy
+            .desired_state
+            .as_ref()
+            .map(|d| d.revision)
+            .or_else(|| store.pending.as_ref().map(|p| p.revision));
+        if let Some(revision) = applied_rev {
+            store.clear_pending_applied(revision, "identity_reboot".into());
+            store.save(state_dir)?;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         issue_windows_power("reboot")?;
         lines.push("identity_reboot=1".into());
@@ -871,11 +891,16 @@ fn decide_identity_action(i: &IdentityDecisionInput) -> IdentityAction {
             IdentityAction::RenameReboot
         };
     }
-    if ip_mismatch {
-        return IdentityAction::SetStaticIp;
+    // Mode switch off: always disarm once and reboot once.
+    if !i.want_frozen && (i.frozen || i.armed) {
+        return IdentityAction::DisarmReboot;
     }
+    // Mode switch on: arm once and reboot once; ArmReboot also sets static IP.
     if i.want_frozen && !(i.frozen || i.armed) {
         return IdentityAction::ArmReboot;
+    }
+    if ip_mismatch {
+        return IdentityAction::SetStaticIp;
     }
     if i.ip_mode == "dhcp" && !i.want_ip.is_empty() && i.have_ip.trim() != i.want_ip.trim() {
         return IdentityAction::RenewDhcp;
@@ -1146,12 +1171,16 @@ fn apply_pending_store(
                     "applied_revision={} frozen={} driver={}",
                     pending.revision, st.frozen, st.detail
                 ),
-                true,
+                // Arming/disarming is already driven by the identity action,
+                // which performs the single reboot. Do not reboot again here.
+                false,
             ))
         } else {
             store.clear_pending_applied(pending.revision, "restore_disabled".into());
             store.save(state_dir).map_err(|e| Error::Other(e))?;
-            Ok(("applied restore_disabled".into(), true))
+            // No filter state change and no reboot is required for an already
+            // disarmed volume.
+            Ok(("applied restore_disabled".into(), false))
         }
     } else {
         Ok(("apply_skip reason=no_pending".into(), false))
@@ -1487,6 +1516,18 @@ async fn perform_agent_update(
 fn issue_windows_power(kind: &str) -> Result<()> {
     #[cfg(windows)]
     {
+        // Flush every fixed volume before the reboot. Warm reboots were
+        // occasionally landing in the boot manager before the disk returned
+        // ready; an explicit flush removes pending writeback in that window.
+        for letter in b'C'..=b'Z' {
+            let drive = format!("{}:", letter as char);
+            let root = format!("{drive}\\");
+            if std::path::Path::new(&root).exists() {
+                let _ = std::process::Command::new("fsutil")
+                    .args(["volume", "flush", &drive])
+                    .status();
+            }
+        }
         let arg = if kind == "reboot" { "/r" } else { "/s" };
         let status = std::process::Command::new("shutdown.exe")
             .args([arg, "/t", "5", "/f", "/c", "YixueIDV power command"])
@@ -1541,6 +1582,7 @@ async fn load_cfg(path: &PathBuf) -> Result<AgentConfig> {
             hostname: String::new(),
             heartbeat_secs: default_heartbeat_secs(),
             log: default_log(),
+            restore_backend: default_restore_backend(),
         })
     }
 }
@@ -1811,6 +1853,24 @@ struct RunProgramPayload {
     args: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExecPayload {
+    #[serde(default = "default_exec_shell")]
+    shell: String,
+    #[serde(default)]
+    script: String,
+    #[serde(default = "default_exec_timeout")]
+    timeout_secs: u64,
+}
+
+fn default_exec_shell() -> String {
+    "powershell".into()
+}
+
+fn default_exec_timeout() -> u64 {
+    60
+}
+
 /// Long-poll Center for one command (returns None on the wait timeout).
 async fn poll_command(cfg: &AgentConfig, mac: &str) -> Result<Option<AgentCommand>> {
     poll_command_wait(cfg, mac, 20).await
@@ -1916,6 +1976,147 @@ fn consume_restore_now_marker(state_dir: &std::path::Path) {
     }
 }
 
+async fn execute_script_command(
+    cfg: &AgentConfig,
+    state_dir: &std::path::Path,
+    cmd: &AgentCommand,
+) -> Result<()> {
+    let payload: ExecPayload = serde_json::from_str(&cmd.payload)
+        .map_err(|e| Error::Other(anyhow::anyhow!("invalid exec payload: {e}")))?;
+    if payload.script.trim().is_empty() {
+        report_command(cfg, &cmd.id, false, "exec: empty script").await?;
+        return Ok(());
+    }
+    let shell = payload.shell.trim().to_ascii_lowercase();
+    let timeout = payload.timeout_secs.clamp(1, 300);
+    let exec_dir = state_dir.join("exec");
+    if let Err(err) = std::fs::create_dir_all(&exec_dir) {
+        report_command(cfg, &cmd.id, false, &format!("exec_create_dir: {err}")).await?;
+        return Ok(());
+    }
+    let extension = if shell == "cmd" { "cmd" } else { "ps1" };
+    let script_path = exec_dir.join(format!("{}.{}", cmd.id, extension));
+    if let Err(err) = std::fs::write(&script_path, payload.script.as_bytes()) {
+        report_command(cfg, &cmd.id, false, &format!("exec_write_script: {err}")).await?;
+        return Ok(());
+    }
+
+    let path = script_path.clone();
+    let run = tokio::task::spawn_blocking(move || run_script_blocking(&shell, &path, timeout)).await;
+    let _ = std::fs::remove_file(&script_path);
+    let (ok, detail) = match run {
+        Ok(Ok((ok, detail))) => (ok, detail),
+        Ok(Err(err)) => (false, format!("exec_failed: {err}")),
+        Err(err) => (false, format!("exec_join_failed: {err}")),
+    };
+    report_command(cfg, &cmd.id, ok, &detail).await?;
+    Ok(())
+}
+
+fn run_script_blocking(
+    shell: &str,
+    script_path: &std::path::Path,
+    timeout_secs: u64,
+) -> anyhow::Result<(bool, String)> {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let mut command = if shell == "cmd" {
+        let mut c = Command::new("cmd.exe");
+        c.args(["/D", "/S", "/C"]).arg(script_path);
+        c
+    } else {
+        let mut c = Command::new("powershell.exe");
+        c.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script_path);
+        c
+    };
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel::<(&'static str, String)>();
+    if let Some(mut s) = stdout {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(("stdout", read_capped(&mut s, 64 * 1024)));
+        });
+    }
+    if let Some(mut s) = stderr {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(("stderr", read_capped(&mut s, 64 * 1024)));
+        });
+    }
+    drop(tx);
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= Duration::from_secs(timeout_secs) {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    for _ in 0..2 {
+        if let Ok((kind, text)) = rx.recv_timeout(Duration::from_secs(2)) {
+            if kind == "stdout" {
+                stdout_text = text;
+            } else {
+                stderr_text = text;
+            }
+        }
+    }
+    let code = status.and_then(|s| s.code()).unwrap_or(-1);
+    let ok = !timed_out && code == 0;
+    let detail = serde_json::json!({
+        "shell": shell,
+        "exit_code": code,
+        "timed_out": timed_out,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+    })
+    .to_string();
+    Ok((ok, detail))
+}
+
+fn read_capped<R: std::io::Read>(reader: &mut R, cap: usize) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() < cap {
+                    let take = n.min(cap - out.len());
+                    out.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 async fn execute_restore_now(
     cfg: &AgentConfig,
     state_dir: &std::path::Path,
@@ -1984,6 +2185,9 @@ async fn execute_agent_command(
     mac: &str,
 ) -> Result<()> {
     let kind = cmd.kind.as_str();
+    if kind == "exec" {
+        return execute_script_command(cfg, state_dir, cmd).await;
+    }
     if kind == "restore_now" {
         return execute_restore_now(cfg, state_dir, sync_lock, cmd).await;
     }
@@ -3121,6 +3325,7 @@ async fn run_daemon(
     stop: std::sync::Arc<AtomicBool>,
 ) -> Result<()> {
     let state_dir = default_state_dir();
+    restore_driver::set_backend(&cfg.restore_backend);
     let cfg = std::sync::Arc::new(cfg);
     let sync_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
@@ -3363,6 +3568,21 @@ mod tests {
             false,
         ));
         assert_eq!(action, IdentityAction::ArmReboot);
+    }
+
+    #[test]
+    fn restore_off_disarms_protection() {
+        let action = decide_identity_action(&input(
+            "stu001",
+            "stu001",
+            "10.110.0.31",
+            "10.110.0.31",
+            "dhcp",
+            false,
+            true,
+            true,
+        ));
+        assert_eq!(action, IdentityAction::DisarmReboot);
     }
 
     #[test]

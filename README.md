@@ -16,8 +16,10 @@
 
 ### 还原与课堂模式
 
-- **卷过滤还原驱动**：Windows 卷级冻结/还原（测试签名，见模块 17）
-- **多盘还原**：`teaching` 保护所有固定 NTFS 盘（C/D/E…），`exam` 仅系统盘
+- **UWF 还原（推荐）**：Windows 10/11 Enterprise、Education、IoT Enterprise 使用微软统一写入筛选器（UWF）；微软签名驱动，**不需要测试签名**，Secure Boot 可以保持开启；见 [UWF 后端说明](docs/plans/2026-11-18-uwf-backend.md)
+- **PE 镜像还原（通用兜底）**：任意 Windows 版本均可通过 PE 重新写入基线镜像，冷启动还原，不依赖系统内驱动
+- **自定义卷过滤驱动（实验）**：仅供试点；需测试签名，存在热重启 `0xc0000225` 风险，不建议生产部署
+- **多盘还原**：`teaching` 保护所有固定 NTFS 盘（C/D/E…），`exam` 仅系统盘；UWF 后端同样按此作用域保护/取消保护
 - **模式策略**：teaching / office / exam / manual，按机房绑定；变更后自动重启生效
 - **手动还原**：manual 模式终端页下发 `restore_now`，开启保护并重启，重启后恢复基线再解冻
 - **USB 管控 / 上课只读 / 定时电源** 等策略能力
@@ -54,7 +56,8 @@ React 多主题 Web UI（Center 托管 `web/dist`），完全离线可用；字�
 学生机：
   PXE → iPXE → Linux PE (idv-pe-agent) → 采集 / 部署
   Windows → idv-agent 服务（心跳/还原/命令）
-              ├─ SysRestoreDriver 卷过滤驱动
+              ├─ UWF（推荐，Enterprise/Education）
+              ├─ SysRestoreDriver（实验，测试签名）
               └─ 登录会话 assist-helper（截屏/键鼠/剪贴板/文件）
 ```
 
@@ -66,7 +69,7 @@ crates/
   idv-center/      Center API + Web 静态托管 + 远程控制中继
   idv-edge/        Edge 缓存、DHCP/PXE/TFTP、PE API、IP 保留
   idv-pe-agent/    PE 内采集/部署代理（另编 musl 静态版）
-  idv-agent/       学生机常驻 Agent（0.4.2：还原/身份/命令/远程协助）
+  idv-agent/       学生机常驻 Agent（0.5.0：UWF/还原/身份/命令/远程协助）
 web/               管理端（React + Vite）
 deploy/
   config/*.toml.example   配置模板（复制后改本地，勿提交密钥）
@@ -82,7 +85,8 @@ pe/                iPXE 脚本；Linux 大文件由脚本生成（gitignore）
 - Rust **stable**（见 `rust-toolchain.toml`）
 - Node.js 22+（构建管理端）
 - Windows 10/11 客户端：PowerShell 5.1、管理员权限
-- 还原驱动：测试签名（`enable-testsigning.ps1`），生产需正式签名
+- **UWF 还原**：Windows 10/11 **Enterprise、Education、IoT Enterprise**；Windows Pro / Pro Education / Home 不支持 UWF 卷保护
+- **自定义还原驱动（实验）**：测试签名（`enable-testsigning.ps1`），仅试点；正式部署应使用 UWF 或 PE 镜像还原
 - 真机 PXE：Windows 上 DHCP 67 / TFTP 69 需管理员权限
 - 编 musl PE 代理：`x86_64-unknown-linux-musl` 目标与 `rust-lld`
 
@@ -237,6 +241,68 @@ powershell -ExecutionPolicy Bypass -File deploy/scripts/fetch-pe-linux.ps1
 
 并将官方 iPXE 二进制放入 `pe/`（`ipxe.efi` 等），说明见 [`pe/README.md`](pe/README.md)。
 
+## Windows 系统还原支持版本与方法
+
+| Windows 版本 | 推荐还原方式 | UWF 支持 | 是否需要测试签名 |
+|---|---|:---:|:---:|
+| Windows 10/11 Enterprise | UWF | ✅ | 否 |
+| Windows 10/11 Education | UWF | ✅ | 否 |
+| Windows 10/11 IoT Enterprise | UWF | ✅ | 否 |
+| Windows 10/11 Pro Education | PE 镜像还原 | ❌ | 否 |
+| Windows 10/11 Pro / Home | PE 镜像还原 | ❌ | 否 |
+| Windows 7 / 8 / 8.1 | PE 镜像还原 | ❌ | 否 |
+| Windows Server | 镜像/快照还原 | ❌ | 否 |
+
+> UWF 可通过 `Enable-WindowsOptionalFeature -FeatureName Client-UnifiedWriteFilter` 安装，但只有 Enterprise / Education / IoT Enterprise 允许真正执行 `UWF_Volume.Protect`。Pro Education 上启用后保护卷会返回 `0x80070005`，不能作为方案。
+
+### 方法一：UWF（Enterprise / Education，推荐）
+
+1. 启用 UWF 可选功能并重启：
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter -All -NoRestart
+Restart-Computer
+```
+
+2. Agent 配置：
+
+```toml
+restore_backend = "uwf"
+```
+
+3. 关闭快速启动，建议使用磁盘覆盖层：
+
+```powershell
+powercfg /h off
+uwfmgr overlay set-type disk
+uwfmgr overlay set-size 8192
+```
+
+4. 通过机房模式切换即可：
+
+- `teaching`：保护所有固定卷（C/D/E…）
+- `exam`：仅保护系统卷
+- `office`：关闭 UWF 保护
+- 每次切换后 Agent 自动重启一次生效
+
+UWF 由微软签名，**不需要测试签名，Secure Boot 可以保持开启**。UWF 只保护卷，不保护分区表、ESP 或整盘。
+
+### 方法二：PE 镜像还原（通用）
+
+适用于所有 Windows 版本，尤其是不支持 UWF 的 Pro / Pro Education / Home：
+
+- 通过 PE 将基线镜像重新写回系统盘；
+- 不依赖系统内还原驱动；
+- 冷启动完成还原，不参与系统内热重启路径；
+- 现有采集/部署/镜像库流程可直接复用。
+
+### 方法三：自定义 SysRestoreDriver（仅实验）
+
+- 需要测试签名和已安装测试证书；
+- 仅限可随时重装的试点机；
+- 热重启存在 `0xc0000225` 风险，不建议生产部署；
+- 安装与回滚见 [驱动测试签名与蓝屏恢复](docs/modules/17-驱动测试签名与蓝屏恢复.md)。
+
 ## 客户端安装（Windows）
 
 把 `deploy/client-package/` 整份复制到学生机 `C:\Program Files\YixueIDV\`，管理员 PowerShell：
@@ -247,20 +313,27 @@ cd "C:\Program Files\YixueIDV"
 # 1) 编辑 Center 地址（复制 agent.toml.example → agent.toml）
 notepad .\agent.toml
 
-# 2) 测试签名驱动（需重启）
-powershell -ExecutionPolicy Bypass -File .\scripts\enable-testsigning.ps1
+# 2) 使用 UWF（Enterprise/Education）时添加
+#    restore_backend = "uwf"
+#    并启用 UWF 可选功能后重启
 
-# 3) 重启后安装还原驱动（再重启）
-powershell -ExecutionPolicy Bypass -File .\scripts\install-driver.ps1
-
-# 4) 安装常驻 Agent 服务
+# 3) 安装常驻 Agent 服务
 powershell -ExecutionPolicy Bypass -File .\scripts\install-agent-service.ps1
 
-# 5) 可选：启用有线 WOL、关闭快速启动
+# 4) 可选：启用有线 WOL、关闭快速启动
 powershell -ExecutionPolicy Bypass -File .\scripts\enable-wol.ps1
 ```
 
-详细说明见 [`deploy/client-package/使用说明-测试签名驱动.txt`](deploy/client-package/使用说明-测试签名驱动.txt) 与模块 17/18。
+UWF 方式的详细说明见 [UWF 后端说明](docs/plans/2026-11-18-uwf-backend.md)。
+
+旧的自定义驱动安装方式（仅实验）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\enable-testsigning.ps1
+# 重启后
+powershell -ExecutionPolicy Bypass -File .\scripts\install-driver.ps1
+```
+
 
 ## 典型流程
 
@@ -279,6 +352,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-wol.ps1
 - [开发与验收总纲](docs/易学IDV机房管理系统-开发文档.md)
 - [功能模块索引](docs/modules/README.md)
 - [驱动测试签名与蓝屏恢复](docs/modules/17-驱动测试签名与蓝屏恢复.md)
+- [UWF 还原后端（推荐）](docs/plans/2026-11-18-uwf-backend.md)
+- [影子空间设计（实验驱动）](docs/plans/2026-11-18-shadow-space-design.md)
+- [远程 Agent 脚本/命令](docs/plans/2026-11-18-remote-agent-command.md)
 - [批量身份与 DHCP 保留](docs/modules/18-批量身份与DHCP保留.md)
 - [常驻 Agent 与即时命令](docs/modules/19-常驻Agent与即时命令.md)
 - [WOL 远程开机](docs/modules/20-WOL远程开机.md)
@@ -295,17 +371,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-wol.ps1
 | 0～3 | 工程骨架、台账、Edge、PXE 报到 | 已完成 |
 | 4 | 真机冷采集 + 流式部署闭环 | 已打通（试点） |
 | 5 | 多 Edge、P2P、规模化参数 | 软件已完成 |
-| 6 | 还原驱动、模式策略、多盘还原 | 软件已完成（测试签名试点） |
+| 6 | 还原驱动、模式策略、多盘还原 | UWF（Enterprise/Education）已完成；自定义驱动仅实验 |
 | 7 | 批量身份、常驻 Agent、即时命令、远程控制、Agent 更新 | 软件已完成 |
 
-当前客户端 Agent：**0.4.2**（GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
+当前客户端 Agent：**0.5.0**（UWF 后端、GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
 
 后续增强：更细分区角色向导、远程控制 WebRTC/音频、Agent 设备令牌与命令签名、跨 VLAN WOL 等。
 
 ## 安全与部署注意
 
 - 生产前修改默认管理员密码、轮换 Edge `node_token`
-- 测试签名驱动仅适合试点机；正式部署需正式签名
+- 测试签名驱动仅适合试点机；生产优先使用 UWF（Enterprise/Education）或 PE 镜像还原
+- UWF 不需要测试签名；Secure Boot 可以保持开启
 - Agent 命令、远程控制、Agent 包下载目前按 MAC / 随机会话 ID 识别，**只应部署在受控机房网络**
 - `run_program`、远程键鼠、文件传输具备高权限能力，建议配合网络隔离与审计
 - DHCP 地址池/保留需与现网规划，避免与校园 DHCP 冲突

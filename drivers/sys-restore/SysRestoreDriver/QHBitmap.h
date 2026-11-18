@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2026 Xuhui Jiang
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -141,6 +141,23 @@ NTSTATUS QHBuildSectorBitmap(
 	_In_ PVOID ClusterBitmapData,
 	_In_ UINT64 ClusterBitmapSize,
 	_Out_ PQH_BITMAP* SectorBitmap
+);
+
+// ============================================================================
+// 影子文件空间
+// ============================================================================
+
+// 打开卷根目录下预分配的 $YixueShadow.bin，读取其已分配簇映射。
+// 失败时保护不得激活（避免退回旧动态空闲扇区方案）。
+NTSTATUS QHLoadShadowRanges(
+	_In_ PDEVICE_OBJECT FilterDeviceObject,
+	_Inout_ PQH_DEVICE_EXTENSION DevExt
+);
+
+// 顺序分配一个影子目标扇区。调用者必须持有 OffsetHashMutex。
+NTSTATUS QHAllocateShadowSector(
+	_Inout_ PQH_DEVICE_EXTENSION DevExt,
+	_Out_ ULONGLONG* TargetSector
 );
 
 // ============================================================================

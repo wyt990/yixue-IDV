@@ -1,8 +1,7 @@
 //! Edge-facing DHCP IP bindings (MAC -> assigned IPv4) for labs attached to the Edge.
 //!
-//! Edge DHCP uses these reservations so batch-deployed clients get the IP that
-//! Center assigned, instead of a random pool address. Only `ip_mode = 'dhcp'`
-//! labs are returned.
+//! Edge DHCP uses these reservations so both DHCP-mode and manually assigned
+//! static addresses win over the dynamic pool instead of causing collisions.
 
 use axum::Json;
 use axum::extract::State;
@@ -105,8 +104,7 @@ pub async fn list(
     // Dynamic IN list; all values are bound, no user input is interpolated.
     let sql = format!(
         "SELECT c.mac, c.assigned_ip, c.lab_id \
-         FROM clients c JOIN labs l ON l.id = c.lab_id \
-         WHERE c.assigned_ip != '' AND l.ip_mode = 'dhcp' AND c.lab_id IN ({placeholders}) \
+         FROM clients c WHERE c.assigned_ip != '' AND c.lab_id IN ({placeholders}) \
          ORDER BY c.mac"
     );
     let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);

@@ -20,7 +20,7 @@ foreach ($p in @("$km\ntddk.h", "$km\ntifs.h", "$lib\ntoskrnl.lib", "$lib\buffer
 
 $clFlags = @(
   "/c", "/nologo", "/W3", "/O2", "/Zp8", "/Gy", "/Gm-", "/EHs-c-", "/GR-", "/GF", "/GS",
-  "/Zi", "/kernel",
+  "/Zi", "/kernel", "/utf-8",
   "/D_WIN64", "/D_AMD64_", "/DAMD64",
   "/DNTDDI_VERSION=0xA000010", "/D_WIN32_WINNT=0x0A00", "/DWINVER=0x0A00", "/DWINNT=1",
   "/I`"$km`"", "/I`"$crt`"", "/I`"$shared`"",

@@ -139,6 +139,65 @@ pub async fn allocate_next_ip(
     ))
 }
 
+/// Validate a manually assigned client IPv4. Manual addresses may intentionally
+/// fall outside the automatic `ip_start..ip_end` range, but must be a usable host
+/// in the lab subnet, must not be the gateway, and must not duplicate another
+/// client in the same lab.
+pub async fn validate_manual_ip(
+    state: &AppState,
+    lab_id: &str,
+    value: &str,
+    exclude_client_id: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let ip = parse_ipv4(value).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("IP 地址格式不正确: {value}"),
+    ))?;
+    let lab = load_lab(state, lab_id).await?;
+
+    if let Some(mask) = parse_ipv4(lab.netmask.trim())
+        && mask != 0
+    {
+        let network = ip & mask;
+        let broadcast = network | !mask;
+        if ip == network || ip == broadcast {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "不能使用网络地址或广播地址".into(),
+            ));
+        }
+        if let Some(gateway) = parse_ipv4(lab.gateway.trim())
+            && ip == gateway
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "不能使用机房网关地址".into(),
+            ));
+        }
+    }
+
+    let duplicate: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, name FROM clients WHERE lab_id = ? AND assigned_ip = ? AND id != ? LIMIT 1",
+    )
+    .bind(lab_id)
+    .bind(value)
+    .bind(exclude_client_id.unwrap_or(""))
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    if let Some((_, name)) = duplicate {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("IP {value} 已被终端 {name} 使用"),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_ipv4(s: &str) -> Option<u32> {
     let parts: Vec<_> = s.split('.').collect();
     if parts.len() != 4 {

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2026 Xuhui Jiang
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +46,25 @@
 // 输入: 无
 // 输出: BOOLEAN (1 字节)
 #define IOCTL_QH_QUERY_PROTECT_STATUS CTL_CODE(QH_IOCTL_TYPE, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// 查询驱动版本和影子空间状态（诊断用）
+typedef struct _QH_DRIVER_STATUS
+{
+	ULONG Magic;
+	ULONG Version;
+	ULONG InitializedVolumes;
+	ULONG ShadowReadyVolumes;
+	ULONG ProtectRangeMax;
+	ULONG Reserved;
+	ULONGLONG ShadowSectorCount;
+	ULONGLONG ShadowSectorNext;
+	ULONG LastInitStatus;
+	ULONG Reserved2;
+} QH_DRIVER_STATUS, *PQH_DRIVER_STATUS;
+
+#define QH_DRIVER_STATUS_MAGIC 0x51485354u // 'QHST'
+#define QH_DRIVER_STATUS_VERSION 2u
+#define IOCTL_QH_QUERY_DRIVER_STATUS CTL_CODE(QH_IOCTL_TYPE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 
 

@@ -108,6 +108,11 @@ export function ClientsPage() {
   const [editLabId, setEditLabId] = useState("");
   const [editNotes, setEditNotes] = useState("");
   const [editAssignedIp, setEditAssignedIp] = useState("");
+  const [remoteScript, setRemoteScript] = useState("");
+  const [remoteShell, setRemoteShell] = useState("powershell");
+  const [remoteTimeout, setRemoteTimeout] = useState(60);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteResult, setRemoteResult] = useState("");
 
   const labMap = useMemo(
     () => new Map(labs.map((l) => [l.id, l])),
@@ -345,6 +350,54 @@ export function ClientsPage() {
   }
 
 
+  async function runRemoteScript(c: Client) {
+    if (!remoteScript.trim()) {
+      msg.warning("请输入要执行的脚本");
+      return;
+    }
+    setRemoteBusy(true);
+    setRemoteResult("已下发，等待客户端返回...");
+    try {
+      const { id } = await api.clients.command(c.mac, "exec", {
+        shell: remoteShell,
+        script: remoteScript,
+        timeout_secs: remoteTimeout,
+      });
+      const deadline = Date.now() + (remoteTimeout + 20) * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const cmd = await api.clients.commandStatus(id);
+        if (!["pending", "delivered", "running"].includes(cmd.state)) {
+          let detail = cmd.error_message || `状态: ${cmd.state}`;
+          try {
+            const parsed = JSON.parse(detail) as {
+              exit_code?: number;
+              timed_out?: boolean;
+              stdout?: string;
+              stderr?: string;
+            };
+            detail = [
+              `state=${cmd.state} exit_code=${parsed.exit_code ?? "?"} timed_out=${parsed.timed_out ?? false}`,
+              parsed.stdout ? `--- stdout ---\n${parsed.stdout}` : "",
+              parsed.stderr ? `--- stderr ---\n${parsed.stderr}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n");
+          } catch {
+            // keep raw detail
+          }
+          setRemoteResult(detail);
+          return;
+        }
+      }
+      setRemoteResult("等待客户端返回超时，请稍后重新查看命令状态");
+    } catch (err) {
+      setRemoteResult(`执行失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setRemoteBusy(false);
+    }
+  }
+
   async function saveClient(id: string) {
     try {
       await api.clients.update(id, {
@@ -383,6 +436,9 @@ export function ClientsPage() {
 
   function openDetail(c: Client) {
     setDetail(c);
+    setRemoteScript("");
+    setRemoteResult("");
+    setRemoteBusy(false);
     setEditName(c.name || "");
     setEditLabId(c.lab_id);
     setEditNotes(c.notes || "");
@@ -1144,6 +1200,61 @@ export function ClientsPage() {
               <br />
               心跳 {seenText(detail.agent_last_seen)}
             </p>
+            <div className="field">
+              <label>远程脚本（以 SYSTEM 执行）</label>
+              <textarea
+                className="mono"
+                rows={5}
+                value={remoteScript}
+                onChange={(e) => setRemoteScript(e.target.value)}
+                placeholder={"例如：\nGet-FileHash C:\\Windows\\System32\\drivers\\SysRestoreDriver.sys -Algorithm SHA256"}
+              />
+            </div>
+            <div className="form-row">
+              <div className="field">
+                <label>Shell</label>
+                <select value={remoteShell} onChange={(e) => setRemoteShell(e.target.value)}>
+                  <option value="powershell">PowerShell</option>
+                  <option value="cmd">CMD</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>超时（秒）</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={300}
+                  value={remoteTimeout}
+                  onChange={(e) => setRemoteTimeout(Number(e.target.value) || 60)}
+                />
+              </div>
+            </div>
+            <div className="field">
+              <button
+                className="btn ghost sm"
+                type="button"
+                disabled={remoteBusy}
+                onClick={() => void runRemoteScript(detail)}
+              >
+                {remoteBusy ? "执行中..." : "执行远程脚本"}
+              </button>
+            </div>
+            {remoteResult ? (
+              <pre
+                className="mono"
+                style={{
+                  whiteSpace: "pre-wrap",
+                  maxHeight: "22rem",
+                  overflow: "auto",
+                  fontSize: "0.75rem",
+                  background: "rgba(0,0,0,0.12)",
+                  padding: "0.6rem",
+                  borderRadius: "0.4rem",
+                }}
+              >
+                {remoteResult}
+              </pre>
+            ) : null}
             <div className="modal-actions">
               <button className="btn sm" type="submit">
                 保存

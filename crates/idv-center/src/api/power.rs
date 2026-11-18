@@ -112,27 +112,6 @@ pub async fn create_bulk(
     Ok(Json(BulkPowerResult { created, errors }))
 }
 
-/// Enqueue reboot for every client in a lab (mode-change path A).
-pub async fn enqueue_reboots_for_lab(
-    state: &AppState,
-    lab_id: &str,
-    detail: &str,
-) -> Result<usize, (StatusCode, String)> {
-    let macs: Vec<(String,)> = sqlx::query_as("SELECT mac FROM clients WHERE lab_id = ?")
-        .bind(lab_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(internal)?;
-    let mut n = 0usize;
-    for (mac,) in macs {
-        let cmd = enqueue_power(&state.pool, &mac, "reboot", detail).await?;
-        let payload = serde_json::json!({ "power_id": cmd.id }).to_string();
-        let _ =
-            crate::api::agent_commands::enqueue(state, &mac, "reboot", &payload, "system").await;
-        n += 1;
-    }
-    Ok(n)
-}
 
 /// Insert a power command row in `pending` state. WOL rows are finalized by
 /// the Edge report or the local fallback; reboot/shutdown rows are finalized by

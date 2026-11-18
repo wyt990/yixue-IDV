@@ -187,15 +187,22 @@ impl DhcpService {
         }
 
         let as_proxy = proxy4011 || self.cfg.mode == "proxy";
-        // Center-assigned IPv4 for this MAC (batch identity). Ignore reservations
-        // outside this DHCP server's subnet so a misconfigured binding can never
-        // hand out a foreign address.
+        // Center-assigned IPv4 for this MAC. Include manually locked static
+        // addresses too, so the DHCP phase never hands out a different address
+        // and later collides with the Agent-applied static IP.
         let reserved = self
             .cfg
             .reservations
             .get(&chaddr)
             .await
-            .filter(|ip| ip_in_subnet(*ip, self.cfg.next_server, self.cfg.subnet_mask));
+            .filter(|ip| {
+                is_usable_dhcp_address(
+                    *ip,
+                    self.cfg.next_server,
+                    self.cfg.router,
+                    self.cfg.subnet_mask,
+                )
+            });
         // 1=Discover 3=Request; some PXE stacks also retry Discover (1) after Offer.
         let (yiaddr, resp_type) = match (as_proxy, msg_type) {
             (true, 1 | 3) => (Ipv4Addr::UNSPECIFIED, if msg_type == 1 { 2 } else { 5 }),
@@ -376,8 +383,25 @@ fn opt_ipv4(b: &[u8]) -> Option<Ipv4Addr> {
     }
 }
 
-fn select_boot_file(configured: &str, arch: Option<u16>) -> &str {
-    // 0=BIOS, 7=x64 UEFI, 9=x64 UEFI (HTTP), 6=x86 UEFI
+/// A manually assigned IP may be outside the dynamic offer range, but it must
+/// still be a usable host address in this DHCP server's subnet.
+fn is_usable_dhcp_address(
+    ip: Ipv4Addr,
+    server: Ipv4Addr,
+    router: Ipv4Addr,
+    mask: Ipv4Addr,
+) -> bool {
+    if !ip_in_subnet(ip, server, mask) {
+        return false;
+    }
+    let mask_u32 = u32::from(mask);
+    let network = u32::from(server) & mask_u32;
+    let broadcast = network | !mask_u32;
+    let n = u32::from(ip);
+    n != network && n != broadcast && ip != server && ip != router
+}
+
+fn select_boot_file(configured: &str, arch: Option<u16>) -> &str {    // 0=BIOS, 7=x64 UEFI, 9=x64 UEFI (HTTP), 6=x86 UEFI
     match arch {
         Some(0) if configured.ends_with(".efi") => "undionly.kpxe",
         Some(7 | 9 | 6) if configured.ends_with(".kpxe") || configured.ends_with(".pxe") => {
@@ -579,5 +603,37 @@ mod tests {
             let ip = svc.allocate(&mac).await.unwrap();
             assert_ne!(ip, Ipv4Addr::new(10, 10, 0, 99));
         }
+    }
+    #[test]
+    fn manual_reservations_must_be_usable_hosts() {
+        let server = "10.110.0.1".parse().unwrap();
+        let router = "10.110.0.254".parse().unwrap();
+        let mask = "255.255.255.0".parse().unwrap();
+        assert!(is_usable_dhcp_address(
+            "10.110.0.2".parse().unwrap(),
+            server,
+            router,
+            mask
+        ));
+        assert!(!is_usable_dhcp_address(server, server, router, mask));
+        assert!(!is_usable_dhcp_address(router, server, router, mask));
+        assert!(!is_usable_dhcp_address(
+            "10.110.0.0".parse().unwrap(),
+            server,
+            router,
+            mask
+        ));
+        assert!(!is_usable_dhcp_address(
+            "10.110.0.255".parse().unwrap(),
+            server,
+            router,
+            mask
+        ));
+        assert!(!is_usable_dhcp_address(
+            "10.111.0.2".parse().unwrap(),
+            server,
+            router,
+            mask
+        ));
     }
 }

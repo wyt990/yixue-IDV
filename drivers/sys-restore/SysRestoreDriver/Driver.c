@@ -5,7 +5,7 @@
 
 PDRIVER_OBJECT g_DriverObject = NULL;
 
-VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
+VOID QHDrainFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 {
 	PQH_DEVICE_EXTENSION DevExt = FilterDeviceObject->DeviceExtension;
 	KIRQL OldIrql;
@@ -14,6 +14,9 @@ VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 	if (!DevExt) return;
 
 	// 先禁止新的保护读写, 阻止新IRP处理 自然不会有新的IRP被插入工作项队列
+	if (!DevExt->Removing)
+		DevExt->WasProtected = DevExt->Initialized ? 1 : DevExt->WasProtected;
+	DevExt->Removing = 1;
 	InterlockedExchange8((volatile CHAR*)&DevExt->Initialized, 0);
 
 	// 排空队列中的IRP, 使工作项不会持续循环
@@ -24,8 +27,15 @@ VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 		PIRP Irp = CONTAINING_RECORD(Entry, IRP, Tail.Overlay.ListEntry);
 		KeReleaseSpinLock(&DevExt->PendingIrpQueueLock, OldIrql);
 
-		// 直接完成该IRP返回失败 一般来说QHDeleteFilterDevice被调用 就等于关机或者重启了
-		QHCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+		// 保护曾激活时，排队的写不能直落原盘；只放行 boot sector。
+		if (DevExt->LowerDeviceObject)
+		{
+			QHDispatchDuringRemoval(FilterDeviceObject, Irp);
+		}
+		else
+		{
+			QHCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+		}
 
 		KeAcquireSpinLock(&DevExt->PendingIrpQueueLock, &OldIrql);
 	}
@@ -38,8 +48,15 @@ VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 		IoFreeWorkItem(DevExt->IoWorkItem);
 		DevExt->IoWorkItem = NULL;
 	}
+}
 
-	// 工作项已结束，现在安全地断开设备栈
+VOID QHDetachAndDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
+{
+	PQH_DEVICE_EXTENSION DevExt = FilterDeviceObject->DeviceExtension;
+	if (!DevExt) return;
+
+	// 必须先把 IRP_MN_REMOVE_DEVICE 交给下层，再拆自己。
+	// 下层磁盘收不到移除，热重启时控制器不会重新就绪，启动管理器报 0xc0000225。
 	if (DevExt->LowerDeviceObject) {
 		IoDetachDevice(DevExt->LowerDeviceObject);
 		DevExt->LowerDeviceObject = NULL;
@@ -54,6 +71,15 @@ VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 		DevExt->SectorBitmap = NULL;
 	}
 
+	if (DevExt->ShadowRanges)
+	{
+		qhfree(DevExt->ShadowRanges);
+		DevExt->ShadowRanges = NULL;
+		DevExt->ShadowRangeCount = 0;
+		DevExt->ShadowSectorCount = 0;
+		DevExt->ShadowSectorNext = 0;
+	}
+
 	if (DevExt->OffsetHash)
 	{
 		QHHashDelete(DevExt->OffsetHash);
@@ -62,6 +88,12 @@ VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 
 	// 安全销毁过滤设备：已无引用、无队列、无资源. 删除设备本身
 	IoDeleteDevice(FilterDeviceObject);
+}
+
+VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
+{
+	QHDrainFilterDevice(FilterDeviceObject);
+	QHDetachAndDeleteFilterDevice(FilterDeviceObject);
 }
 
 // 创建通讯设备
@@ -167,7 +199,11 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 	DeviceExtension->SectorBitmap = NULL;
 	DeviceExtension->ProtectRangeCount = 0;
 	DeviceExtension->LastScanIndex = 0;
-	FilterDeviceObject->Flags = DeviceExtension->LowerDeviceObject->Flags | DO_POWER_PAGABLE | DO_DIRECT_IO;
+	// 标志跟下层设备走，只额外要求直接 I/O。不要强制加上 DO_POWER_PAGABLE：
+	// 启动卷是分页设备，热重启时电源 IRP 可能早于分页路径通知，
+	// 卷会被当成可分页设备，间歇性变成 0xc0000225。
+	FilterDeviceObject->Flags = DeviceExtension->LowerDeviceObject->Flags | DO_DIRECT_IO;
+	FilterDeviceObject->Flags &= ~DO_POWER_PAGABLE;
 
 	// 偏移记录表 看起来是hash, 其实不是hash. 后期考虑替换为hash
 	// 原本的确是hash, 但是我将klib的khashl移植过来使用出现严重的卡死问题 我就删除了 也避免第三方库的开源协议污染

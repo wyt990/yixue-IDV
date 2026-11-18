@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2026 Xuhui Jiang
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +36,10 @@ typedef struct _QH_BITMAP* PQH_BITMAP;
 // 这些文件在保护期间可能被用户态动态扩容/缩小, 新扇区不在本表中,
 // 写入会被驱动重定向 → 系统读取错位数据 → 蓝屏或更严重
 #define QH_PROTECT_RANGE_MAX 8
+
+// 影子文件：由安装/准备脚本预先分配，驱动只使用其已分配簇作为重定向目标。
+// 不再从 NTFS 空闲位图动态挑选目标扇区。
+#define QH_SHADOW_FILE_NAME L"\\$YixueShadow.bin"
 
 typedef struct _QH_PROTECT_RANGE
 {
@@ -126,6 +130,16 @@ typedef struct _QH_DEVICE_EXTENSION
 	// init 阶段一次性填充, IRP 路径上无锁只读 (见 QH_PROTECT_RANGE 注释)
 	QH_PROTECT_RANGE ProtectRanges[QH_PROTECT_RANGE_MAX];
 	ULONG ProtectRangeCount;
+	// 影子文件已分配簇的物理扇区区间；重定向目标只从这里顺序分配。
+	PQH_PROTECT_RANGE ShadowRanges;
+	ULONG ShadowRangeCount;
+	ULONGLONG ShadowSectorCount;
+	ULONGLONG ShadowSectorNext;
+	// 最近一次保护初始化结果（诊断用）
+	ULONG LastInitStatus;
+	// 设备移除/关机阶段：阻止新的保护写，已排队写不能直落原盘
+	volatile LONG Removing;
+	volatile LONG WasProtected;
 	// 上次扫描空闲扇区的位置（加速 RtlFindClearBits 起点提示）
 	ULONG LastScanIndex;
 	// 位图互斥体

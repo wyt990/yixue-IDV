@@ -24,6 +24,8 @@ const IOCTL_QH_QUERY_PROTECT_STATUS: u32 = 0x80002004;
 pub enum DriverBackendKind {
     /// Write `_qh_protect_state.data` (+ optional IOCTL query).
     StateFile,
+    /// Microsoft Unified Write Filter (Windows Enterprise/Education).
+    Uwf,
     /// Persist freeze flag to a local JSON file (dev / forced mock).
     MockFile,
 }
@@ -53,12 +55,30 @@ pub fn default_driver() -> Box<dyn RestoreDriver> {
     }
     #[cfg(windows)]
     {
-        Box::new(StateFileDriver)
+        let requested = BACKEND
+            .get()
+            .cloned()
+            .or_else(|| std::env::var("IDV_RESTORE_BACKEND").ok())
+            .unwrap_or_else(|| "auto".into())
+            .to_ascii_lowercase();
+        let uwf_present = Path::new(r"C:\Windows\System32\uwfmgr.exe").exists();
+        if requested == "uwf" || (requested == "auto" && uwf_present) {
+            Box::new(UwfDriver)
+        } else {
+            Box::new(StateFileDriver)
+        }
     }
     #[cfg(not(windows))]
     {
         Box::new(MockFileDriver::default())
     }
+}
+
+static BACKEND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Select the restore backend once at Agent startup (`auto`, `uwf`, `state_file`).
+pub fn set_backend(value: &str) {
+    let _ = BACKEND.set(value.trim().to_ascii_lowercase());
 }
 
 #[derive(Debug, Default)]
@@ -328,8 +348,142 @@ impl RestoreDriver for StateFileDriver {
     }
 }
 
-fn system_drive_root() -> Option<PathBuf> {
-    std::env::var_os("SystemDrive")
+/// Microsoft Unified Write Filter backend (Enterprise/Education only).
+pub struct UwfDriver;
+
+impl UwfDriver {
+    #[cfg(windows)]
+    fn uwfmgr(args: &[&str]) -> anyhow::Result<String> {
+        let out = std::process::Command::new(r"C:\Windows\System32\uwfmgr.exe")
+            .args(args)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "uwfmgr {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    #[cfg(windows)]
+    fn state() -> anyhow::Result<(bool, bool, Vec<String>)> {
+        // Query the UWF WMI provider rather than parsing localized CLI output.
+        let script = r#"
+$ns='root/standardcimv2/embedded'
+$f=Get-CimInstance -Namespace $ns -ClassName UWF_Filter
+$v=@(Get-CimInstance -Namespace $ns -ClassName UWF_Volume | Where-Object { $_.Protected -eq $true } | ForEach-Object { $_.DriveLetter })
+[pscustomobject]@{current=[bool]$f.CurrentEnabled;next=[bool]$f.NextEnabled;protected=$v} | ConvertTo-Json -Compress
+"#;
+        let out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "UWF status query failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with('{'))
+            .ok_or_else(|| anyhow::anyhow!("UWF status: no JSON output"))?;
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        let current = value
+            .get("current")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let next = value
+            .get("next")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let protected = value
+            .get("protected")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                let mut out: Vec<String> = a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                out.sort();
+                out.dedup();
+                out
+            })
+            .unwrap_or_default();
+        Ok((current, next, protected))
+    }
+
+    #[cfg(not(windows))]
+    fn uwfmgr(_args: &[&str]) -> anyhow::Result<String> {
+        anyhow::bail!("UWF is only supported on Windows")
+    }
+
+    #[cfg(not(windows))]
+    fn state() -> anyhow::Result<(bool, bool, Vec<String>)> {
+        anyhow::bail!("UWF is only supported on Windows")
+    }
+}
+
+impl RestoreDriver for UwfDriver {
+    fn status(&self) -> anyhow::Result<DriverStatus> {
+        let (current, next, protected) = Self::state()?;
+        Ok(DriverStatus {
+            backend: DriverBackendKind::Uwf,
+            available: true,
+            frozen: current,
+            armed: next,
+            detail: format!(
+                "uwf current={current} next={next} protected={}",
+                protected.join(",")
+            ),
+        })
+    }
+
+    fn protect_on(&self, volumes: &[String]) -> anyhow::Result<DriverStatus> {
+        let roots = StateFileDriver::volume_roots(volumes);
+        if roots.is_empty() {
+            anyhow::bail!("no volume roots resolved for {volumes:?}");
+        }
+        Self::uwfmgr(&["filter", "enable"])?;
+        let wanted: Vec<String> = roots
+            .iter()
+            .filter_map(|p| p.to_string_lossy().chars().next())
+            .map(|c| format!("{}:", c.to_ascii_uppercase()))
+            .collect();
+        // Protect the requested fixed volumes.
+        for drive in &wanted {
+            Self::uwfmgr(&["volume", "protect", drive])?;
+        }
+        // Unprotect fixed volumes outside the requested scope.
+        for root in fixed_volume_roots() {
+            let drive = match root.to_string_lossy().chars().next() {
+                Some(c) => format!("{}:", c.to_ascii_uppercase()),
+                None => continue,
+            };
+            if !wanted.iter().any(|w| w.eq_ignore_ascii_case(&drive)) {
+                let _ = Self::uwfmgr(&["volume", "unprotect", &drive]);
+            }
+        }
+        self.status()
+    }
+
+    fn protect_off(&self) -> anyhow::Result<DriverStatus> {
+        Self::uwfmgr(&["filter", "disable"])?;
+        self.status()
+    }
+}
+
+fn system_drive_root() -> Option<PathBuf> {    std::env::var_os("SystemDrive")
         .map(|d| {
             let s = d.to_string_lossy();
             if s.ends_with(':') {

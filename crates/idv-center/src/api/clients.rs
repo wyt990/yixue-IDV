@@ -344,6 +344,7 @@ pub async fn update(
         .assigned_ip
         .map(|s| s.trim().to_string())
         .unwrap_or(existing.assigned_ip);
+    crate::lab_naming::validate_manual_ip(&state, &lab_id, &assigned_ip, Some(&id)).await?;
 
     sqlx::query("UPDATE clients SET lab_id = ?, name = ?, notes = ?, assigned_ip = ? WHERE id = ?")
         .bind(&lab_id)

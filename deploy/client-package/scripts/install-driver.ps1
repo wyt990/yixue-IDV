@@ -80,7 +80,28 @@ Add-Type -MemberDefinition $sig -Name SetupApi -Namespace Native -ErrorAction Si
 
 $svc = Get-Service -Name SysRestoreDriver -ErrorAction SilentlyContinue
 if (-not $svc) {
-  throw "Service SysRestoreDriver not found after INF install."
+  # Some Windows builds reject DefaultInstall.NTamd64 via InstallHinfSection.
+  # Fall back to the exact service registration declared by the INF.
+  Write-Host "INF 未创建服务，使用 sc.exe 兜底注册..."
+  $driverDst = Join-Path $env:SystemRoot "System32\drivers\SysRestoreDriver.sys"
+  Copy-Item -Force $sys $driverDst
+  $scArgs = @(
+    "create", "SysRestoreDriver",
+    "type=", "kernel",
+    "start=", "boot",
+    "error=", "normal",
+    "binPath=", "\SystemRoot\System32\drivers\SysRestoreDriver.sys",
+    "group=", "Storage Volume Filters",
+    "DisplayName=", "SysRestoreDriver"
+  )
+  & sc.exe @scArgs | Out-Host
+  if ($LASTEXITCODE -ne 0) {
+    throw "sc.exe create SysRestoreDriver failed: $LASTEXITCODE"
+  }
+  $svc = Get-Service -Name SysRestoreDriver -ErrorAction SilentlyContinue
+}
+if (-not $svc) {
+  throw "Service SysRestoreDriver not found after INF/fallback install."
 }
 Write-Host "Service OK: StartType=$($svc.StartType) Status=$($svc.Status)"
 

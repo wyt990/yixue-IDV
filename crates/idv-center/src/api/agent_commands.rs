@@ -176,6 +176,7 @@ const ALLOWED_KINDS: &[&str] = &[
     "assist_ack",
     "update_agent",
     "restore_now",
+    "exec",
 ];
 
 /// Admin/API: queue a command for a MAC (used by UI/automation).
@@ -202,4 +203,33 @@ pub async fn create(
 
 fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct AgentCommandView {
+    pub id: String,
+    pub mac: String,
+    pub kind: String,
+    pub state: String,
+    pub error_message: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Admin: read a queued/completed command's result (remote script output).
+pub async fn get(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<AgentCommandView>, (StatusCode, String)> {
+    let row = sqlx::query_as::<_, AgentCommandView>(
+        "SELECT id, mac, kind, state, error_message, created_at, finished_at \
+         FROM agent_commands WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?
+    .ok_or((StatusCode::NOT_FOUND, "command not found".into()))?;
+    Ok(Json(row))
 }

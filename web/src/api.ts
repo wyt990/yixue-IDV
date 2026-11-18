@@ -416,6 +416,16 @@ export const api = {
           }),
         },
       ),
+    commandStatus: (id: string) =>
+      request<{
+        id: string;
+        mac: string;
+        kind: string;
+        state: string;
+        error_message: string;
+        created_at: string;
+        finished_at: string | null;
+      }>(`/api/v1/agent/commands/${id}`),
   },
   enrollment: {
     get: () => request<EnrollmentSettings>("/api/v1/ops/enrollment"),

@@ -233,6 +233,10 @@ pub fn router() -> Router<AppState> {
             post(agent_commands::report),
         )
         .route(
+            "/api/v1/agent/commands/{id}",
+            get(agent_commands::get),
+        )
+        .route(
             "/api/v1/clients/{mac}/commands",
             post(agent_commands::create),
         )

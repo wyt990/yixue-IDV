@@ -242,17 +242,10 @@ pub async fn bind_lab(
     .execute(&state.pool)
     .await
     .map_err(internal)?;
-    let mode_changed = prev.as_deref() != Some(body.mode_policy_id.as_str());
-    let mut reboot_n = 0usize;
-    if mode_changed {
-        reboot_n = super::power::enqueue_reboots_for_lab(
-            &state,
-            &lab_id,
-            &format!("mode_bind→{} auto-reboot", mode.name),
-        )
-        .await
-        .unwrap_or(0);
-    }
+    let _mode_changed = prev.as_deref() != Some(body.mode_policy_id.as_str());
+    // Do not queue a separate reboot here. The queued apply_policy makes the
+    // Agent arm/disarm the volume filter and issue exactly one reboot.
+    let reboot_n = 0usize;
     // Push an immediate policy apply to every client in the lab (persistent
     // agents receive it via long-poll; old agents still get it on heartbeat).
     let macs: Vec<(String,)> = sqlx::query_as("SELECT mac FROM clients WHERE lab_id = ?")

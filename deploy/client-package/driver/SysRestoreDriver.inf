@@ -1,4 +1,4 @@
-[Version]
+ÿþ[Version]
 Signature   = "$WINDOWS NT$"
 Class       = Volume
 ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
@@ -68,4 +68,4 @@ LoadOrderGroup = "Storage Volume Filters"
 ProviderName = "XuHui.Jiang"
 DiskName     = "SysRestoreDriver Installation Disk"
 ServiceName  = "SysRestoreDriver"
-ServiceDesc  = "QH Engine Disk Volume Filter Driver - Provides system restore and protection functionality"
+ServiceDesc  = "QH Engine Disk Volume Filter Driver - Provides system restore and protection functionality

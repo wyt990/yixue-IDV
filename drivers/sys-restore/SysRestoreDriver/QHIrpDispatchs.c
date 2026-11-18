@@ -76,6 +76,39 @@ NTSTATUS QHIrpDispatchDefault(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp
 	return QHCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
+NTSTATUS QHDispatchDuringRemoval(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+	PQH_DEVICE_EXTENSION DevExt = (PQH_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+	if (!DevExt || !DevExt->WasProtected)
+		return QHIrpDispatchDefault(DeviceObject, Irp);
+
+	PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+	if (Stack->MajorFunction != IRP_MJ_WRITE)
+		return QHIrpDispatchDefault(DeviceObject, Irp);
+
+	UINT64 Offset = Stack->Parameters.Write.ByteOffset.QuadPart;
+	UINT32 Length = Stack->Parameters.Write.Length;
+	UINT32 BytesPerSector = DevExt->NtfsBootSector.BPB.BytesPerSector;
+	if (Length != 0 && BytesPerSector != 0)
+	{
+		if (Offset < BytesPerSector && (Offset + Length) <= BytesPerSector)
+		{
+			// boot sector dirty flag 必须继续落盘
+			return QHIrpDispatchDefault(DeviceObject, Irp);
+		}
+
+		UINT64 startSector = Offset / BytesPerSector;
+		UINT64 endSector = (Offset + Length - 1) / BytesPerSector;
+		// $Volume 等直写区间里的关机清 dirty 也必须落盘
+		if (QHAreSectorsProtected(DevExt, startSector, endSector - startSector + 1))
+			return QHIrpDispatchDefault(DeviceObject, Irp);
+	}
+
+	// 受保护卷的其它排队的写不能直落原盘，否则关机后基线可能损坏。
+	// 对文件系统报告写完成，避免它在拆卷过程中重试到原盘。
+	return QHCompleteIrp(Irp, STATUS_SUCCESS, Length);
+}
+
 NTSTATUS QHIrpDispatchCreateCloseCleanup(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	NTSTATUS Status = STATUS_SUCCESS;
@@ -121,9 +154,21 @@ VOID QHIoWorkItemRoutine(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Contex
 		Irp = CONTAINING_RECORD(Entry, IRP, Tail.Overlay.ListEntry);
 		PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
 
+		if (DevExt->Removing)
+		{
+			QHDispatchDuringRemoval(DeviceObject, Irp);
+			continue;
+		}
+
 		if (!DevExt->Initialized)
 		{
-			QHCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+			// 保护尚未生效，或关机流程刚把 Initialized 清掉、下层设备还在。
+			// 这时必须把 IRP 交给真实磁盘。直接失败成 STATUS_DEVICE_NOT_READY
+			// 会让启动管理器以为启动卷不存在（0xc0000225），热重启时更容易撞上。
+			if (DevExt->LowerDeviceObject)
+				QHIrpDispatchDefault(DeviceObject, Irp);
+			else
+				QHCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
 			continue;
 		}
 
@@ -204,6 +249,9 @@ NTSTATUS QHIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
 	PQH_DEVICE_EXTENSION DevExt = (PQH_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
+	if (DevExt->Removing)
+		return QHDispatchDuringRemoval(DeviceObject, Irp);
+
 	if (!DevExt->Initialized)
 		return QHIrpDispatchDefault(DeviceObject, Irp);
 
@@ -216,15 +264,16 @@ NTSTATUS QHIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		return QHCompleteIrp(Irp, STATUS_SUCCESS, 0);
 	}
 
+	// 先排队再映射。DISPATCH_LEVEL 上 MmGetSystemAddressForMdlSafe 会失败，
+	// 若在这里直接失败，关机阶段的分页读会被丢掉，热重启更容易 0xc0000225。
+	if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+		return QHQueueIrpForWorkItem(DevExt, Irp);
+
 	// 映射缓冲区
 	NTSTATUS mapStatus;
 	PUCHAR Buffer = QHMapIrpBuffer(Irp, &mapStatus);
 	if (!Buffer)
 		return mapStatus;
-
-	// FAST_MUTEX 要求 PASSIVE_LEVEL
-	if (KeGetCurrentIrql() != PASSIVE_LEVEL)
-		return QHQueueIrpForWorkItem(DevExt, Irp);
 
 
 	// 快速扫描, 直接查 OffsetHash 判断是否存在任意重定向
@@ -373,6 +422,9 @@ NTSTATUS QHIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
 	PQH_DEVICE_EXTENSION DevExt = (PQH_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
+	if (DevExt->Removing)
+		return QHDispatchDuringRemoval(DeviceObject, Irp);
+
 	if (!DevExt->Initialized)
 		return QHIrpDispatchDefault(DeviceObject, Irp);
 
@@ -389,44 +441,26 @@ NTSTATUS QHIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		return QHCompleteIrp(Irp, STATUS_SUCCESS, 0);
 	}
 
-	// 引导扇区写保护：拒绝写入卷的第一个扇区（偏移 0 ~ BytesPerSector-1）
+	// 引导扇区不重定向，也不拒绝。NTFS 用它记录 dirty 标志，
+	// 拒绝写入会让热重启后启动管理器打不开这块卷（0xc0000225）。
+	// 只放行落在第一个扇区之内的写；跨出首扇区的写仍拒绝，避免用户数据直写原盘。
 	if (Offset < BytesPerSector)
 	{
+		if ((UINT64)Offset + Length <= BytesPerSector)
+		{
+			IoSkipCurrentIrpStackLocation(Irp);
+			return IoCallDriver(DevExt->LowerDeviceObject, Irp);
+		}
 		return QHCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
 	}
 
-	// 范围短路 — 在缓冲区分配/拷贝之前先尝试整段直通, 避免无谓的 qhalloc + memcpy
-	//
-	// 两种短路条件 (任一成立都可走原生透传):
-	//   1. 整段都在 ProtectRanges 内 -> 直接写原位置 (等同慢路径每扇区 IsProtected==TRUE)
-	//   2. 整段在 SectorBitmap 内全 0 (空闲) -> 标 SectorBitmap 后直写原位置
-	//      (等同慢路径每扇区 IsFreeSector==TRUE 的逐位处理结果)
-	//
-	// 关键: "判空 + 占用" 必须在同一把锁内完成, 否则两个并发 IRP 都判定为空,
-	// 都直写到同一物理位置, 造成数据相互覆盖
+	// 范围短路 — 只有整段命中 ProtectRanges 才能直接透传原盘。
+	// 空闲扇区也必须写影子文件，不能再直接写原始空闲空间。
 	{
 		UINT64 wStartSector = Offset / BytesPerSector;
 		UINT64 wEndSector = (Offset + Length - 1) / BytesPerSector;
 		UINT64 wSectorCount = wEndSector - wStartSector + 1;
-
-		// 全段保护无锁判断 (ProtectRanges 在 init 后只读)
-		BOOLEAN allProtected = QHAreSectorsProtected(DevExt, wStartSector, wSectorCount);
-
-		BOOLEAN allFree = FALSE;
-		if (!allProtected)
-		{
-			ExAcquireFastMutex(&DevExt->BitmapMutex);
-			allFree = QHBitmapAreBitsClear(DevExt->SectorBitmap, wStartSector, wSectorCount);
-			if (allFree)
-			{
-				// 原子地把整段标记为已用, 防止后续并发写再次判空走直通
-				// (语义与慢路径单扇区 "判空 -> 立即 QHBitmapSet" 一致)
-				QHBitmapSetRange(DevExt->SectorBitmap, wStartSector, wSectorCount);
-			}
-			ExReleaseFastMutex(&DevExt->BitmapMutex);
-		}
-
-		if (allProtected || allFree)
+		if (QHAreSectorsProtected(DevExt, wStartSector, wSectorCount))
 		{
 			IoSkipCurrentIrpStackLocation(Irp);
 			return IoCallDriver(DevExt->LowerDeviceObject, Irp);
@@ -477,69 +511,26 @@ NTSTATUS QHIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 			}
 			else
 			{
-				// 检查当前扇区是否为空闲
-				ExAcquireFastMutex(&DevExt->BitmapMutex);
-				BOOLEAN IsFreeSector = !QHBitmapTest(DevExt->SectorBitmap, sectorIndex);
-				if (IsFreeSector)
-				{
-					QHBitmapSet(DevExt->SectorBitmap, sectorIndex, TRUE);
-				}
-				ExReleaseFastMutex(&DevExt->BitmapMutex);
+				// 所有非 ProtectRanges 的写都必须进入影子文件；
+				// 不再使用 NTFS 空闲扇区作为重定向目标。
+				// 在 OffsetHashMutex 内原子完成“查询 → 必要时分配 → 写表”。
+				ExAcquireFastMutex(&DevExt->OffsetHashMutex);
 
-				if (IsFreeSector)
+				UINT64 targetSector = 0;
+				NTSTATUS hashStatus = QHHashGet(DevExt->OffsetHash, sectorIndex, &targetSector);
+				if (!NT_SUCCESS(hashStatus))
 				{
-					// 空闲扇区直接写入原始位置
-					physicalOffset = currOffset;
-				}
-				else
-				{
-					// 已占用扇区, 在 OffsetHashMutex 内原子完成 "查询 → 必要时分配 → 写表"
-					//
-					// 必须把整段保护在同一把锁内, 否则两个并发写同一扇区的 IRP 都会:
-					//   1) 各自查 hash 都未命中
-					//   2) 各自分一个新空闲扇区 (例如 100, 101)
-					//   3) 各自写 hash, 后者覆盖前者
-					// 结果: 一份数据落到 100 (永久泄露, 引用丢失), hash 表只指向 101,
-					//      前者的写入永久消失
-					//
-					// 锁顺序约定: OffsetHashMutex 外, BitmapMutex 内
-					// (全代码库无反向嵌套, 无死锁风险)
-					ExAcquireFastMutex(&DevExt->OffsetHashMutex);
-
-					UINT64 targetSector;
-					NTSTATUS hashStatus = QHHashGet(DevExt->OffsetHash, sectorIndex, &targetSector);
-
-					if (NT_SUCCESS(hashStatus))
+					NTSTATUS shadowStatus = QHAllocateShadowSector(DevExt, &targetSector);
+					if (!NT_SUCCESS(shadowStatus))
 					{
-						// 已有重定向, 直接用目标扇区
 						ExReleaseFastMutex(&DevExt->OffsetHashMutex);
-						physicalOffset = targetSector * BytesPerSector;
+						qhfree(newBuf);
+						return QHCompleteIrp(Irp, shadowStatus, 0);
 					}
-					else
-					{
-						// 首次写入已占用扇区, 分配新的空闲扇区作为重定向目标
-						// QHBitmapFindNextClear 内部已带 wrap-around 语义,
-						// 返回 -1 即代表整张位图已无清零位
-						ExAcquireFastMutex(&DevExt->BitmapMutex);
-						ULONGLONG freeSector = QHBitmapFindNextClear(DevExt->SectorBitmap, DevExt->LastScanIndex);
-						if (freeSector == (ULONGLONG)-1)
-						{
-							ExReleaseFastMutex(&DevExt->BitmapMutex);
-							ExReleaseFastMutex(&DevExt->OffsetHashMutex);
-							qhfree(newBuf);
-							return QHCompleteIrp(Irp, STATUS_DISK_FULL, 0);
-						}
-						DevExt->LastScanIndex = (ULONG)(freeSector + 1);
-						QHBitmapSet(DevExt->SectorBitmap, freeSector, TRUE);
-						ExReleaseFastMutex(&DevExt->BitmapMutex);
-
-						// 仍持 OffsetHashMutex, 此处写入对其他线程的下一次 HashGet 立即可见
-						QHHashSet(DevExt->OffsetHash, sectorIndex, freeSector);
-						ExReleaseFastMutex(&DevExt->OffsetHashMutex);
-
-						physicalOffset = freeSector * BytesPerSector;
-					}
+					QHHashSet(DevExt->OffsetHash, sectorIndex, targetSector);
 				}
+				ExReleaseFastMutex(&DevExt->OffsetHashMutex);
+				physicalOffset = targetSector * BytesPerSector;
 			} // end else IsProtected
 
 		__writeReInit:
@@ -606,12 +597,14 @@ static NTSTATUS QHInitializeVolumeProtection(
 	_In_ PQH_DEVICE_EXTENSION DevExt)
 {
 	NTSTATUS Status;
+	DevExt->LastInitStatus = STATUS_SUCCESS;
 
 	// 1. 读 boot sector
 	//    此时 Initialized=FALSE, QHReadVolumeData 走默认透传, 不经过本驱动重定向
 	Status = QHGetBootSector(DeviceObject, &DevExt->NtfsBootSector);
 	if (!NT_SUCCESS(Status))
 	{
+		DevExt->LastInitStatus = Status;
 		return STATUS_SUCCESS;
 	}
 
@@ -626,14 +619,25 @@ static NTSTATUS QHInitializeVolumeProtection(
 		return STATUS_SUCCESS;
 	}
 
-	// 3. 构建位图并填充 ProtectRanges (其中包含状态文件本身)
-	Status = _QHUpdateSectorBitmapSafe(DeviceObject);
+	// 3. 加载预先分配的影子文件；没有影子空间时不激活保护，
+	//    避免退回到旧的“动态占用 NTFS 空闲扇区”逻辑。
+	Status = QHLoadShadowRanges(DeviceObject, DevExt);
 	if (!NT_SUCCESS(Status))
 	{
+		DevExt->LastInitStatus = Status;
+		KdPrint(("QH: shadow file missing/invalid, protection not activated: 0x%08X\n", Status));
 		return STATUS_SUCCESS;
 	}
 
-	// 4. 标记该设备已初始化完毕, 正式开始拦截读写
+	// 4. 构建位图并填充 ProtectRanges (其中包含状态文件本身)
+	Status = _QHUpdateSectorBitmapSafe(DeviceObject);
+	if (!NT_SUCCESS(Status))
+	{
+		DevExt->LastInitStatus = Status;
+		return STATUS_SUCCESS;
+	}
+
+	// 5. 标记该设备已初始化完毕, 正式开始拦截读写
 	InterlockedExchange8((volatile CHAR*)&DevExt->Initialized, 1);
 
 	return STATUS_SUCCESS;
@@ -711,20 +715,20 @@ NTSTATUS QHIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 
 	switch (IrpSp->MinorFunction)
 	{
-	case IRP_MN_REMOVE_DEVICE:	// 删除的控制码, 书中说要处理这个, 具体这些代码我还未测试
+	case IRP_MN_REMOVE_DEVICE:
 	{
 		KIRQL OldIrql;
 		PQH_DEVICE_LIST_NODE NodeToFree = NULL;
+		PDEVICE_OBJECT LowerDeviceObject;
+		NTSTATUS Status;
 
 		KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &OldIrql);
 		PLIST_ENTRY PEntry = DriverExt->DeviceObjectListHead.Flink;
 		while (PEntry != &DriverExt->DeviceObjectListHead)
 		{
 			PQH_DEVICE_LIST_NODE Node = CONTAINING_RECORD(PEntry, QH_DEVICE_LIST_NODE, Entry);
-			// 要删除的设备是否是过滤设备
 			if (Node->DeviceObject == DeviceObject)
 			{
-				// 如果是 在链表中删除此节点
 				RemoveEntryList(&Node->Entry);
 				NodeToFree = Node;
 				break;
@@ -736,11 +740,24 @@ NTSTATUS QHIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		if (NodeToFree)
 			qhfree(NodeToFree);
 
-		QHCompleteIrp(Irp, STATUS_SUCCESS, 0);
+		// 先排空队列，此时还挂在设备栈上，排队的 I/O 仍能下发。
+		// 然后必须把 REMOVE 交给下层磁盘，最后才拆掉自己。
+		// 以前在这里直接完成 IRP，下层收不到移除，热重启控制器不就绪，冷启动却正常。
+		QHDrainFilterDevice(DeviceObject);
+		LowerDeviceObject = DevExt->LowerDeviceObject;
 
-		// 无论链表中是否移除了此设备 都要进行设备删除操作
-		QHDeleteFilterDevice(DeviceObject);
-		return STATUS_SUCCESS;
+		if (LowerDeviceObject)
+		{
+			IoSkipCurrentIrpStackLocation(Irp);
+			Status = IoCallDriver(LowerDeviceObject, Irp);
+		}
+		else
+		{
+			Status = QHCompleteIrp(Irp, STATUS_SUCCESS, 0);
+		}
+
+		QHDetachAndDeleteFilterDevice(DeviceObject);
+		return Status;
 	}
 
 	// 物理设备如果下线
@@ -753,21 +770,9 @@ NTSTATUS QHIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 			return IoCallDriver(DevExt->LowerDeviceObject, Irp);
 		}
 
-		// 如果不是分页
-		BOOLEAN SetPagable = FALSE;
-		// InPath = FALSE 表示移除分页文件路径，且当前分页路径计数为 1（即将变为 0）
-		if (!IrpSp->Parameters.UsageNotification.InPath &&
-			DevExt->PagingPathCount == 1)
-		{
-			// 此设备不是大浪涌电流设备
-			if (!(DeviceObject->Flags & DO_POWER_INRUSH))
-			{
-				// 则设置 DO_POWER_PAGABLE 标志
-				// 在电源转换期间，设备可以被分页（即其内存可以换出）
-				DeviceObject->Flags |= DO_POWER_PAGABLE;
-				SetPagable = TRUE;
-			}
-		}
+		// 不在分页路径通知里切换 DO_POWER_PAGABLE：启动卷过滤驱动在
+		// 热重启阶段不能把卷标成可分页设备，否则电源路径可能抢先于
+		// 分页通知，导致启动管理器认为启动卷不存在（0xc0000225）。
 
 		// 初始化等待事件
 		KEVENT Event;
@@ -788,18 +793,6 @@ NTSTATUS QHIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		{
 			IoAdjustPagingPathCount(&DevExt->PagingPathCount,
 				IrpSp->Parameters.UsageNotification.InPath);
-			if (IrpSp->Parameters.UsageNotification.InPath &&
-				DevExt->PagingPathCount == 1)
-			{
-				DeviceObject->Flags &= ~DO_POWER_PAGABLE;
-			}
-		}
-		else
-		{
-			if (SetPagable)
-			{
-				DeviceObject->Flags &= ~DO_POWER_PAGABLE;
-			}
 		}
 
 		QHCompleteIrp(Irp, Status, Irp->IoStatus.Information);
@@ -881,6 +874,43 @@ NTSTATUS QHIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PI
 
 			*(PBOOLEAN)Irp->AssociatedIrp.SystemBuffer = isProtecting;
 			return QHCompleteIrp(Irp, STATUS_SUCCESS, sizeof(BOOLEAN));
+		}
+
+		case IOCTL_QH_QUERY_DRIVER_STATUS:
+		{
+			if (IrpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(QH_DRIVER_STATUS))
+			{
+				return QHCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			PQH_DRIVER_STATUS out = (PQH_DRIVER_STATUS)Irp->AssociatedIrp.SystemBuffer;
+			RtlZeroMemory(out, sizeof(*out));
+			out->Magic = QH_DRIVER_STATUS_MAGIC;
+			out->Version = QH_DRIVER_STATUS_VERSION;
+			out->ProtectRangeMax = QH_PROTECT_RANGE_MAX;
+
+			PQH_DRIVER_EXTENSION DriverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+			if (DriverExt)
+			{
+				KIRQL OldIrql;
+				KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &OldIrql);
+				PLIST_ENTRY Entry = DriverExt->DeviceObjectListHead.Flink;
+				while (Entry != &DriverExt->DeviceObjectListHead)
+				{
+					PQH_DEVICE_LIST_NODE Node = CONTAINING_RECORD(Entry, QH_DEVICE_LIST_NODE, Entry);
+					PQH_DEVICE_EXTENSION VolExt = (PQH_DEVICE_EXTENSION)Node->DeviceObject->DeviceExtension;
+					if (VolExt->Initialized)
+						out->InitializedVolumes++;
+					if (VolExt->ShadowRanges)
+						out->ShadowReadyVolumes++;
+					out->ShadowSectorCount += VolExt->ShadowSectorCount;
+					out->ShadowSectorNext += VolExt->ShadowSectorNext;
+					if (out->LastInitStatus == STATUS_SUCCESS && VolExt->LastInitStatus != STATUS_SUCCESS)
+						out->LastInitStatus = VolExt->LastInitStatus;
+					Entry = Entry->Flink;
+				}
+				KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, OldIrql);
+			}
+			return QHCompleteIrp(Irp, STATUS_SUCCESS, sizeof(QH_DRIVER_STATUS));
 		}
 
 		default:

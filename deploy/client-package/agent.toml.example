@@ -15,3 +15,6 @@ center_url = "http://10.110.0.1:8080"
 # hostname = ""
 
 log = "info,idv_agent=info"
+
+# auto | uwf | state_file
+restore_backend = "auto"

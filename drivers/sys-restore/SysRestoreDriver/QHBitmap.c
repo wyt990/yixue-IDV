@@ -1,4 +1,4 @@
-﻿#include <ntifs.h>
+#include <ntifs.h>
 #include "QHBitmap.h"
 
 // ============================================================================
@@ -746,6 +746,140 @@ static NTSTATUS QHCollectFileProtectRanges(
 
 	ZwClose(fileHandle);
 	return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// 影子文件空间（预先分配的 $YixueShadow.bin）
+// ============================================================================
+
+NTSTATUS QHLoadShadowRanges(
+	_In_ PDEVICE_OBJECT FilterDeviceObject,
+	_Inout_ PQH_DEVICE_EXTENSION DevExt)
+{
+	UNREFERENCED_PARAMETER(FilterDeviceObject);
+	NTSTATUS Status;
+	HANDLE fileHandle = NULL;
+	UNICODE_STRING fullpath = { 0 };
+	OBJECT_ATTRIBUTES oa;
+	IO_STATUS_BLOCK iosb;
+	UNICODE_STRING fileName;
+	ULONG sectorsPerCluster = DevExt->NtfsBootSector.BPB.SectorsPerCluster;
+	RtlInitUnicodeString(&fileName, QH_SHADOW_FILE_NAME);
+
+	{
+		UNICODE_STRING dosName = { 0 };
+		Status = QHGetVolumeDosName(DevExt->PhysicalDeviceObject, &dosName);
+		if (!NT_SUCCESS(Status))
+			return Status;
+		fullpath.MaximumLength = dosName.Length + fileName.Length + sizeof(WCHAR);
+		fullpath.Buffer = (PWCH)qhalloc(fullpath.MaximumLength);
+		if (!fullpath.Buffer)
+		{
+			ExFreePool(dosName.Buffer);
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+		RtlCopyUnicodeString(&fullpath, &dosName);
+		RtlAppendUnicodeStringToString(&fullpath, &fileName);
+		ExFreePool(dosName.Buffer);
+	}
+
+	InitializeObjectAttributes(&oa, &fullpath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+	Status = ZwCreateFile(&fileHandle, GENERIC_READ | SYNCHRONIZE, &oa, &iosb, NULL,
+		FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+	qhfree(fullpath.Buffer);
+	if (!NT_SUCCESS(Status))
+		return Status;
+
+	{
+		STARTING_VCN_INPUT_BUFFER startingVcn = { 0 };
+		ULONG outputSize = sizeof(RETRIEVAL_POINTERS_BUFFER) + 1024 * sizeof(LARGE_INTEGER);
+		PRETRIEVAL_POINTERS_BUFFER pVcnPairs = NULL;
+		do {
+			if (pVcnPairs) qhfree(pVcnPairs);
+			pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)qhalloc(outputSize);
+			if (!pVcnPairs)
+			{
+				ZwClose(fileHandle);
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
+			Status = ZwFsControlFile(fileHandle, NULL, NULL, NULL, &iosb,
+				FSCTL_GET_RETRIEVAL_POINTERS, &startingVcn, sizeof(startingVcn),
+				pVcnPairs, outputSize);
+			outputSize += 1024 * sizeof(LARGE_INTEGER);
+		} while (Status == STATUS_BUFFER_OVERFLOW);
+
+		if (!NT_SUCCESS(Status))
+		{
+			qhfree(pVcnPairs);
+			ZwClose(fileHandle);
+			return Status;
+		}
+
+		ULONG maxRanges = pVcnPairs->ExtentCount;
+		PQH_PROTECT_RANGE ranges = (PQH_PROTECT_RANGE)qhalloc(
+			(maxRanges ? maxRanges : 1) * sizeof(QH_PROTECT_RANGE));
+		if (!ranges)
+		{
+			qhfree(pVcnPairs);
+			ZwClose(fileHandle);
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+
+		ULONG count = 0;
+		ULONGLONG totalSectors = 0;
+		LARGE_INTEGER prevVcn = pVcnPairs->StartingVcn;
+		for (ULONG r = 0; r < pVcnPairs->ExtentCount; r++)
+		{
+			LARGE_INTEGER lcn = pVcnPairs->Extents[r].Lcn;
+			ULONGLONG clusterCount = pVcnPairs->Extents[r].NextVcn.QuadPart - prevVcn.QuadPart;
+			prevVcn = pVcnPairs->Extents[r].NextVcn;
+			if (lcn.QuadPart == -1 || clusterCount == 0)
+				continue;
+			ranges[count].StartSector = (ULONGLONG)lcn.QuadPart * sectorsPerCluster;
+			ranges[count].SectorCount = clusterCount * sectorsPerCluster;
+			totalSectors += ranges[count].SectorCount;
+			count++;
+		}
+		qhfree(pVcnPairs);
+
+		if (count == 0 || totalSectors == 0)
+		{
+			qhfree(ranges);
+			ZwClose(fileHandle);
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+		}
+		DevExt->ShadowRanges = ranges;
+		DevExt->ShadowRangeCount = count;
+		DevExt->ShadowSectorCount = totalSectors;
+		DevExt->ShadowSectorNext = 0;
+	}
+
+	ZwClose(fileHandle);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS QHAllocateShadowSector(
+	_Inout_ PQH_DEVICE_EXTENSION DevExt,
+	_Out_ ULONGLONG* TargetSector)
+{
+	ULONGLONG ordinal = DevExt->ShadowSectorNext;
+	if (!DevExt->ShadowRanges || ordinal >= DevExt->ShadowSectorCount)
+		return STATUS_DISK_FULL;
+
+	ULONGLONG remaining = ordinal;
+	for (ULONG i = 0; i < DevExt->ShadowRangeCount; i++)
+	{
+		PQH_PROTECT_RANGE r = &DevExt->ShadowRanges[i];
+		if (remaining < r->SectorCount)
+		{
+			*TargetSector = r->StartSector + remaining;
+			DevExt->ShadowSectorNext = ordinal + 1;
+			return STATUS_SUCCESS;
+		}
+		remaining -= r->SectorCount;
+	}
+	return STATUS_DISK_FULL;
 }
 
 // 辅助：将 MFT 中指定记录覆盖的所有扇区追加到 DevExt->ProtectRanges
