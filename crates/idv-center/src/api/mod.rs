@@ -185,6 +185,10 @@ pub fn router() -> Router<AppState> {
             post(remote::fs_download),
         )
         .route(
+            "/api/v1/assist/sessions/{id}/fs/move",
+            post(remote::fs_move),
+        )
+        .route(
             "/api/v1/assist/sessions/{id}/fs/upload",
             post(remote::fs_upload).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )

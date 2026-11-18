@@ -374,7 +374,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-driver.ps1
 | 6 | 还原驱动、模式策略、多盘还原 | UWF（Enterprise/Education）已完成；自定义驱动仅实验 |
 | 7 | 批量身份、常驻 Agent、即时命令、远程控制、Agent 更新 | 软件已完成 |
 
-当前客户端 Agent：**0.7.0**（UWF 后端、GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
+当前客户端 Agent：**0.8.2**（UWF 后端、GDI 截屏、Task Scheduler updater、远程协助/文件传输）。
 
 后续增强：更细分区角色向导、远程控制 WebRTC/音频、Agent 设备令牌与命令签名、跨 VLAN WOL 等。
 

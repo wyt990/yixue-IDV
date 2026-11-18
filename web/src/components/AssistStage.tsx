@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type 
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useMessage } from "../message";
+import { FileTree } from "./FileTree";
 
 type Session = {
   id: string;
@@ -48,8 +49,6 @@ export function AssistStage({
   const [error, setError] = useState("");
   const [clipboard, setClipboard] = useState("");
   const [tool, setTool] = useState<"clip" | "files">("clip");
-  const [path, setPath] = useState("C:\\");
-  const [entries, setEntries] = useState<Entry[]>([]);
   const [fsBusy, setFsBusy] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [streamStats, setStreamStats] = useState({ fps: 0, rtt: 0, codec: "JPEG" });
@@ -72,8 +71,6 @@ export function AssistStage({
     let cancelled = false;
     setSession(null);
     setError("");
-    setEntries([]);
-    setPath("C:\\");
     (async () => {
       try {
         const s = (await api.phase3.createAssist(mac, mode)) as Session;
@@ -429,38 +426,10 @@ export function AssistStage({
     if (e.key.length > 1) sendInput({ type: "key", key: e.key, down: false });
   }
 
-  async function waitFs(requestId: string, timeoutMs = 60000) {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      const st = await api.remote.fsStatus(requestId);
-      if (st.state === "done" || st.state === "failed") return st;
-      await sleep(400);
-    }
-    throw new Error("文件操作超时");
-  }
-
-  async function openPath(next: string) {
-    if (!session) return;
-    setFsBusy(true);
-    setError("");
-    try {
-      const { request_id } = await api.remote.fsList(session.id, next);
-      const st = await waitFs(request_id);
-      if (st.state === "failed") throw new Error(st.error_message || "列目录失败");
-      const parsed = st.payload ? JSON.parse(st.payload) : { entries: [] };
-      setEntries((parsed.entries || []) as Entry[]);
-      setPath(next);
-    } catch (e) {
-      setError(String((e as Error).message || e));
-    } finally {
-      setFsBusy(false);
-    }
-  }
-
-  async function downloadEntry(entry: Entry) {
+  async function downloadEntry(entry: Entry, name?: string, forceHttp = false) {
     if (!session) return;
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (!forceHttp && !entry.is_dir && ws && ws.readyState === WebSocket.OPEN) {
       setFsBusy(true);
       const id = crypto.randomUUID();
       downloads.current.set(id, { name: entry.name, chunks: [] });
@@ -469,11 +438,19 @@ export function AssistStage({
     }
     setFsBusy(true);
     try {
-      const { request_id } = await api.remote.fsDownload(session.id, entry.path);
-      const st = await waitFs(request_id);
-      if (st.state === "failed") throw new Error(st.error_message || "下载失败");
-      await api.remote.fsData(request_id, entry.name);
-      msg.success(`已下载 ${entry.name}`);
+      const fileName = name || entry.name;
+      const { request_id } = await api.remote.fsDownload(session.id, entry.path, fileName);
+      const st = await api.remote.fsStatus(request_id);
+      let state = st;
+      const started = Date.now();
+      while (state.state !== "done" && state.state !== "failed" && Date.now() - started < 60000) {
+        await sleep(400);
+        state = await api.remote.fsStatus(request_id);
+      }
+      if (state.state === "failed") throw new Error(state.error_message || "下载失败");
+      if (state.state !== "done") throw new Error("下载超时");
+      await api.remote.fsData(request_id, fileName);
+      msg.success(`已下载 ${fileName}`);
     } catch (e) {
       setError(String((e as Error).message || e));
     } finally {
@@ -481,9 +458,9 @@ export function AssistStage({
     }
   }
 
-  async function uploadFile(file: File) {
+  async function uploadFile(file: File, targetDir: string) {
     if (!session) return;
-    const target = path.endsWith("\\") ? `${path}${file.name}` : `${path}\\${file.name}`;
+    const target = targetDir.endsWith("\\") ? `${targetDir}${file.name}` : `${targetDir}\\${file.name}`;
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       setFsBusy(true);
@@ -504,18 +481,21 @@ export function AssistStage({
     setFsBusy(true);
     try {
       const { request_id } = await api.remote.fsUpload(session.id, target, file);
-      const st = await waitFs(request_id);
+      let st = await api.remote.fsStatus(request_id);
+      const started = Date.now();
+      while (st.state !== "done" && st.state !== "failed" && Date.now() - started < 60000) {
+        await sleep(400);
+        st = await api.remote.fsStatus(request_id);
+      }
       if (st.state === "failed") throw new Error(st.error_message || "上传失败");
+      if (st.state !== "done") throw new Error("上传超时");
       msg.success(`已上传 ${file.name}`);
-      await openPath(path);
     } catch (e) {
       setError(String((e as Error).message || e));
     } finally {
       setFsBusy(false);
     }
   }
-
-  const parentPath = path.replace(/[\\/][^\\/]*$/, "") || path;
 
   return (
     <section className={`assist-stage${assist ? "" : " view-only"}`}>
@@ -646,81 +626,14 @@ export function AssistStage({
               </div>
             ) : (
               <div className="assist-pane">
-                <div className="page-actions">
-                  <input value={path} onChange={(e) => setPath(e.target.value)} />
-                  <button
-                    className="btn sm"
-                    type="button"
-                    disabled={!session || fsBusy}
-                    onClick={() => openPath(path)}
-                  >
-                    打开
-                  </button>
-                  <button
-                    className="btn ghost sm"
-                    type="button"
-                    disabled={!session || fsBusy}
-                    onClick={() => openPath(parentPath)}
-                  >
-                    上级
-                  </button>
-                  <label className="btn ghost sm">
-                    上传
-                    <input
-                      type="file"
-                      hidden
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (f) uploadFile(f);
-                        e.currentTarget.value = "";
-                      }}
-                    />
-                  </label>
-                </div>
-                {fsBusy ? <p className="muted">文件操作中…</p> : null}
-                <div className="assist-files">
-                  <table className="data-table">
-                    <tbody>
-                      {entries.length === 0 ? (
-                        <tr>
-                          <td className="muted">{session ? "打开目录后显示" : "等待会话"}</td>
-                        </tr>
-                      ) : (
-                        entries.map((entry) => (
-                          <tr key={entry.path}>
-                            <td>
-                              {entry.is_dir ? (
-                                <button
-                                  type="button"
-                                  className="linkish"
-                                  onClick={() => openPath(entry.path)}
-                                >
-                                  {entry.name}
-                                </button>
-                              ) : (
-                                entry.name
-                              )}
-                            </td>
-                            <td className="muted">
-                              {entry.is_dir ? "目录" : `${Math.round(entry.size / 1024)} KB`}
-                            </td>
-                            <td>
-                              {!entry.is_dir ? (
-                                <button
-                                  className="btn ghost sm"
-                                  type="button"
-                                  onClick={() => downloadEntry(entry)}
-                                >
-                                  下载
-                                </button>
-                              ) : null}
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+                <FileTree
+                  sessionId={session?.id || ""}
+                  busy={fsBusy}
+                  onBusy={setFsBusy}
+                  onError={setError}
+                  onUpload={uploadFile}
+                  onDownload={downloadEntry}
+                />
               </div>
             )}
           </aside>

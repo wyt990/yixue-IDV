@@ -72,6 +72,8 @@ pub struct TextBody {
 #[derive(Debug, Deserialize)]
 pub struct PathBody {
     pub path: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 async fn load_session(
@@ -467,9 +469,15 @@ pub async fn fs_download(
     Path(id): Path<String>,
     Json(body): Json<PathBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let name = std::path::Path::new(&body.path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
+    let name = body
+        .name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::path::Path::new(&body.path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+        })
         .unwrap_or_default();
     let rid = create_fs_request(&state, &id, "download", &body.path, &name, "").await?;
     Ok(Json(serde_json::json!({ "request_id": rid })))
@@ -533,6 +541,54 @@ pub async fn fs_upload(
     })
     .to_string();
     enqueue_command(&state, &id, "fs_upload", &payload)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({ "request_id": request_id })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoveBody {
+    pub from: String,
+    pub to: String,
+}
+
+pub async fn fs_move(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<MoveBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (_mac, _kind, sess_state) = load_session(&state, &id).await?;
+    if sess_state == "ended" || sess_state == "denied" {
+        return Err((StatusCode::CONFLICT, "session not active".into()));
+    }
+    if body.from.trim().is_empty() || body.to.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "from/to required".into()));
+    }
+    let request_id = new_id();
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO assist_file_requests \
+         (id, session_id, mac, kind, path, state, file_name, size_bytes, payload, error_message, created_at, updated_at) \
+         VALUES (?, ?, (SELECT mac FROM assist_sessions WHERE id = ?), 'move', ?, 'pending', '', 0, ?, '', ?, ?)",
+    )
+    .bind(&request_id)
+    .bind(&id)
+    .bind(&id)
+    .bind(&body.from)
+    .bind(&body.to)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await
+    .map_err(internal)?;
+    let payload = serde_json::json!({
+        "request_id": request_id,
+        "from": body.from,
+        "to": body.to,
+    })
+    .to_string();
+    enqueue_command(&state, &id, "fs_move", &payload)
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({ "request_id": request_id })))

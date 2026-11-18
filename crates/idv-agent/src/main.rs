@@ -3510,7 +3510,15 @@ async fn assist_ws_loop(
                     if kind.starts_with("fs_") {
                         let payload = cmd.get("payload").and_then(|v| v.as_str()).unwrap_or("");
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-                            let _ = handle_assist_fs_command(&fs_base, kind, &value).await;
+                            if let Err(err) = handle_assist_fs_command(&fs_base, kind, &value).await
+                                && let Some(rid) = value.get("request_id").and_then(|v| v.as_str())
+                            {
+                                let _ = http_client()
+                                    .put(format!("{fs_base}/api/v1/assist/fs/{rid}"))
+                                    .json(&serde_json::json!({ "ok": false, "error": err.to_string() }))
+                                    .send()
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -3725,6 +3733,22 @@ async fn assist_frame_loop(
 }
 
 fn fs_list_json(path: &str) -> Result<serde_json::Value> {
+    if path.trim().is_empty() {
+        let mut entries = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let root = format!("{}:\\", letter as char);
+            if std::path::Path::new(&root).exists() {
+                entries.push(serde_json::json!({
+                    "name": format!("{}:", letter as char),
+                    "path": root,
+                    "is_dir": true,
+                    "size": 0,
+                    "modified": 0,
+                }));
+            }
+        }
+        return Ok(serde_json::json!({ "ok": true, "entries": entries }));
+    }
     let dir = std::path::Path::new(path);
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| Error::Other(anyhow::anyhow!(e)))? {
@@ -3796,12 +3820,79 @@ async fn handle_assist_fs_command(
         }
         "fs_download" => {
             let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            let meta = std::fs::metadata(path)
+                .map_err(|e| Error::Other(anyhow::anyhow!("{path}: {e}")))?;
+            let bytes = if meta.is_dir() {
+                let zip_path = std::env::temp_dir().join(format!("idv-assist-{request_id}.zip"));
+                let zip_s = zip_path.to_string_lossy().to_string();
+                let script = format!(
+                    "Compress-Archive -LiteralPath {} -DestinationPath {} -Force",
+                    ps_quote(path),
+                    ps_quote(&zip_s)
+                );
+                let out = run_powershell_command(&script)
+                    .map_err(|e| Error::Other(anyhow::anyhow!("compress: {e}")))?;
+                if !out.status.success() {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "compress failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )));
+                }
+                let bytes = tokio::fs::read(&zip_path)
+                    .await
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+                let _ = tokio::fs::remove_file(&zip_path).await;
+                bytes
+            } else {
+                tokio::fs::read(path)
+                    .await
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
+            };
             let _ = http_client()
                 .put(format!("{base}/api/v1/assist/fs/{request_id}/data"))
                 .body(bytes)
+                .send()
+                .await;
+        }
+        "fs_move" => {
+            let from = payload
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let to = payload
+                .get("to")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if from.is_empty() || to.is_empty() {
+                return Err(Error::Other(anyhow::anyhow!("invalid fs_move payload")));
+            }
+            let from_path = std::path::Path::new(&from);
+            let to_path = std::path::Path::new(&to);
+            if !from_path.exists() {
+                return Err(Error::Other(anyhow::anyhow!("source not found: {from}")));
+            }
+            if to_path.exists() {
+                return Err(Error::Other(anyhow::anyhow!("target already exists: {to}")));
+            }
+            let from_prefix = format!("{}\\", from.trim_end_matches('\\'));
+            if to.starts_with(&from_prefix) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "cannot move a directory into itself"
+                )));
+            }
+            if let Some(parent) = to_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            }
+            tokio::task::spawn_blocking(move || move_path(&from, &to))
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!("move task: {e}")))??;
+            let _ = http_client()
+                .put(format!("{base}/api/v1/assist/fs/{request_id}"))
+                .json(&serde_json::json!({ "ok": true }))
                 .send()
                 .await;
         }
@@ -3959,7 +4050,7 @@ async fn run_assist_helper(
                         Err(err) => Err(err),
                     }
                 }
-                "fs_list" | "fs_download" | "fs_upload" => {
+                "fs_list" | "fs_download" | "fs_upload" | "fs_move" => {
                     handle_assist_fs_command(center_url, cmd_kind, &payload).await
                 }
                 "assist_stop" => {
@@ -4002,6 +4093,36 @@ async fn run_assist_helper(
 
 fn ps_quote(path: &str) -> String {
     path.replace('\'', "''")
+}
+
+fn move_path(from: &str, to: &str) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    let meta = std::fs::metadata(from).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    if meta.is_dir() {
+        copy_dir_all(std::path::Path::new(from), std::path::Path::new(to))?;
+        std::fs::remove_dir_all(from).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    } else {
+        std::fs::copy(from, to).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        std::fs::remove_file(from).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    }
+    Ok(())
+}
+
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+    for entry in std::fs::read_dir(from).map_err(|e| Error::Other(anyhow::anyhow!(e)))? {
+        let entry = entry.map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        }
+    }
+    Ok(())
 }
 
 fn center_url_join(center: &str, path: &str) -> String {

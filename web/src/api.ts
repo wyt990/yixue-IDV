@@ -814,10 +814,15 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ path }),
       }),
-    fsDownload: (id: string, path: string) =>
+    fsDownload: (id: string, path: string, name?: string) =>
       request<{ request_id: string }>(
         `/api/v1/assist/sessions/${id}/fs/download`,
-        { method: "POST", body: JSON.stringify({ path }) },
+        { method: "POST", body: JSON.stringify({ path, name }) },
+      ),
+    fsMove: (id: string, from: string, to: string) =>
+      request<{ request_id: string }>(
+        `/api/v1/assist/sessions/${id}/fs/move`,
+        { method: "POST", body: JSON.stringify({ from, to }) },
       ),
     fsStatus: (requestId: string) =>
       request<{

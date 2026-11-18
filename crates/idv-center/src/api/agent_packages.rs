@@ -47,10 +47,25 @@ pub fn extract_embedded_version(body: &[u8]) -> Option<String> {
     if end == start {
         return None;
     }
-    let version = String::from_utf8_lossy(&body[start..end])
-        .trim()
-        .to_string();
-    if valid_version(&version) {
+    let raw = String::from_utf8_lossy(&body[start..end]);
+    // The marker is followed by an arbitrary adjacent string in some builds.
+    // Keep only a leading major.minor.patch semantic version.
+    let mut version = String::new();
+    let mut dots = 0u8;
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && dots < 2) {
+            if ch == '.' {
+                dots += 1;
+            }
+            version.push(ch);
+        } else {
+            break;
+        }
+    }
+    while version.ends_with('.') {
+        version.pop();
+    }
+    if dots == 2 && valid_version(&version) {
         Some(version)
     } else {
         None
