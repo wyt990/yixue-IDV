@@ -131,6 +131,7 @@ export function AssistStage({
             description?: string;
             width?: number;
             height?: number;
+            backend?: string;
           };
           if (m.type === "clipboard" && typeof m.text === "string") setClipboard(m.text);
           if (
@@ -188,7 +189,7 @@ export function AssistStage({
                 optimizeForLatency: true,
               });
               h264Decoder.current = decoder;
-              setStreamStats((s) => ({ ...s, codec: "H.264" }));
+              setStreamStats((s) => ({ ...s, codec: m.backend === "hw" ? "H.264 HW" : "H.264 SW" }));
             } catch {
               h264Decoder.current = null;
               setStreamStats((s) => ({ ...s, codec: "JPEG" }));

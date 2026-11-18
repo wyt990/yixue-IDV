@@ -1,4 +1,6 @@
 mod netinfo;
+#[cfg(windows)]
+mod hw_h264;
 mod policy_store;
 mod restore_driver;
 
@@ -28,6 +30,41 @@ use policy_store::{LocalPolicyStore, default_state_dir};
 use restore_driver::{apply_frozen_state, default_driver};
 use serde::{Deserialize, Serialize};
 use tracing::info;
+
+#[cfg(windows)]
+fn h264_hardware_available() -> bool {
+    use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
+            return false;
+        }
+        let input = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_NV12,
+        };
+        let output = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        let ok = MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            Some(&input),
+            Some(&output),
+            &mut activates,
+            &mut count,
+        )
+        .is_ok();
+        let _ = MFShutdown();
+        ok && count > 0
+    }
+}
+
+
 
 #[derive(Debug, Parser)]
 #[command(
@@ -147,6 +184,9 @@ enum Commands {
         #[command(subcommand)]
         action: RestoreDriverCmd,
     },
+    /// Probe Media Foundation H.264 hardware encoder availability
+    HwProbe,
+
     /// Heartbeat: queue DesiredState if newer; with --apply apply pending after "reboot"
     SyncPolicy {
         #[arg(short, long, default_value = "deploy/config/agent.toml")]
@@ -632,6 +672,14 @@ async fn main() -> anyhow::Result<()> {
                     println!("protect_off_ok frozen={} detail={}", st.frozen, st.detail);
                 }
             }
+        }
+        Commands::HwProbe => {
+            println!("h264_hardware={}", h264_hardware_available());
+            #[cfg(windows)]
+            println!(
+                "hw_encoder={}",
+                hw_h264::HardwareH264::new(1920, 1080).is_some()
+            );
         }
         Commands::SyncPolicy {
             config,
@@ -2890,7 +2938,7 @@ impl H264Session {
 }
 
 #[cfg(windows)]
-fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+pub(crate) fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(1u8);
     out.push(sps.get(1).copied().unwrap_or(0x42));
@@ -3494,6 +3542,7 @@ async fn assist_ws_loop(
         let mut seq = 0u32;
         let capture = std::sync::Arc::new(std::sync::Mutex::new(AssistDirtyCapture::default()));
         let mut h264: Option<H264Session> = None;
+        let mut hardware: Option<hw_h264::HardwareH264> = None;
         let mut force_counter = 0u32;
         loop {
             if cap_stop.load(Ordering::SeqCst) {
@@ -3507,18 +3556,32 @@ async fn assist_ws_loop(
                 })
                 .await;
                 if let Ok(Ok((_sw, _sh, rgb))) = rgb {
-                    if h264.is_none() {
-                        h264 = H264Session::new(1920, 1080).ok();
+                    if hardware.is_none() && h264.is_none() {
+                        hardware = hw_h264::HardwareH264::new(1920, 1080);
+                        if hardware.is_none() {
+                            h264 = H264Session::new(1920, 1080).ok();
+                        }
                     }
-                    if let Some(session) = h264.as_mut()
-                        && let Ok((payload, keyframe, avcc, codec)) = session.encode(&rgb)
-                    {
+                    let encoded = if let Some(hw) = hardware.as_mut() {
+                        match hw.encode(rgb.as_raw()) {
+                            Ok(value) if !value.0.is_empty() => Some(value),
+                            _ => {
+                                hardware = None;
+                                h264 = H264Session::new(1920, 1080).ok();
+                                h264.as_mut().and_then(|s| s.encode(&rgb).ok())
+                            }
+                        }
+                    } else {
+                        h264.as_mut().and_then(|s| s.encode(&rgb).ok())
+                    };
+                    if let Some((payload, keyframe, avcc, codec)) = encoded {
                         if let (Some(avcc), Some(codec)) = (avcc, codec) {
                             let config = serde_json::json!({
                                 "type": "h264_config",
                                 "codec": codec,
-                                "width": session.width,
-                                "height": session.height,
+                                "width": 1920,
+                                "height": 1080,
+                                "backend": if hardware.is_some() { "hw" } else { "sw" },
                                 "description": hex::encode(avcc),
                             })
                             .to_string();
@@ -3534,8 +3597,8 @@ async fn assist_ws_loop(
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
                         packet.extend_from_slice(&ts.to_le_bytes());
-                        packet.extend_from_slice(&(session.width as u16).to_le_bytes());
-                        packet.extend_from_slice(&(session.height as u16).to_le_bytes());
+                        packet.extend_from_slice(&1920u16.to_le_bytes());
+                        packet.extend_from_slice(&1080u16.to_le_bytes());
                         packet.extend_from_slice(&payload);
                         seq = seq.wrapping_add(1);
                         let _ = frame_tx.try_send(AssistOut::Binary(packet));
