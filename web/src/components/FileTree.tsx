@@ -138,15 +138,20 @@ export function FileTree({
     const { request_id } = await api.remote.fsList(sessionId, path);
     const st = await waitFs(request_id);
     if (st.state === "failed") throw new Error(st.error_message || "列目录失败");
-    const parsed = st.payload ? JSON.parse(st.payload) : { entries: [] };
-    return (parsed.entries || []) as Entry[];
+    const parsed = st.payload ? JSON.parse(st.payload) : [];
+    const list = Array.isArray(parsed)
+      ? parsed
+      : parsed && Array.isArray(parsed.entries)
+        ? parsed.entries
+        : [];
+    return list as Entry[];
   }
 
   function updateNode(path: string, updater: (node: TreeNode) => TreeNode, list = nodes, set = setNodes) {
     const walk = (items: TreeNode[]): TreeNode[] =>
-      items.map((item) => {
+      (Array.isArray(items) ? items : []).map((item) => {
         if (item.path.toLowerCase() === path.toLowerCase()) return updater(item);
-        if (item.children) return { ...item, children: walk(item.children) };
+        if (Array.isArray(item.children)) return { ...item, children: walk(item.children) };
         return item;
       });
     set(walk(list));
@@ -329,7 +334,7 @@ export function FileTree({
           </span>
         </div>,
       );
-      if (item.is_dir && item.expanded && item.children?.length) {
+      if (item.is_dir && item.expanded && Array.isArray(item.children) && item.children.length) {
         rows.push(...renderRows(item.children.map((child) => ({ ...child })), depth + 1));
       }
     }
