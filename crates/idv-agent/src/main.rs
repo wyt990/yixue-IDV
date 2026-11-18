@@ -2684,6 +2684,100 @@ fn capture_virtual_rgb() -> Result<(u32, u32, image::RgbImage)> {
 }
 
 #[cfg(windows)]
+fn capture_virtual_rgb_scaled(target_width: i32, target_height: i32) -> Result<image::RgbImage> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BITMAPINFO, BI_RGB, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+        DeleteObject, GetDC, GetDIBits, HALFTONE, ReleaseDC, SRCCOPY, SelectObject,
+        SetStretchBltMode, StretchBlt,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err(Error::Other(anyhow::anyhow!("invalid screen size")));
+    }
+    let screen = unsafe { GetDC(std::ptr::null_mut()) };
+    if screen.is_null() {
+        return Err(Error::Other(anyhow::anyhow!("GetDC failed")));
+    }
+    let mem = unsafe { CreateCompatibleDC(screen) };
+    let bmp = unsafe { CreateCompatibleBitmap(screen, target_width, target_height) };
+    if mem.is_null() || bmp.is_null() {
+        unsafe {
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+        return Err(Error::Other(anyhow::anyhow!("GDI bitmap creation failed")));
+    }
+    let old = unsafe { SelectObject(mem, bmp) };
+    unsafe { SetStretchBltMode(mem, HALFTONE) };
+    let blt = unsafe {
+        StretchBlt(
+            mem,
+            0,
+            0,
+            target_width,
+            target_height,
+            screen,
+            vx,
+            vy,
+            width,
+            height,
+            SRCCOPY,
+        )
+    };
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader.biSize = std::mem::size_of_val(&bmi.bmiHeader) as u32;
+    bmi.bmiHeader.biWidth = target_width;
+    bmi.bmiHeader.biHeight = -target_height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    let mut bgra = vec![0u8; (target_width as usize) * (target_height as usize) * 4];
+    let lines = if blt != 0 {
+        unsafe {
+            GetDIBits(
+                mem,
+                bmp,
+                0,
+                target_height as u32,
+                bgra.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        }
+    } else {
+        0
+    };
+    unsafe {
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+    }
+    if lines == 0 {
+        return Err(Error::Other(anyhow::anyhow!("scaled screen capture failed")));
+    }
+    let mut rgb = Vec::with_capacity((target_width as usize) * (target_height as usize) * 3);
+    for px in bgra.chunks_exact(4) {
+        rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    image::RgbImage::from_raw(target_width as u32, target_height as u32, rgb)
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("invalid scaled RGB buffer")))
+}
+
+#[cfg(windows)]
 struct H264Session {
     encoder: openh264::encoder::Encoder,
     width: u32,
@@ -2698,13 +2792,15 @@ struct H264Session {
 impl H264Session {
     fn new(width: u32, height: u32) -> Result<Self> {
         use openh264::encoder::{
-            BitRate, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+            BitRate, Complexity, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+            UsageType,
         };
         let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(2_000_000))
+            .bitrate(BitRate::from_bps(4_000_000))
             .max_frame_rate(FrameRate::from_hz(15.0))
             .rate_control_mode(RateControlMode::Bitrate)
             .usage_type(UsageType::ScreenContentRealTime)
+            .complexity(Complexity::Low)
             .intra_frame_period(IntraFramePeriod::from_num_frames(30))
             .skip_frames(false)
             .num_threads(0);
@@ -3405,10 +3501,14 @@ async fn assist_ws_loop(
             }
             force_counter = force_counter.wrapping_add(1);
             if cap_codec.load(Ordering::Relaxed) == 1 {
-                let rgb = tokio::task::spawn_blocking(capture_virtual_rgb).await;
+                let frame_started = std::time::Instant::now();
+                let rgb = tokio::task::spawn_blocking(|| {
+                    capture_virtual_rgb_scaled(1920, 1080).map(|image| (1920u32, 1080u32, image))
+                })
+                .await;
                 if let Ok(Ok((_sw, _sh, rgb))) = rgb {
                     if h264.is_none() {
-                        h264 = H264Session::new(1280, 720).ok();
+                        h264 = H264Session::new(1920, 1080).ok();
                     }
                     if let Some(session) = h264.as_mut()
                         && let Ok((payload, keyframe, avcc, codec)) = session.encode(&rgb)
@@ -3441,7 +3541,10 @@ async fn assist_ws_loop(
                         let _ = frame_tx.try_send(AssistOut::Binary(packet));
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(66)).await;
+                let elapsed = frame_started.elapsed().as_millis() as u64;
+                if elapsed < 66 {
+                    tokio::time::sleep(std::time::Duration::from_millis(66 - elapsed)).await;
+                }
                 continue;
             }
             let force = force_counter % 30 == 0;
