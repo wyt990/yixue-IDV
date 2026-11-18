@@ -2605,6 +2605,223 @@ fn changed_ratio_x(min_x: usize, max_x: usize, min_y: usize, max_y: usize) -> f6
 }
 
 #[cfg(windows)]
+fn capture_virtual_rgb() -> Result<(u32, u32, image::RgbImage)> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BITMAPINFO, BI_RGB, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err(Error::Other(anyhow::anyhow!("invalid screen size")));
+    }
+    let screen = unsafe { GetDC(std::ptr::null_mut()) };
+    if screen.is_null() {
+        return Err(Error::Other(anyhow::anyhow!("GetDC failed")));
+    }
+    let mem = unsafe { CreateCompatibleDC(screen) };
+    let bmp = unsafe { CreateCompatibleBitmap(screen, width, height) };
+    if mem.is_null() || bmp.is_null() {
+        unsafe {
+            if !bmp.is_null() {
+                DeleteObject(bmp);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+        return Err(Error::Other(anyhow::anyhow!("GDI bitmap creation failed")));
+    }
+    let old = unsafe { SelectObject(mem, bmp) };
+    let blt = unsafe { BitBlt(mem, 0, 0, width, height, screen, vx, vy, SRCCOPY) };
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader.biSize = std::mem::size_of_val(&bmi.bmiHeader) as u32;
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
+    let lines = if blt != 0 {
+        unsafe {
+            GetDIBits(
+                mem,
+                bmp,
+                0,
+                height as u32,
+                bgra.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        }
+    } else {
+        0
+    };
+    unsafe {
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+    }
+    if lines == 0 {
+        return Err(Error::Other(anyhow::anyhow!("screen capture failed")));
+    }
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for px in bgra.chunks_exact(4) {
+        rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    let image = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("invalid RGB buffer")))?;
+    Ok((width as u32, height as u32, image))
+}
+
+#[cfg(windows)]
+struct H264Session {
+    encoder: openh264::encoder::Encoder,
+    width: u32,
+    height: u32,
+    timestamp_ms: u64,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    avcc_sent: bool,
+}
+
+#[cfg(windows)]
+impl H264Session {
+    fn new(width: u32, height: u32) -> Result<Self> {
+        use openh264::encoder::{
+            BitRate, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+        };
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(2_000_000))
+            .max_frame_rate(FrameRate::from_hz(15.0))
+            .rate_control_mode(RateControlMode::Bitrate)
+            .usage_type(UsageType::ScreenContentRealTime)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(30))
+            .skip_frames(false)
+            .num_threads(0);
+        let encoder = openh264::encoder::Encoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            config,
+        )
+        .map_err(|e| Error::Other(anyhow::anyhow!("openh264: {e}")))?;
+        Ok(Self {
+            encoder,
+            width,
+            height,
+            timestamp_ms: 0,
+            sps: None,
+            pps: None,
+            avcc_sent: false,
+        })
+    }
+
+    fn encode(
+        &mut self,
+        rgb: &image::RgbImage,
+    ) -> Result<(Vec<u8>, bool, Option<Vec<u8>>, Option<String>)> {
+        use openh264::encoder::FrameType;
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        let resized = if rgb.width() != self.width || rgb.height() != self.height {
+            image::imageops::resize(
+                rgb,
+                self.width,
+                self.height,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            rgb.clone()
+        };
+        let source = RgbSliceU8::new(
+            resized.as_raw(),
+            (self.width as usize, self.height as usize),
+        );
+        let yuv = YUVBuffer::from_rgb8_source(source);
+        let timestamp = openh264::Timestamp::from_millis(self.timestamp_ms);
+        self.timestamp_ms = self.timestamp_ms.saturating_add(66);
+        let encoded = self
+            .encoder
+            .encode_at(&yuv, timestamp)
+            .map_err(|e| Error::Other(anyhow::anyhow!("openh264 encode: {e}")))?;
+        let keyframe = matches!(encoded.frame_type(), FrameType::IDR);
+        let mut out = Vec::new();
+        for l in 0..encoded.num_layers() {
+            let Some(layer) = encoded.layer(l) else {
+                continue;
+            };
+            for i in 0..layer.nal_count() {
+                if let Some(nal) = layer.nal_unit(i) {
+                    let nal = strip_h264_start_code(nal);
+                    if nal.is_empty() {
+                        continue;
+                    }
+                    let nal_type = nal[0] & 0x1f;
+                    if nal_type == 7 {
+                        self.sps = Some(nal.to_vec());
+                    } else if nal_type == 8 {
+                        self.pps = Some(nal.to_vec());
+                    }
+                    // AVCC: 4-byte big-endian length followed by NAL bytes.
+                    out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                    out.extend_from_slice(nal);
+                }
+            }
+        }
+        let mut avcc = None;
+        let mut codec = None;
+        if keyframe
+            && let (Some(sps), Some(pps)) = (&self.sps, &self.pps)
+        {
+            avcc = Some(build_avcc(sps, pps));
+            codec = Some(format!(
+                "avc1.{:02X}{:02X}{:02X}",
+                sps.get(1).copied().unwrap_or(0x42),
+                sps.get(2).copied().unwrap_or(0xE0),
+                sps.get(3).copied().unwrap_or(0x1E)
+            ));
+            self.avcc_sent = true;
+        }
+        Ok((out, keyframe, avcc, codec))
+    }
+}
+
+#[cfg(windows)]
+fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(1u8);
+    out.push(sps.get(1).copied().unwrap_or(0x42));
+    out.push(sps.get(2).copied().unwrap_or(0xE0));
+    out.push(sps.get(3).copied().unwrap_or(0x1E));
+    out.push(0xFFu8);
+    out.push(0xE1u8);
+    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(1u8);
+    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
+    out
+}
+
+#[cfg(windows)]
+fn strip_h264_start_code(nal: &[u8]) -> &[u8] {
+    if nal.starts_with(&[0, 0, 0, 1]) {
+        &nal[4..]
+    } else if nal.starts_with(&[0, 0, 1]) {
+        &nal[3..]
+    } else {
+        nal
+    }
+}
+
+#[cfg(windows)]
 fn capture_screen_jpeg(max_width: u32, quality: u8) -> Result<Vec<u8>> {
     use windows_sys::Win32::Graphics::Gdi::{
         BITMAPINFO, BI_RGB, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
@@ -3094,6 +3311,13 @@ fn launch_assist_helper(
     launch_as_user(&cmd)
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+enum AssistOut {
+    Binary(Vec<u8>),
+    Text(String),
+}
+
 static ASSIST_HELPER_SESSION: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);
 
 fn stop_assist_helper() {
@@ -3162,21 +3386,64 @@ async fn assist_ws_loop(
     .map_err(|_| anyhow::anyhow!("assist websocket connect timeout"))??;
     let (mut sink, mut incoming) = stream.split();
 
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<AssistOut>(2);
     let quality = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(60));
     let frame_interval = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100));
+    let codec_mode = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cap_codec = codec_mode.clone();
     let cap_stop = stop.clone();
     let cap_quality = quality.clone();
     let cap_interval = frame_interval.clone();
     tokio::spawn(async move {
         let mut seq = 0u32;
         let capture = std::sync::Arc::new(std::sync::Mutex::new(AssistDirtyCapture::default()));
+        let mut h264: Option<H264Session> = None;
         let mut force_counter = 0u32;
         loop {
             if cap_stop.load(Ordering::SeqCst) {
                 break;
             }
             force_counter = force_counter.wrapping_add(1);
+            if cap_codec.load(Ordering::Relaxed) == 1 {
+                let rgb = tokio::task::spawn_blocking(capture_virtual_rgb).await;
+                if let Ok(Ok((_sw, _sh, rgb))) = rgb {
+                    if h264.is_none() {
+                        h264 = H264Session::new(1280, 720).ok();
+                    }
+                    if let Some(session) = h264.as_mut()
+                        && let Ok((payload, keyframe, avcc, codec)) = session.encode(&rgb)
+                    {
+                        if let (Some(avcc), Some(codec)) = (avcc, codec) {
+                            let config = serde_json::json!({
+                                "type": "h264_config",
+                                "codec": codec,
+                                "width": session.width,
+                                "height": session.height,
+                                "description": hex::encode(avcc),
+                            })
+                            .to_string();
+                            let _ = frame_tx.try_send(AssistOut::Text(config));
+                        }
+                        let mut packet = Vec::with_capacity(24 + payload.len());
+                        packet.extend_from_slice(b"IDVF");
+                        packet.extend_from_slice(&3u16.to_le_bytes());
+                        packet.extend_from_slice(&(if keyframe { 1u16 } else { 0u16 }).to_le_bytes());
+                        packet.extend_from_slice(&seq.to_le_bytes());
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        packet.extend_from_slice(&ts.to_le_bytes());
+                        packet.extend_from_slice(&(session.width as u16).to_le_bytes());
+                        packet.extend_from_slice(&(session.height as u16).to_le_bytes());
+                        packet.extend_from_slice(&payload);
+                        seq = seq.wrapping_add(1);
+                        let _ = frame_tx.try_send(AssistOut::Binary(packet));
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(66)).await;
+                continue;
+            }
             let force = force_counter % 30 == 0;
             let q = cap_quality.load(Ordering::Relaxed).clamp(30, 80) as u8;
             let capture_task = capture.clone();
@@ -3200,9 +3467,7 @@ async fn assist_ws_loop(
                 packet.extend_from_slice(&(frame.height as u16).to_le_bytes());
                 packet.extend_from_slice(&frame.jpeg);
                 seq = seq.wrapping_add(1);
-                if frame_tx.try_send(packet).is_err() {
-                    // Slow link: drop rather than queueing stale frames.
-                }
+                let _ = frame_tx.try_send(AssistOut::Binary(packet));
             }
             let interval = cap_interval.load(Ordering::Relaxed).clamp(66, 250);
             tokio::time::sleep(std::time::Duration::from_millis(interval as u64)).await;
@@ -3222,7 +3487,11 @@ async fn assist_ws_loop(
         tokio::select! {
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else { break };
-                if sink.send(WsMessage::Binary(frame.into())).await.is_err() {
+                let msg = match frame {
+                    AssistOut::Binary(bytes) => WsMessage::Binary(bytes.into()),
+                    AssistOut::Text(text) => WsMessage::Text(text.into()),
+                };
+                if sink.send(msg).await.is_err() {
                     break;
                 }
             }
@@ -3275,6 +3544,10 @@ async fn assist_ws_loop(
                 };
                 let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ty {
+                    "codec" => {
+                        let codec = value.get("codec").and_then(|v| v.as_str()).unwrap_or("jpeg");
+                        codec_mode.store(if codec == "h264" { 1 } else { 0 }, Ordering::Relaxed);
+                    }
                     "ping" => {
                         let t = value.get("t").cloned().unwrap_or(serde_json::Value::Null);
                         let msg = serde_json::json!({"type":"pong","t":t}).to_string();

@@ -60,6 +60,8 @@ export function AssistStage({
   const moveTimer = useRef<number | undefined>(undefined);
   const lastRtt = useRef(0);
   const frameCounter = useRef({ at: Date.now(), frames: 0 });
+  const h264Decoder = useRef<VideoDecoder | null>(null);
+  const h264Seq = useRef(0);
   const downloads = useRef(
     new Map<string, { name: string; chunks: Uint8Array[] }>(),
   );
@@ -128,8 +130,74 @@ export function AssistStage({
             name?: string;
             data?: string;
             message?: string;
+            codec?: string;
+            description?: string;
+            width?: number;
+            height?: number;
           };
           if (m.type === "clipboard" && typeof m.text === "string") setClipboard(m.text);
+          if (
+            m.type === "h264_config" &&
+            typeof m.codec === "string" &&
+            typeof m.description === "string"
+          ) {
+            const bytes = new Uint8Array(m.description.length / 2);
+            for (let i = 0; i < bytes.length; i++) {
+              bytes[i] = parseInt(m.description.slice(i * 2, i * 2 + 2), 16);
+            }
+            h264Decoder.current?.close();
+            try {
+              const decoder = new VideoDecoder({
+                output: (frame) => {
+                  const canvas = canvasRef.current;
+                  if (canvas) {
+                    if (m.width && m.height && (canvas.width !== m.width || canvas.height !== m.height)) {
+                      canvas.width = m.width;
+                      canvas.height = m.height;
+                    }
+                    canvas.getContext("2d")?.drawImage(frame, 0, 0);
+                  }
+                  frame.close();
+                  h264Seq.current += 1;
+                  frameCounter.current.frames += 1;
+                  if (wsRef.current?.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(
+                      JSON.stringify({
+                        type: "ack",
+                        seq: h264Seq.current,
+                        rtt: lastRtt.current,
+                      }),
+                    );
+                  }
+                  const now = Date.now();
+                  if (now - frameCounter.current.at >= 1000) {
+                    const fps = Math.round(
+                      (frameCounter.current.frames * 1000) / (now - frameCounter.current.at),
+                    );
+                    frameCounter.current = { at: now, frames: 0 };
+                    setStreamStats((s) => ({ ...s, fps }));
+                  }
+                },
+                error: () => {
+                  h264Decoder.current = null;
+                  if (wsRef.current?.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(JSON.stringify({ type: "codec", codec: "jpeg" }));
+                  }
+                },
+              });
+              decoder.configure({
+                codec: m.codec,
+                description: bytes,
+                optimizeForLatency: true,
+              });
+              h264Decoder.current = decoder;
+            } catch {
+              h264Decoder.current = null;
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({ type: "codec", codec: "jpeg" }));
+              }
+            }
+          }
           if (m.type === "pong" && typeof (m as { t?: number }).t === "number") {
             const t = (m as { t: number }).t;
             lastRtt.current = Math.max(0, Math.round(performance.now() - t));
@@ -172,7 +240,7 @@ export function AssistStage({
         return;
       }
       const buf = ev.data as ArrayBuffer;
-      if (buf.byteLength <= 32) return;
+      if (buf.byteLength <= 24) return;
       const dv = new DataView(buf);
       if (
         dv.getUint8(0) !== 0x49 ||
@@ -185,6 +253,24 @@ export function AssistStage({
       const version = dv.getUint16(4, true);
       const flags = dv.getUint16(6, true);
       const seq = dv.getUint32(8, true);
+      if (version === 3) {
+        const decoder = h264Decoder.current;
+        if (!decoder || decoder.state !== "configured") return;
+        h264Seq.current = seq;
+        try {
+          decoder.decode(
+            new EncodedVideoChunk({
+              type: (flags & 1) !== 0 ? "key" : "delta",
+              timestamp: Number(dv.getBigUint64(12, true)) * 1000,
+              data: buf.slice(24),
+            }),
+          );
+        } catch {
+          h264Decoder.current = null;
+          wsRef.current?.send(JSON.stringify({ type: "codec", codec: "jpeg" }));
+        }
+        return;
+      }
       let screenWidth = 0;
       let screenHeight = 0;
       let x = 0;
@@ -239,6 +325,13 @@ export function AssistStage({
     };
     ws.onclose = () => {
       if (wsRef.current === ws) wsRef.current = null;
+      h264Decoder.current?.close();
+      h264Decoder.current = null;
+    };
+    ws.onopen = () => {
+      if ("VideoDecoder" in window) {
+        ws.send(JSON.stringify({ type: "codec", codec: "h264" }));
+      }
     };
     const pingTimer = window.setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
