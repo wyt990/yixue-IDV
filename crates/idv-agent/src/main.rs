@@ -2828,6 +2828,11 @@ fn launch_as_user(cmd: &str) -> anyhow::Result<u32> {
     let mut cmdline: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // The helper is a console binary launched in the user session. Without
+    // these flags Windows creates a visible console window on the teacher's
+    // desktop; it also covers the screen being captured.
+    si.dwFlags = 0x0000_0001; // STARTF_USESHOWWINDOW
+    si.wShowWindow = 0; // SW_HIDE
     // Explicit desktop: otherwise a helper launched from Session 0 may inherit
     // the service desktop, making CopyFromScreen/clipboard/input fail.
     let desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
@@ -2841,7 +2846,8 @@ fn launch_as_user(cmd: &str) -> anyhow::Result<u32> {
             std::ptr::null(),
             std::ptr::null(),
             0,
-            CREATE_UNICODE_ENVIRONMENT,
+            // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+            0x0800_0000 | CREATE_UNICODE_ENVIRONMENT,
             env,
             std::ptr::null(),
             &mut si,
