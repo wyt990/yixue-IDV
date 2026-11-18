@@ -52,7 +52,7 @@ export function AssistStage({
   const [entries, setEntries] = useState<Entry[]>([]);
   const [fsBusy, setFsBusy] = useState(false);
   const [attempt, setAttempt] = useState(0);
-  const [streamStats, setStreamStats] = useState({ fps: 0, rtt: 0 });
+  const [streamStats, setStreamStats] = useState({ fps: 0, rtt: 0, codec: "JPEG" });
   const sessionId = useRef("");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -191,8 +191,10 @@ export function AssistStage({
                 optimizeForLatency: true,
               });
               h264Decoder.current = decoder;
+              setStreamStats((s) => ({ ...s, codec: "H.264" }));
             } catch {
               h264Decoder.current = null;
+              setStreamStats((s) => ({ ...s, codec: "JPEG" }));
               if (wsRef.current?.readyState === WebSocket.OPEN) {
                 wsRef.current.send(JSON.stringify({ type: "codec", codec: "jpeg" }));
               }
@@ -525,7 +527,7 @@ export function AssistStage({
         <span className="mono muted">{peer?.last_ip || mac}</span>
         <span className="tag">{assist ? "协助" : "观察"}</span>
         <span className="muted">
-          {streamStats.fps} fps · {streamStats.rtt} ms
+          {streamStats.codec} · {streamStats.fps} fps · {streamStats.rtt} ms
         </span>
         {session ? (
           <span className="muted">
