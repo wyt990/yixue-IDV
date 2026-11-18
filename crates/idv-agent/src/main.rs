@@ -2431,6 +2431,180 @@ async fn execute_agent_command(
 }
 
 #[cfg(windows)]
+struct AssistFrame {
+    screen_width: u32,
+    screen_height: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    jpeg: Vec<u8>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct AssistDirtyCapture {
+    previous_thumb: Option<Vec<u8>>,
+}
+
+#[cfg(windows)]
+impl AssistDirtyCapture {
+    fn capture(&mut self, quality: u8, force_full: bool) -> Result<Option<AssistFrame>> {
+        use windows_sys::Win32::Graphics::Gdi::{
+            BITMAPINFO, BI_RGB, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
+            DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if width <= 0 || height <= 0 {
+            return Ok(None);
+        }
+        let screen = unsafe { GetDC(std::ptr::null_mut()) };
+        if screen.is_null() {
+            return Err(Error::Other(anyhow::anyhow!("GetDC failed")));
+        }
+        let mem = unsafe { CreateCompatibleDC(screen) };
+        let bmp = unsafe { CreateCompatibleBitmap(screen, width, height) };
+        if mem.is_null() || bmp.is_null() {
+            unsafe {
+                if !bmp.is_null() {
+                    DeleteObject(bmp);
+                }
+                if !mem.is_null() {
+                    DeleteDC(mem);
+                }
+                ReleaseDC(std::ptr::null_mut(), screen);
+            }
+            return Err(Error::Other(anyhow::anyhow!("GDI bitmap creation failed")));
+        }
+        let old = unsafe { SelectObject(mem, bmp) };
+        let blt = unsafe { BitBlt(mem, 0, 0, width, height, screen, vx, vy, SRCCOPY) };
+        let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+        bmi.bmiHeader.biSize = std::mem::size_of_val(&bmi.bmiHeader) as u32;
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
+        let lines = if blt != 0 {
+            unsafe {
+                GetDIBits(
+                    mem,
+                    bmp,
+                    0,
+                    height as u32,
+                    bgra.as_mut_ptr() as *mut core::ffi::c_void,
+                    &mut bmi,
+                    DIB_RGB_COLORS,
+                )
+            }
+        } else {
+            0
+        };
+        unsafe {
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
+        if lines == 0 {
+            return Err(Error::Other(anyhow::anyhow!("screen capture failed")));
+        }
+        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for px in bgra.chunks_exact(4) {
+            rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+        }
+        let full = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("invalid RGB buffer")))?;
+        let thumb = image::imageops::resize(
+            &full,
+            160,
+            90,
+            image::imageops::FilterType::Triangle,
+        );
+        let thumb_bytes = thumb.as_raw().clone();
+        let mut changed = false;
+        let mut min_x = 160usize;
+        let mut min_y = 90usize;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        if let Some(prev) = &self.previous_thumb {
+            for y in 0..90 {
+                for x in 0..160 {
+                    let i = (y * 160 + x) * 3;
+                    let diff = prev[i].abs_diff(thumb_bytes[i])
+                        + prev[i + 1].abs_diff(thumb_bytes[i + 1])
+                        + prev[i + 2].abs_diff(thumb_bytes[i + 2]);
+                    if diff > 24 {
+                        changed = true;
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+        }
+        if !changed && !force_full {
+            self.previous_thumb = Some(thumb_bytes);
+            return Ok(None);
+        }
+        let full_frame = force_full || self.previous_thumb.is_none() || changed_ratio_x(min_x, max_x, min_y, max_y) > 0.30;
+        let (x0, y0, w0, h0) = if full_frame {
+            (0, 0, width as u32, height as u32)
+        } else {
+            let pad_x = 4usize;
+            let pad_y = 4usize;
+            let x0 = min_x.saturating_sub(pad_x);
+            let y0 = min_y.saturating_sub(pad_y);
+            let x1 = (max_x + pad_x + 1).min(160);
+            let y1 = (max_y + pad_y + 1).min(90);
+            let sx = width as usize;
+            let sy = height as usize;
+            (
+                (x0 * sx / 160) as u32,
+                (y0 * sy / 90) as u32,
+                (((x1 - x0) * sx / 160) as u32).max(1),
+                (((y1 - y0) * sy / 90) as u32).max(1),
+            )
+        };
+        let w0 = w0.min(width as u32);
+        let h0 = h0.min(height as u32);
+        let crop = image::imageops::crop_imm(&full, x0, y0, w0, h0).to_image();
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+        encoder
+            .encode_image(&crop)
+            .map_err(|e| Error::Other(anyhow::anyhow!("jpeg encode: {e}")))?;
+        self.previous_thumb = Some(thumb_bytes);
+        Ok(Some(AssistFrame {
+            screen_width: width as u32,
+            screen_height: height as u32,
+            x: x0,
+            y: y0,
+            width: w0,
+            height: h0,
+            jpeg: out,
+        }))
+    }
+}
+
+#[cfg(windows)]
+fn changed_ratio_x(min_x: usize, max_x: usize, min_y: usize, max_y: usize) -> f64 {
+    let w = max_x.saturating_sub(min_x) + 1;
+    let h = max_y.saturating_sub(min_y) + 1;
+    (w * h) as f64 / (160.0 * 90.0)
+}
+
+#[cfg(windows)]
 fn capture_screen_jpeg(max_width: u32, quality: u8) -> Result<Vec<u8>> {
     use windows_sys::Win32::Graphics::Gdi::{
         BITMAPINFO, BI_RGB, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
@@ -2710,17 +2884,22 @@ fn assist_input(value: &serde_json::Value) -> Result<()> {
         MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
         keybd_event, mouse_event,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SetCursorPos};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
 
     let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match ty {
         "mouse_move" => {
             let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let w = unsafe { GetSystemMetrics(0) }.max(1);
-            let h = unsafe { GetSystemMetrics(1) }.max(1);
-            let px = ((x.clamp(0.0, 1.0)) * w as f64) as i32;
-            let py = ((y.clamp(0.0, 1.0)) * h as f64) as i32;
+            let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+            let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+            let w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+            let h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+            let px = vx + ((x.clamp(0.0, 1.0)) * w as f64) as i32;
+            let py = vy + ((y.clamp(0.0, 1.0)) * h as f64) as i32;
             unsafe {
                 SetCursorPos(px, py);
             }
@@ -2984,32 +3163,49 @@ async fn assist_ws_loop(
     let (mut sink, mut incoming) = stream.split();
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let quality = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(60));
+    let frame_interval = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100));
     let cap_stop = stop.clone();
+    let cap_quality = quality.clone();
+    let cap_interval = frame_interval.clone();
     tokio::spawn(async move {
         let mut seq = 0u32;
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(AssistDirtyCapture::default()));
+        let mut force_counter = 0u32;
         loop {
             if cap_stop.load(Ordering::SeqCst) {
                 break;
             }
-            let frame = tokio::task::spawn_blocking(|| capture_screen_jpeg(1280, 58)).await;
-            if let Ok(Ok(jpeg)) = frame {
-                let mut packet = Vec::with_capacity(20 + jpeg.len());
+            force_counter = force_counter.wrapping_add(1);
+            let force = force_counter % 30 == 0;
+            let q = cap_quality.load(Ordering::Relaxed).clamp(30, 80) as u8;
+            let capture_task = capture.clone();
+            let captured = tokio::task::spawn_blocking(move || capture_task.lock().unwrap().capture(q, force)).await;
+            if let Ok(Ok(Some(frame))) = captured {
+                let mut packet = Vec::with_capacity(32 + frame.jpeg.len());
                 packet.extend_from_slice(b"IDVF");
-                packet.extend_from_slice(&1u16.to_le_bytes());
-                packet.extend_from_slice(&1u16.to_le_bytes()); // keyframe
+                packet.extend_from_slice(&2u16.to_le_bytes());
+                packet.extend_from_slice(&(if force { 1u16 } else { 0u16 }).to_le_bytes());
                 packet.extend_from_slice(&seq.to_le_bytes());
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 packet.extend_from_slice(&ts.to_le_bytes());
-                packet.extend_from_slice(&jpeg);
+                packet.extend_from_slice(&(frame.screen_width as u16).to_le_bytes());
+                packet.extend_from_slice(&(frame.screen_height as u16).to_le_bytes());
+                packet.extend_from_slice(&(frame.x as u16).to_le_bytes());
+                packet.extend_from_slice(&(frame.y as u16).to_le_bytes());
+                packet.extend_from_slice(&(frame.width as u16).to_le_bytes());
+                packet.extend_from_slice(&(frame.height as u16).to_le_bytes());
+                packet.extend_from_slice(&frame.jpeg);
                 seq = seq.wrapping_add(1);
                 if frame_tx.try_send(packet).is_err() {
-                    // Slow network: drop this frame rather than building latency.
+                    // Slow link: drop rather than queueing stale frames.
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let interval = cap_interval.load(Ordering::Relaxed).clamp(66, 250);
+            tokio::time::sleep(std::time::Duration::from_millis(interval as u64)).await;
         }
     });
 
@@ -3079,6 +3275,24 @@ async fn assist_ws_loop(
                 };
                 let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ty {
+                    "ping" => {
+                        let t = value.get("t").cloned().unwrap_or(serde_json::Value::Null);
+                        let msg = serde_json::json!({"type":"pong","t":t}).to_string();
+                        let _ = sink.send(WsMessage::Text(msg.into())).await;
+                    }
+                    "ack" => {
+                        let rtt = value.get("rtt").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let q = quality.load(Ordering::Relaxed);
+                        let interval = frame_interval.load(Ordering::Relaxed);
+                        if rtt > 250 {
+                            quality.store(q.saturating_sub(5).max(30), Ordering::Relaxed);
+                            frame_interval.store((interval + 20).min(250), Ordering::Relaxed);
+                        } else if rtt > 0 && rtt < 90 {
+                            quality.store((q + 1).min(75), Ordering::Relaxed);
+                            frame_interval
+                                .store(interval.saturating_sub(2).max(66), Ordering::Relaxed);
+                        }
+                    }
                     "input" => {
                         if let Some(event) = value.get("event") {
                             let _ = assist_input(event);
@@ -3374,6 +3588,10 @@ async fn run_assist_helper(
     kind: &str,
     frame_ms: u64,
 ) -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+    }
     let state_dir = assist_user_dir().join(session_id);
     tokio::fs::create_dir_all(&state_dir).await.map_err(|e| {
         Error::Other(anyhow::anyhow!(

@@ -52,11 +52,14 @@ export function AssistStage({
   const [entries, setEntries] = useState<Entry[]>([]);
   const [fsBusy, setFsBusy] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const [streamStats, setStreamStats] = useState({ fps: 0, rtt: 0 });
   const sessionId = useRef("");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
   const moveTimer = useRef<number | undefined>(undefined);
+  const lastRtt = useRef(0);
+  const frameCounter = useRef({ at: Date.now(), frames: 0 });
   const downloads = useRef(
     new Map<string, { name: string; chunks: Uint8Array[] }>(),
   );
@@ -127,6 +130,11 @@ export function AssistStage({
             message?: string;
           };
           if (m.type === "clipboard" && typeof m.text === "string") setClipboard(m.text);
+          if (m.type === "pong" && typeof (m as { t?: number }).t === "number") {
+            const t = (m as { t: number }).t;
+            lastRtt.current = Math.max(0, Math.round(performance.now() - t));
+            setStreamStats((s) => ({ ...s, rtt: lastRtt.current }));
+          }
           if (m.type === "file_begin" && m.id) {
             downloads.current.set(m.id, { name: m.name || "download", chunks: [] });
           }
@@ -164,7 +172,7 @@ export function AssistStage({
         return;
       }
       const buf = ev.data as ArrayBuffer;
-      if (buf.byteLength <= 20) return;
+      if (buf.byteLength <= 32) return;
       const dv = new DataView(buf);
       if (
         dv.getUint8(0) !== 0x49 ||
@@ -174,22 +182,71 @@ export function AssistStage({
       ) {
         return;
       }
+      const version = dv.getUint16(4, true);
+      const flags = dv.getUint16(6, true);
+      const seq = dv.getUint32(8, true);
+      let screenWidth = 0;
+      let screenHeight = 0;
+      let x = 0;
+      let y = 0;
+      let width = 0;
+      let height = 0;
+      let payloadOffset = 20;
+      if (version >= 2 && buf.byteLength > 32) {
+        screenWidth = dv.getUint16(20, true);
+        screenHeight = dv.getUint16(22, true);
+        x = dv.getUint16(24, true);
+        y = dv.getUint16(26, true);
+        width = dv.getUint16(28, true);
+        height = dv.getUint16(30, true);
+        payloadOffset = 32;
+      }
       const bitmap = await createImageBitmap(
-        new Blob([buf.slice(20)], { type: "image/jpeg" }),
+        new Blob([buf.slice(payloadOffset)], { type: "image/jpeg" }),
       );
       const canvas = canvasRef.current;
       if (canvas) {
-        if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
-        if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+        const nextWidth = screenWidth || bitmap.width;
+        const nextHeight = screenHeight || bitmap.height;
+        if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+          canvas.width = nextWidth;
+          canvas.height = nextHeight;
+        }
         const ctx = canvas.getContext("2d");
-        ctx?.drawImage(bitmap, 0, 0);
+        if (ctx) {
+          if (version < 2 || (flags & 1) !== 0) ctx.clearRect(0, 0, nextWidth, nextHeight);
+          if (version >= 2) {
+            ctx.drawImage(bitmap, x, y, width || bitmap.width, height || bitmap.height);
+          } else {
+            ctx.drawImage(bitmap, 0, 0);
+          }
+        }
       }
       bitmap.close();
+      frameCounter.current.frames += 1;
+      const now = Date.now();
+      if (now - frameCounter.current.at >= 1000) {
+        const fps = Math.round(
+          (frameCounter.current.frames * 1000) / (now - frameCounter.current.at),
+        );
+        frameCounter.current = { at: now, frames: 0 };
+        setStreamStats((s) => ({ ...s, fps }));
+      }
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "ack", seq, rtt: lastRtt.current }));
+      }
     };
     ws.onclose = () => {
       if (wsRef.current === ws) wsRef.current = null;
     };
+    const pingTimer = window.setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "ping", t: performance.now() }));
+      }
+    }, 2000);
     return () => {
+      window.clearInterval(pingTimer);
       if (wsRef.current === ws) wsRef.current = null;
       ws.close();
     };
@@ -374,6 +431,9 @@ export function AssistStage({
         <strong>{peer?.name || mac}</strong>
         <span className="mono muted">{peer?.last_ip || mac}</span>
         <span className="tag">{assist ? "协助" : "观察"}</span>
+        <span className="muted">
+          {streamStats.fps} fps · {streamStats.rtt} ms
+        </span>
         {session ? (
           <span className="muted">
             {session.state}
