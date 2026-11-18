@@ -2547,6 +2547,39 @@ fn run_powershell_command(script: &str) -> Result<std::process::Output> {
         .map_err(|e| Error::Other(anyhow::anyhow!("powershell: {e}")))
 }
 
+#[cfg(windows)]
+fn get_clipboard_text() -> Result<String> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Ok(String::new());
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT as u32);
+        if handle.is_null() {
+            CloseClipboard();
+            return Ok(String::new());
+        }
+        let ptr = GlobalLock(handle as _);
+        if ptr.is_null() {
+            CloseClipboard();
+            return Ok(String::new());
+        }
+        let bytes = GlobalSize(handle as _) as usize;
+        let units = std::slice::from_raw_parts(ptr as *const u16, bytes / 2);
+        let len = units.iter().position(|c| *c == 0).unwrap_or(units.len());
+        let text = String::from_utf16_lossy(&units[..len]);
+        GlobalUnlock(handle as _);
+        CloseClipboard();
+        Ok(text)
+    }
+}
+
+#[cfg(not(windows))]
 fn get_clipboard_text() -> Result<String> {
     let out = run_powershell_command("[Console]::Out.Write((Get-Clipboard -Raw))")?;
     if !out.status.success() {
@@ -2570,6 +2603,46 @@ fn assist_user_dir() -> PathBuf {
         .join("assist")
 }
 
+#[cfg(windows)]
+fn set_clipboard_text(text: &str) -> Result<()> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0);
+    let bytes = utf16.len() * 2;
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err(Error::Other(anyhow::anyhow!("OpenClipboard failed")));
+        }
+        EmptyClipboard();
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if handle.is_null() {
+            CloseClipboard();
+            return Err(Error::Other(anyhow::anyhow!("GlobalAlloc failed")));
+        }
+        let ptr = GlobalLock(handle);
+        if ptr.is_null() {
+            CloseClipboard();
+            return Err(Error::Other(anyhow::anyhow!("GlobalLock failed")));
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr() as *const u8, ptr as *mut u8, bytes);
+        GlobalUnlock(handle);
+        if SetClipboardData(CF_UNICODETEXT as u32, handle) == std::ptr::null_mut() {
+            CloseClipboard();
+            return Err(Error::Other(anyhow::anyhow!("SetClipboardData failed")));
+        }
+        CloseClipboard();
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn set_clipboard_text(text: &str) -> Result<()> {
     let dir = assist_user_dir();
     std::fs::create_dir_all(&dir).map_err(Error::Io)?;
@@ -2875,6 +2948,224 @@ async fn assist_session_state(center: &str, session_id: &str) -> Option<String> 
 }
 
 #[cfg(windows)]
+async fn assist_ws_loop(
+    center: &str,
+    session_id: &str,
+    mac: &str,
+    stop: std::sync::Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let base = center.trim_end_matches('/');
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base.to_string()
+    };
+    let url = format!(
+        "{ws_base}/api/v1/assist/sessions/{session_id}/ws?role=agent&mac={}",
+        urlencoding_lite(mac)
+    );
+    let (stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("assist websocket connect timeout"))??;
+    let (mut sink, mut incoming) = stream.split();
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let cap_stop = stop.clone();
+    tokio::spawn(async move {
+        let mut seq = 0u32;
+        loop {
+            if cap_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let frame = tokio::task::spawn_blocking(|| capture_screen_jpeg(1280, 58)).await;
+            if let Ok(Ok(jpeg)) = frame {
+                let mut packet = Vec::with_capacity(20 + jpeg.len());
+                packet.extend_from_slice(b"IDVF");
+                packet.extend_from_slice(&1u16.to_le_bytes());
+                packet.extend_from_slice(&1u16.to_le_bytes()); // keyframe
+                packet.extend_from_slice(&seq.to_le_bytes());
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                packet.extend_from_slice(&ts.to_le_bytes());
+                packet.extend_from_slice(&jpeg);
+                seq = seq.wrapping_add(1);
+                if frame_tx.try_send(packet).is_err() {
+                    // Slow network: drop this frame rather than building latency.
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    let mut last_clip_seq = unsafe {
+        windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    };
+    let mut last_clip = get_clipboard_text().unwrap_or_default();
+    let mut clip_tick = tokio::time::interval(std::time::Duration::from_millis(300));
+    let mut fs_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut uploads: std::collections::HashMap<String, std::fs::File> = std::collections::HashMap::new();
+    let fs_base = base.to_string();
+
+    loop {
+        tokio::select! {
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else { break };
+                if sink.send(WsMessage::Binary(frame.into())).await.is_err() {
+                    break;
+                }
+            }
+            _ = fs_tick.tick() => {
+                // Keep the existing HTTP file browser working while video,
+                // input and clipboard use the persistent WebSocket.
+                let url = format!("{fs_base}/api/v1/assist/sessions/{session_id}/commands/next?wait=0");
+                if let Ok(resp) = http_client().get(&url).timeout(std::time::Duration::from_secs(2)).send().await
+                    && resp.status().is_success()
+                    && let Ok(Some(cmd)) = resp.json::<Option<serde_json::Value>>().await
+                {
+                    let kind = cmd.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind == "assist_stop" {
+                        break;
+                    }
+                    if kind.starts_with("fs_") {
+                        let payload = cmd.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                            let _ = handle_assist_fs_command(&fs_base, kind, &value).await;
+                        }
+                    }
+                }
+            }
+            _ = clip_tick.tick() => {
+                let seq = unsafe {
+                    windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber()
+                };
+                if seq != last_clip_seq {
+                    last_clip_seq = seq;
+                    if let Ok(Ok(text)) = tokio::task::spawn_blocking(get_clipboard_text).await
+                        && text != last_clip
+                    {
+                        last_clip = text.clone();
+                        let msg = serde_json::json!({"type":"clipboard","text":text}).to_string();
+                        if sink.send(WsMessage::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            msg = incoming.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                let text = match msg {
+                    WsMessage::Text(t) => t.to_string(),
+                    WsMessage::Binary(_) | WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Close(_) | WsMessage::Frame(_) => continue,
+                };
+                let value: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match ty {
+                    "input" => {
+                        if let Some(event) = value.get("event") {
+                            let _ = assist_input(event);
+                        }
+                    }
+                    "clipboard_set" => {
+                        let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Ok(()) = set_clipboard_text(text) {
+                            last_clip = text.to_string();
+                            last_clip_seq = unsafe {
+                                windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber()
+                            };
+                        }
+                    }
+                    "clipboard_get" => {
+                        if let Ok(Ok(text)) = tokio::task::spawn_blocking(get_clipboard_text).await {
+                            last_clip = text.clone();
+                            let msg = serde_json::json!({"type":"clipboard","text":text}).to_string();
+                            let _ = sink.send(WsMessage::Text(msg.into())).await;
+                        }
+                    }
+                    "file_get" => {
+                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        if !id.is_empty() {
+                            if let Ok(bytes) = std::fs::read(path) {
+                                let name = std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                                let begin = serde_json::json!({"type":"file_begin","id":id,"name":name,"size":bytes.len()}).to_string();
+                                let _ = sink.send(WsMessage::Text(begin.into())).await;
+                                for (i, chunk) in bytes.chunks(128 * 1024).enumerate() {
+                                    let msg = serde_json::json!({
+                                        "type":"file_chunk","id":id,"offset":i * 128 * 1024,"data":hex::encode(chunk)
+                                    }).to_string();
+                                    if sink.send(WsMessage::Text(msg.into())).await.is_err() { break; }
+                                }
+                                let end = serde_json::json!({"type":"file_end","id":id}).to_string();
+                                let _ = sink.send(WsMessage::Text(end.into())).await;
+                            } else {
+                                let err = serde_json::json!({"type":"file_error","id":id,"message":"open failed"}).to_string();
+                                let _ = sink.send(WsMessage::Text(err.into())).await;
+                            }
+                        }
+                    }
+                    "file_put_start" => {
+                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        if !id.is_empty() {
+                            match std::fs::File::create(path) {
+                                Ok(file) => {
+                                    uploads.insert(id.clone(), file);
+                                    let _ = sink.send(WsMessage::Text(serde_json::json!({"type":"file_ack","id":id}).to_string().into())).await;
+                                }
+                                Err(_) => {
+                                    let _ = sink.send(WsMessage::Text(serde_json::json!({"type":"file_error","id":id,"message":"create failed"}).to_string().into())).await;
+                                }
+                            }
+                        }
+                    }
+                    "file_chunk" => {
+                        use std::io::Write;
+                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some(data) = value.get("data").and_then(|v| v.as_str())
+                            && let Ok(bytes) = hex::decode(data)
+                            && let Some(file) = uploads.get_mut(id)
+                        {
+                            let _ = file.write_all(&bytes);
+                        }
+                    }
+                    "file_end" => {
+                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        uploads.remove(id);
+                        let _ = sink.send(WsMessage::Text(serde_json::json!({"type":"file_ack","id":id}).to_string().into())).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn assist_ws_loop(
+    _center: &str,
+    _session_id: &str,
+    _mac: &str,
+    _stop: std::sync::Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("assist websocket is only supported on Windows")
+}
+
+#[cfg(windows)]
 async fn assist_frame_loop(
     center: String,
     session_id: String,
@@ -3086,6 +3377,14 @@ async fn run_assist_helper(
     })?;
     assist_helper_ack(center_url, session_id, "accepted", "helper_started").await;
     assist_helper_ack(center_url, session_id, "active", "helper_active").await;
+    #[cfg(windows)]
+    {
+        let ws_stop = std::sync::Arc::new(AtomicBool::new(false));
+        if assist_ws_loop(center_url, session_id, mac, ws_stop).await.is_ok() {
+            return Ok(());
+        }
+        eprintln!("idv-agent: assist websocket unavailable, falling back to HTTP helper");
+    }
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let frame_stop = stop.clone();
     let frame_task = tokio::spawn(assist_frame_loop(

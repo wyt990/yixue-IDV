@@ -148,6 +148,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/assist/sessions/{id}/end", post(remote::end))
         .route(
+            "/api/v1/assist/sessions/{id}/ws",
+            get(remote::ws),
+        )
+        .route(
             "/api/v1/assist/sessions/{id}/frame",
             get(remote::frame_get)
                 .put(remote::frame_put)

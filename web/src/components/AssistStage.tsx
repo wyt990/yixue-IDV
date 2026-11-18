@@ -45,7 +45,6 @@ export function AssistStage({
 }) {
   const msg = useMessage();
   const [session, setSession] = useState<Session | null>(null);
-  const [frameUrl, setFrameUrl] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [clipboard, setClipboard] = useState("");
   const [tool, setTool] = useState<"clip" | "files">("clip");
@@ -54,15 +53,19 @@ export function AssistStage({
   const [fsBusy, setFsBusy] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const sessionId = useRef("");
-  const frameUrlRef = useRef<string | null>(null);
-  const lastMove = useRef(0);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const pendingMove = useRef<{ x: number; y: number } | null>(null);
+  const moveTimer = useRef<number | undefined>(undefined);
+  const downloads = useRef(
+    new Map<string, { name: string; chunks: Uint8Array[] }>(),
+  );
   const assist = mode === "control";
   const peer = peers.find((p) => p.mac === mac);
 
   useEffect(() => {
     let cancelled = false;
     setSession(null);
-    setFrameUrl(null);
     setError("");
     setEntries([]);
     setPath("C:\\");
@@ -89,10 +92,6 @@ export function AssistStage({
       const id = sessionId.current;
       sessionId.current = "";
       if (id) api.remote.end(id).catch(() => {});
-      if (frameUrlRef.current) {
-        URL.revokeObjectURL(frameUrlRef.current);
-        frameUrlRef.current = null;
-      }
     };
   }, [mac, mode, attempt]);
 
@@ -103,10 +102,9 @@ export function AssistStage({
         .get(session.id)
         .then((s) => setSession((prev) => (prev ? { ...prev, ...s } : prev)))
         .catch(() => {});
-      if (!assist) return;
       api.remote
-        .clipboardShow(session.id)
-        .then((r) => setClipboard(r.text))
+        .get(session.id)
+        .then((s) => setSession((prev) => (prev ? { ...prev, ...s } : prev)))
         .catch(() => {});
     }, 2000);
     return () => window.clearInterval(timer);
@@ -114,29 +112,89 @@ export function AssistStage({
 
   useEffect(() => {
     if (!session || session.state === "ended" || session.state === "denied") return;
-    let stopped = false;
-    let timer = 0;
-    const tick = async () => {
-      if (stopped) return;
-      try {
-        const blob = await api.remote.frame(session.id);
-        if (blob && !stopped) {
-          const url = URL.createObjectURL(blob);
-          if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
-          frameUrlRef.current = url;
-          setFrameUrl(url);
+    const ws = new WebSocket(api.remote.wsUrl(session.id));
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+    ws.onmessage = async (ev) => {
+      if (typeof ev.data === "string") {
+        try {
+          const m = JSON.parse(ev.data) as {
+            type?: string;
+            text?: string;
+            id?: string;
+            name?: string;
+            data?: string;
+            message?: string;
+          };
+          if (m.type === "clipboard" && typeof m.text === "string") setClipboard(m.text);
+          if (m.type === "file_begin" && m.id) {
+            downloads.current.set(m.id, { name: m.name || "download", chunks: [] });
+          }
+          if (m.type === "file_chunk" && m.id && m.data) {
+            const item = downloads.current.get(m.id);
+            if (item) {
+              const bytes = new Uint8Array(m.data.length / 2);
+              for (let i = 0; i < bytes.length; i++) {
+                bytes[i] = parseInt(m.data.slice(i * 2, i * 2 + 2), 16);
+              }
+              item.chunks.push(bytes);
+            }
+          }
+          if (m.type === "file_end" && m.id) {
+            const item = downloads.current.get(m.id);
+            downloads.current.delete(m.id);
+            setFsBusy(false);
+            if (item) {
+              const blob = new Blob(item.chunks as BlobPart[]);
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = item.name;
+              a.click();
+              URL.revokeObjectURL(url);
+              msg.success(`已下载 ${item.name}`);
+            }
+          }
+          if (m.type === "file_error") {
+            setError(m.message || "文件传输失败");
+          }
+        } catch {
+          // ignore malformed control message
         }
-      } catch {
-        // Session may still be starting.
+        return;
       }
-      if (!stopped) timer = window.setTimeout(tick, 350);
+      const buf = ev.data as ArrayBuffer;
+      if (buf.byteLength <= 20) return;
+      const dv = new DataView(buf);
+      if (
+        dv.getUint8(0) !== 0x49 ||
+        dv.getUint8(1) !== 0x44 ||
+        dv.getUint8(2) !== 0x56 ||
+        dv.getUint8(3) !== 0x46
+      ) {
+        return;
+      }
+      const bitmap = await createImageBitmap(
+        new Blob([buf.slice(20)], { type: "image/jpeg" }),
+      );
+      const canvas = canvasRef.current;
+      if (canvas) {
+        if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+        if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+        const ctx = canvas.getContext("2d");
+        ctx?.drawImage(bitmap, 0, 0);
+      }
+      bitmap.close();
     };
-    tick();
+    ws.onclose = () => {
+      if (wsRef.current === ws) wsRef.current = null;
+    };
     return () => {
-      stopped = true;
-      window.clearTimeout(timer);
+      if (wsRef.current === ws) wsRef.current = null;
+      ws.close();
     };
   }, [session?.id, session?.state]);
+
 
   async function finish() {
     const id = sessionId.current;
@@ -151,7 +209,7 @@ export function AssistStage({
     onClose();
   }
 
-  function norm(e: MouseEvent<HTMLImageElement>) {
+  function norm(e: MouseEvent<HTMLCanvasElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
     return {
       x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
@@ -159,35 +217,39 @@ export function AssistStage({
     };
   }
 
-  async function sendInput(event: unknown) {
+  function sendInput(event: unknown) {
     if (!session || !assist) return;
-    try {
-      await api.remote.input(session.id, event);
-    } catch (e) {
-      setError(String((e as Error).message || e));
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "input", event }));
+      return;
     }
-  }
-
-  function onMouseMove(e: MouseEvent<HTMLImageElement>) {
-    if (!assist) return;
-    const now = Date.now();
-    if (now - lastMove.current < 60) return;
-    lastMove.current = now;
-    const p = norm(e);
-    sendInput({ type: "mouse_move", ...p });
-  }
-
-  function onMouseButton(e: MouseEvent<HTMLImageElement>, down: boolean) {
-    if (!assist) return;
-    e.preventDefault();
-    const p = norm(e);
-    const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
-    sendInput({ type: "mouse_move", ...p }).then(() =>
-      sendInput({ type: "mouse_click", button, down }),
+    api.remote.input(session.id, event).catch((e) =>
+      setError(String((e as Error).message || e)),
     );
   }
 
-  function onWheel(e: WheelEvent<HTMLImageElement>) {
+  function onMouseMove(e: MouseEvent<HTMLCanvasElement>) {
+    if (!assist) return;
+    pendingMove.current = norm(e);
+    if (moveTimer.current !== undefined) return;
+    moveTimer.current = window.setTimeout(() => {
+      moveTimer.current = undefined;
+      if (pendingMove.current) sendInput({ type: "mouse_move", ...pendingMove.current });
+    }, 16);
+  }
+
+  function onMouseButton(e: MouseEvent<HTMLCanvasElement>, down: boolean) {
+    if (!assist) return;
+    e.preventDefault();
+    const p = norm(e);
+    pendingMove.current = null;
+    const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
+    sendInput({ type: "mouse_move", ...p });
+    sendInput({ type: "mouse_click", button, down });
+  }
+
+  function onWheel(e: WheelEvent<HTMLCanvasElement>) {
     if (!assist) return;
     e.preventDefault();
     sendInput({ type: "mouse_wheel", delta: e.deltaY > 0 ? -120 : 120 });
@@ -245,6 +307,14 @@ export function AssistStage({
 
   async function downloadEntry(entry: Entry) {
     if (!session) return;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      setFsBusy(true);
+      const id = crypto.randomUUID();
+      downloads.current.set(id, { name: entry.name, chunks: [] });
+      ws.send(JSON.stringify({ type: "file_get", id, path: entry.path }));
+      return;
+    }
     setFsBusy(true);
     try {
       const { request_id } = await api.remote.fsDownload(session.id, entry.path);
@@ -261,9 +331,26 @@ export function AssistStage({
 
   async function uploadFile(file: File) {
     if (!session) return;
+    const target = path.endsWith("\\") ? `${path}${file.name}` : `${path}\\${file.name}`;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      setFsBusy(true);
+      const id = crypto.randomUUID();
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      ws.send(JSON.stringify({ type: "file_put_start", id, path: target, size: bytes.length }));
+      const chunk = 128 * 1024;
+      for (let off = 0; off < bytes.length; off += chunk) {
+        const part = bytes.subarray(off, Math.min(off + chunk, bytes.length));
+        const hex = Array.from(part, (b) => b.toString(16).padStart(2, "0")).join("");
+        ws.send(JSON.stringify({ type: "file_chunk", id, offset: off, data: hex }));
+      }
+      ws.send(JSON.stringify({ type: "file_end", id }));
+      setFsBusy(false);
+      msg.success(`已上传 ${file.name}`);
+      return;
+    }
     setFsBusy(true);
     try {
-      const target = path.endsWith("\\") ? `${path}${file.name}` : `${path}\\${file.name}`;
       const { request_id } = await api.remote.fsUpload(session.id, target, file);
       const st = await waitFs(request_id);
       if (st.state === "failed") throw new Error(st.error_message || "上传失败");
@@ -317,23 +404,21 @@ export function AssistStage({
           onKeyDown={onKeyDown}
           onKeyUp={onKeyUp}
         >
-          {frameUrl ? (
-            <img
-              src={frameUrl}
-              alt="终端画面"
-              draggable={false}
-              onMouseMove={onMouseMove}
-              onMouseDown={(e) => onMouseButton(e, true)}
-              onMouseUp={(e) => onMouseButton(e, false)}
-              onWheel={onWheel}
-              onContextMenu={(e) => e.preventDefault()}
-              style={{ cursor: assist ? "crosshair" : "default" }}
-            />
-          ) : (
-            <p className="muted">
-              {session ? "等待客户端首帧画面…" : "会话准备中"}
-            </p>
-          )}
+          <canvas
+            ref={canvasRef}
+            className="assist-frame"
+            onMouseMove={onMouseMove}
+            onMouseDown={(e) => onMouseButton(e, true)}
+            onMouseUp={(e) => onMouseButton(e, false)}
+            onWheel={onWheel}
+            onContextMenu={(e) => e.preventDefault()}
+            style={{
+              cursor: assist ? "crosshair" : "default",
+              width: "100%",
+              height: "100%",
+            }}
+          />
+          {!session ? <p className="muted">会话准备中</p> : null}
         </div>
         {assist ? (
           <aside className="assist-rail">
@@ -366,13 +451,19 @@ export function AssistStage({
                     className="btn ghost sm"
                     type="button"
                     disabled={!session}
-                    onClick={() =>
-                      session &&
-                      api.remote
-                        .clipboardRead(session.id)
-                        .then(() => msg.success("已请求读取客户端剪贴板"))
-                        .catch((e) => setError(String(e.message || e)))
-                    }
+                    onClick={() => {
+                      if (!session) return;
+                      const ws = wsRef.current;
+                      if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "clipboard_get" }));
+                        msg.success("已请求读取客户端剪贴板");
+                      } else {
+                        api.remote
+                          .clipboardRead(session.id)
+                          .then(() => msg.success("已请求读取客户端剪贴板"))
+                          .catch((e) => setError(String(e.message || e)));
+                      }
+                    }}
                   >
                     读取客户端
                   </button>
@@ -380,13 +471,19 @@ export function AssistStage({
                     className="btn sm"
                     type="button"
                     disabled={!session}
-                    onClick={() =>
-                      session &&
-                      api.remote
-                        .clipboardSet(session.id, clipboard)
-                        .then(() => msg.success("已发送到客户端"))
-                        .catch((e) => setError(String(e.message || e)))
-                    }
+                    onClick={() => {
+                      if (!session) return;
+                      const ws = wsRef.current;
+                      if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "clipboard_set", text: clipboard }));
+                        msg.success("已发送到客户端");
+                      } else {
+                        api.remote
+                          .clipboardSet(session.id, clipboard)
+                          .then(() => msg.success("已发送到客户端"))
+                          .catch((e) => setError(String(e.message || e)));
+                      }
+                    }}
                   >
                     发送到客户端
                   </button>

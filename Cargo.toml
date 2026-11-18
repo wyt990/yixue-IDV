@@ -20,7 +20,7 @@ idv-common = { path = "crates/idv-common" }
 
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"

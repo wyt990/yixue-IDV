@@ -767,6 +767,11 @@ export const api = {
       ),
   },
   remote: {
+    wsUrl: (id: string) => {
+      const token = getToken() || "";
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${window.location.host}/api/v1/assist/sessions/${id}/ws?role=viewer&token=${encodeURIComponent(token)}`;
+    },
     get: (id: string) =>
       request<{
         id: string;

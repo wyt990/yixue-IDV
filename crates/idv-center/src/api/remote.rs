@@ -6,16 +6,19 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use tokio::sync::mpsc;
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, admin_from_token};
 use crate::models::new_id;
-use crate::state::AppState;
+use crate::state::{AppState, AssistWire};
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct AssistCommand {
@@ -942,6 +945,118 @@ pub async fn collect_download(
         header::HeaderValue::from_static("application/zip"),
     );
     Ok(resp)
+}
+
+// ---------------------------------------------------------------- websocket
+
+#[derive(Debug, Deserialize)]
+pub struct AssistWsQuery {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub mac: String,
+    #[serde(default)]
+    pub token: String,
+}
+
+/// Multiplexed Assist transport: one Agent side and N viewer sides per session.
+pub async fn ws(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<AssistWsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, (StatusCode, String)> {
+    let (mac, _kind, session_state) = load_session(&state, &id).await?;
+    if session_state == "ended" || session_state == "denied" {
+        return Err((StatusCode::CONFLICT, "assist session not active".into()));
+    }
+    let role = q.role.trim().to_ascii_lowercase();
+    if role == "viewer" {
+        let admin = admin_from_token(&state.pool, q.token.trim())
+            .await
+            .ok_or((StatusCode::UNAUTHORIZED, "invalid assist token".into()))?;
+        if admin.role == "readonly" {
+            // readonly can watch, but not control
+        }
+    } else if role == "agent" {
+        if q.mac.trim().is_empty() || !q.mac.eq_ignore_ascii_case(&mac) {
+            return Err((StatusCode::FORBIDDEN, "assist mac mismatch".into()));
+        }
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "role must be agent|viewer".into()));
+    }
+    let hub = state.assist_hub.clone();
+    Ok(ws
+        .on_upgrade(move |socket| async move {
+            if role == "agent" {
+                handle_agent_ws(socket, hub, id).await;
+            } else {
+                handle_viewer_ws(socket, hub, id).await;
+            }
+        })
+        .into_response())
+}
+
+async fn handle_agent_ws(socket: WebSocket, hub: std::sync::Arc<crate::state::AssistHub>, id: String) {
+    let (mut sink, mut stream) = socket.split();
+    let (tx, mut rx) = mpsc::channel::<AssistWire>(64);
+    hub.set_agent(&id, tx).await;
+    loop {
+        tokio::select! {
+            out = rx.recv() => {
+                let Some(out) = out else { break };
+                let msg = match out {
+                    AssistWire::Text(s) => Message::Text(s.into()),
+                    AssistWire::Binary(b) => Message::Binary(b.into()),
+                };
+                if sink.send(msg).await.is_err() { break; }
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => hub.broadcast(&id, AssistWire::Text(text.to_string())).await,
+                    Some(Ok(Message::Binary(bytes))) => hub.broadcast(&id, AssistWire::Binary(bytes.to_vec())).await,
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+    hub.clear_agent(&id).await;
+}
+
+async fn handle_viewer_ws(socket: WebSocket, hub: std::sync::Arc<crate::state::AssistHub>, id: String) {
+    let (mut sink, mut stream) = socket.split();
+    let mut rx = hub.subscribe(&id).await;
+    loop {
+        tokio::select! {
+            out = rx.recv() => {
+                match out {
+                    Ok(AssistWire::Text(s)) => {
+                        if sink.send(Message::Text(s.into())).await.is_err() { break; }
+                    }
+                    Ok(AssistWire::Binary(b)) => {
+                        if sink.send(Message::Binary(b.into())).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let _ = hub.send_agent(&id, AssistWire::Text(text.to_string())).await;
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let _ = hub.send_agent(&id, AssistWire::Binary(bytes.to_vec())).await;
+                    }
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
 }
 
 fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {

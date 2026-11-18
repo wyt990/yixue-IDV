@@ -95,7 +95,7 @@ pub async fn create(
     let payload = serde_json::json!({
         "session_id": row.id,
         "kind": row.kind,
-        "frame_ms": 500,
+        "frame_ms": 100,
     })
     .to_string();
     let _ = super::agent_commands::enqueue(
