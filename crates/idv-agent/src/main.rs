@@ -2834,6 +2834,7 @@ struct H264Session {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     avcc_sent: bool,
+    first_frame: bool,
 }
 
 #[cfg(windows)]
@@ -2865,6 +2866,7 @@ impl H264Session {
             sps: None,
             pps: None,
             avcc_sent: false,
+            first_frame: true,
         })
     }
 
@@ -2891,6 +2893,10 @@ impl H264Session {
         let yuv = YUVBuffer::from_rgb8_source(source);
         let timestamp = openh264::Timestamp::from_millis(self.timestamp_ms);
         self.timestamp_ms = self.timestamp_ms.saturating_add(66);
+        if self.first_frame {
+            self.encoder.force_intra_frame();
+            self.first_frame = false;
+        }
         let encoded = self
             .encoder
             .encode_at(&yuv, timestamp)
@@ -2921,7 +2927,7 @@ impl H264Session {
         }
         let mut avcc = None;
         let mut codec = None;
-        if keyframe
+        if (keyframe || !self.avcc_sent)
             && let (Some(sps), Some(pps)) = (&self.sps, &self.pps)
         {
             avcc = Some(build_avcc(sps, pps));
@@ -3543,10 +3549,48 @@ async fn assist_ws_loop(
         let capture = std::sync::Arc::new(std::sync::Mutex::new(AssistDirtyCapture::default()));
         let mut h264: Option<H264Session> = None;
         let mut hardware: Option<hw_h264::HardwareH264> = None;
+        let mut software_task = Some(tokio::task::spawn_blocking(|| {
+            H264Session::new(1920, 1080)
+        }));
+        let mut hardware_task = Some(tokio::task::spawn_blocking(|| {
+            hw_h264::HardwareH264::new(1920, 1080)
+        }));
+        let mut initial_jpeg_sent = false;
         let mut force_counter = 0u32;
         loop {
             if cap_stop.load(Ordering::SeqCst) {
                 break;
+            }
+            if !initial_jpeg_sent {
+                initial_jpeg_sent = true;
+                let capture_task = capture.clone();
+                let q = cap_quality.load(Ordering::Relaxed).clamp(30, 80) as u8;
+                let captured = tokio::task::spawn_blocking(move || {
+                    capture_task.lock().unwrap().capture(q, true)
+                })
+                .await;
+                if let Ok(Ok(Some(frame))) = captured {
+                    let mut packet = Vec::with_capacity(32 + frame.jpeg.len());
+                    packet.extend_from_slice(b"IDVF");
+                    packet.extend_from_slice(&2u16.to_le_bytes());
+                    packet.extend_from_slice(&1u16.to_le_bytes());
+                    packet.extend_from_slice(&seq.to_le_bytes());
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    packet.extend_from_slice(&ts.to_le_bytes());
+                    packet.extend_from_slice(&(frame.screen_width as u16).to_le_bytes());
+                    packet.extend_from_slice(&(frame.screen_height as u16).to_le_bytes());
+                    packet.extend_from_slice(&(frame.x as u16).to_le_bytes());
+                    packet.extend_from_slice(&(frame.y as u16).to_le_bytes());
+                    packet.extend_from_slice(&(frame.width as u16).to_le_bytes());
+                    packet.extend_from_slice(&(frame.height as u16).to_le_bytes());
+                    packet.extend_from_slice(&frame.jpeg);
+                    seq = seq.wrapping_add(1);
+                    let _ = frame_tx.try_send(AssistOut::Binary(packet));
+                }
+                continue;
             }
             force_counter = force_counter.wrapping_add(1);
             if cap_codec.load(Ordering::Relaxed) == 1 {
@@ -3556,10 +3600,21 @@ async fn assist_ws_loop(
                 })
                 .await;
                 if let Ok(Ok((_sw, _sh, rgb))) = rgb {
-                    if hardware.is_none() && h264.is_none() {
-                        hardware = hw_h264::HardwareH264::new(1920, 1080);
-                        if hardware.is_none() {
+                    if h264.is_none() {
+                        if let Some(task) = software_task.take() {
+                            h264 = task.await.ok().and_then(|r| r.ok());
+                        }
+                        if h264.is_none() {
                             h264 = H264Session::new(1920, 1080).ok();
+                        }
+                    }
+                    if hardware.is_none()
+                        && let Some(task) = hardware_task.take()
+                    {
+                        if task.is_finished() {
+                            hardware = task.await.ok().flatten();
+                        } else {
+                            hardware_task = Some(task);
                         }
                     }
                     let encoded = if let Some(hw) = hardware.as_mut() {

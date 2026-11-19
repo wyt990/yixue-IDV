@@ -17,6 +17,8 @@ struct AssistChannel {
     viewers: broadcast::Sender<AssistWire>,
     /// Latest full/keyframe, so a late viewer gets a first image immediately.
     last_keyframe: Option<AssistWire>,
+    /// Control messages from viewers that arrived before the Agent connected.
+    pending_agent: Vec<AssistWire>,
 }
 
 /// In-memory broker for one Assist session: one Agent socket and N browser sockets.
@@ -32,6 +34,7 @@ impl AssistHub {
             agent: None,
             viewers: broadcast::channel(32).0,
             last_keyframe: None,
+            pending_agent: Vec::new(),
         });
     }
 
@@ -51,7 +54,11 @@ impl AssistHub {
         self.ensure(id).await;
         let mut map = self.inner.lock().await;
         if let Some(channel) = map.get_mut(id) {
-            channel.agent = Some(tx);
+            channel.agent = Some(tx.clone());
+            let pending = std::mem::take(&mut channel.pending_agent);
+            for msg in pending {
+                let _ = tx.try_send(msg);
+            }
         }
     }
 
@@ -68,8 +75,27 @@ impl AssistHub {
             map.get(id).and_then(|c| c.agent.clone())
         };
         match tx {
-            Some(tx) => tx.try_send(msg).is_ok(),
-            None => false,
+            Some(tx) => {
+                if tx.try_send(msg.clone()).is_ok() {
+                    true
+                } else {
+                    self.queue_pending(id, msg).await;
+                    false
+                }
+            }
+            None => {
+                self.queue_pending(id, msg).await;
+                false
+            }
+        }
+    }
+
+    async fn queue_pending(&self, id: &str, msg: AssistWire) {
+        let mut map = self.inner.lock().await;
+        if let Some(channel) = map.get_mut(id) {
+            if channel.pending_agent.len() < 16 {
+                channel.pending_agent.push(msg);
+            }
         }
     }
 
