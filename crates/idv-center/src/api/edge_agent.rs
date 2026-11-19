@@ -416,6 +416,7 @@ pub async fn claim_task(
         WHERE tg.mac = ?
           AND tg.state IN ('pending', 'running')
           AND mt.state IN ('pending', 'running')
+          AND mt.kind IN ('capture', 'deploy')
           AND (
             mt.kind = 'deploy'
             OR (mt.edge_id IS NULL OR mt.edge_id = '' OR mt.edge_id = ?)

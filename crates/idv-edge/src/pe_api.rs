@@ -293,9 +293,12 @@ pub async fn checkin_ipxe(
         script.push_str("shell\n");
     } else if body.has_task {
         script.push_str(&format!(
-            "echo Unsupported task kind '{kind}' - not starting PE.\n"
+            "echo Unsupported task kind '{kind}' - booting local disk.\n"
         ));
-        script.push_str("sleep 8\n");
+        script.push_str("sleep 2\n");
+        script.push_str("sanboot --no-describe --drive 0x80 && exit 0 ||\n");
+        script.push_str("sanboot --no-describe --drive 0x81 && exit 0 ||\n");
+        script.push_str("echo ERROR: sanboot failed\n");
         script.push_str("shell\n");
     } else {
         script.push_str("echo No capture/deploy task; booting local disk...\n");
