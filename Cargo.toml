@@ -42,4 +42,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = "0.3"
-sysinfo = "0.33"
+sysinfo = "0.40"
